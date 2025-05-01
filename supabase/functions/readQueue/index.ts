@@ -1,6 +1,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { getRateLimiter } from "../_shared/rateLimiter.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -14,7 +15,7 @@ serve(async (req) => {
   }
 
   try {
-    const { queue_name, batch_size, visibility_timeout } = await req.json();
+    const { queue_name, batch_size = 5, visibility_timeout = 60 } = await req.json();
     
     if (!queue_name) {
       throw new Error("queue_name is required");
@@ -25,23 +26,29 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
-    const { data, error } = await supabase.rpc('pg_dequeue', {
-      queue_name,
-      batch_size: batch_size || 5,
-      visibility_timeout: visibility_timeout || 60
+    // Use rate limiter for internal database operations to avoid overwhelming the database
+    const rateLimiter = getRateLimiter();
+    
+    const { data, error } = await rateLimiter.execute({
+      api: "supabase",
+      endpoint: "rpc_dequeue",
+      tokensPerInterval: 10,
+      interval: 5,
+      maxRetries: 3
+    }, async () => {
+      return supabase.rpc('pg_dequeue', {
+        queue_name,
+        batch_size,
+        visibility_timeout
+      });
     });
     
     if (error) throw error;
     
-    // Parse message bodies if they're strings
-    const messages = data.messages.map((msg: any) => ({
-      ...msg,
-      message: typeof msg.message === 'string' ? JSON.parse(msg.message) : msg.message
-    }));
-    
-    return new Response(JSON.stringify(messages), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return new Response(
+      JSON.stringify(data),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
     
   } catch (error) {
     console.error("Error reading from queue:", error);

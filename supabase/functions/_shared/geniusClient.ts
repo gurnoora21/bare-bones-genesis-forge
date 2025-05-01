@@ -1,17 +1,16 @@
+import { getRateLimiter, RATE_LIMITERS } from "./rateLimiter.ts";
 
 /**
  * GeniusClient handles authentication and API calls to the Genius API,
- * implementing proper rate limiting and retry logic.
+ * implementing proper rate limiting and retry logic using our distributed
+ * rate limiter.
  */
 export class GeniusClient {
   private accessToken: string;
-  private lastRequestTime: number;
-  private requestDelay: number; // Minimum milliseconds between requests
+  private rateLimiter = getRateLimiter();
   
   constructor() {
     this.accessToken = Deno.env.get("GENIUS_ACCESS_TOKEN") || "";
-    this.lastRequestTime = 0;
-    this.requestDelay = 200; // 5 requests per second max
     
     if (!this.accessToken) {
       throw new Error("Genius access token must be provided as environment variable");
@@ -26,57 +25,41 @@ export class GeniusClient {
       ? endpoint
       : `https://api.genius.com${endpoint}`;
     
-    // Implement rate limiting
-    const now = Date.now();
-    const timeToWait = Math.max(0, this.requestDelay - (now - this.lastRequestTime));
+    // Extract endpoint name for rate limiting
+    const endpointName = endpoint.split('?')[0].split('/').filter(Boolean).pop() || 'default';
     
-    if (timeToWait > 0) {
-      await new Promise(resolve => setTimeout(resolve, timeToWait));
-    }
+    // Determine if this is a search endpoint
+    const limiterConfig = endpoint.includes("/search")
+      ? { ...RATE_LIMITERS.GENIUS.DEFAULT, endpoint: "search" }
+      : { ...RATE_LIMITERS.GENIUS.DEFAULT, endpoint: endpointName };
     
-    // Implement exponential backoff retries
-    const maxRetries = 3;
-    let retryCount = 0;
-    let lastError: Error | null = null;
+    // Determine cache TTL based on endpoint type
+    // Search results change less frequently than individual resources
+    const cacheTtl = endpoint.includes("/search") ? 60 * 60 * 24 : 60 * 60 * 12;
     
-    while (retryCount < maxRetries) {
-      try {
-        this.lastRequestTime = Date.now();
-        
-        const response = await fetch(url, {
-          headers: {
-            "Authorization": `Bearer ${this.accessToken}`
-          }
-        });
-        
-        if (response.status === 429) {
-          // Rate limited - back off more aggressively
-          console.log("Genius API rate limited, backing off");
-          await new Promise(resolve => setTimeout(resolve, 2000 * Math.pow(2, retryCount)));
-          retryCount++;
-          continue;
+    // Use the caching rate limiter
+    const cacheKey = `genius:${endpoint}`;
+    return this.rateLimiter.executeWithCache({
+      ...limiterConfig,
+      cacheKey,
+      cacheTtl
+    }, async () => {
+      const response = await fetch(url, {
+        headers: {
+          "Authorization": `Bearer ${this.accessToken}`
         }
-        
-        if (!response.ok) {
-          throw new Error(`Genius API error: ${response.status} ${await response.text()}`);
-        }
-        
-        return await response.json();
-      } catch (error) {
-        console.error(`Genius API request failed (attempt ${retryCount + 1}/${maxRetries}):`, error);
-        lastError = error instanceof Error ? error : new Error(String(error));
-        
-        // Exponential backoff with jitter
-        const baseDelay = Math.pow(2, retryCount) * 1000;
-        const jitter = Math.random() * 1000;
-        const delay = baseDelay + jitter;
-        
-        await new Promise(resolve => setTimeout(resolve, delay));
-        retryCount++;
+      });
+      
+      if (response.status === 429) {
+        throw new Error("Genius API rate limited");
       }
-    }
-    
-    throw lastError || new Error("Max retries exceeded");
+      
+      if (!response.ok) {
+        throw new Error(`Genius API error: ${response.status} ${await response.text()}`);
+      }
+      
+      return await response.json();
+    });
   }
 
   /**
