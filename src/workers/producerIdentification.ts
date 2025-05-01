@@ -1,3 +1,4 @@
+
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker';
 import { EnvConfig } from '../lib/EnvConfig';
@@ -96,7 +97,9 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
       }
 
       // Explicitly type and convert the producer id to string
-      const producerId: string = String(producer.id);
+      const producerId: string = typeof producer.id === 'string' 
+        ? producer.id 
+        : String(producer.id);
       
       // Associate producer with track
       const { error: associationError } = await this.supabase

@@ -12,7 +12,7 @@ declare global {
     };
   }
   
-  // Use interface merging instead of redeclaring the variable
+  // Use interface merging to add EdgeRuntime to globalThis
   interface GlobalThis {
     EdgeRuntime: Window['EdgeRuntime'];
   }
