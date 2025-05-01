@@ -31,7 +31,7 @@ serve(async (req) => {
     
     console.log(`Attempting to enqueue artist discovery for: ${artistName}`);
     
-    // Use the database function with proper JSONB handling
+    // Use the pg_enqueue function with proper JSONB handling
     const { data: messageId, error } = await supabase.rpc('pg_enqueue', {
       queue_name: 'artist_discovery',
       message_body: JSON.stringify({ artistName }) // Convert to JSON string which Postgres will parse as JSONB

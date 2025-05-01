@@ -374,17 +374,21 @@ export type Database = {
         Args: {
           queue_name: string
           batch_size?: number
-          visibility_timeout?: number
+          visibility_seconds?: number
         }
         Returns: Json
       }
       pg_enqueue: {
-        Args: { queue_name: string; message_body: string }
-        Returns: string
+        Args: { queue_name: string; message_body: Json }
+        Returns: number
       }
       pg_release_message: {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
+      }
+      pg_send_text: {
+        Args: { queue_name: string; msg_text: string }
+        Returns: number[]
       }
       search_producers: {
         Args: { search_term: string }

@@ -26,6 +26,8 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
+    console.log(`Reading messages from queue: ${queue_name}, batch size: ${batch_size}`);
+    
     // Use rate limiter for internal database operations to avoid overwhelming the database
     const rateLimiter = getRateLimiter();
     
@@ -43,7 +45,12 @@ serve(async (req) => {
       });
     });
     
-    if (error) throw error;
+    if (error) {
+      console.error(`Error reading from queue ${queue_name}:`, error);
+      throw error;
+    }
+    
+    console.log(`Successfully read ${data ? JSON.stringify(data).length : 0} bytes from queue ${queue_name}`);
     
     return new Response(
       JSON.stringify(data),

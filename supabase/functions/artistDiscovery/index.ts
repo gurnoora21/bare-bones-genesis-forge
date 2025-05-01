@@ -24,22 +24,33 @@ serve(async (req) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
 
+  console.log("Starting artist discovery worker process...");
+
   // Process queue batch
-  const { data: messages, error } = await supabase.functions.invoke("readQueue", {
-    body: { 
-      queue_name: "artist_discovery",
-      batch_size: 5,
-      visibility_timeout: 180 // 3 minutes
-    }
+  const { data: queueData, error: queueError } = await supabase.rpc('pg_dequeue', { 
+    queue_name: "artist_discovery",
+    batch_size: 5,
+    visibility_timeout: 180 // 3 minutes
   });
 
-  if (error) {
-    console.error("Error reading from queue:", error);
-    return new Response(JSON.stringify({ error }), { status: 500, headers: corsHeaders });
+  if (queueError) {
+    console.error("Error reading from queue:", queueError);
+    return new Response(JSON.stringify({ error: queueError }), { 
+      status: 500, 
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    });
   }
 
+  // Parse the JSONB result from pg_dequeue
+  const messages = queueData ? JSON.parse(JSON.stringify(queueData)) : [];
+
+  console.log(`Retrieved ${messages.length} messages from queue`);
+
   if (!messages || messages.length === 0) {
-    return new Response(JSON.stringify({ processed: 0, message: "No messages to process" }), { headers: corsHeaders });
+    return new Response(
+      JSON.stringify({ processed: 0, message: "No messages to process" }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
   }
 
   // Initialize the Spotify client
@@ -47,33 +58,55 @@ serve(async (req) => {
 
   // Process messages with background tasks
   const promises = messages.map(async (message) => {
-    // Ensure the message is properly typed
-    const msg = typeof message.message === 'string' 
-      ? JSON.parse(message.message) as ArtistDiscoveryMsg 
-      : message.message as ArtistDiscoveryMsg;
-      
-    const messageId = message.id;
+    // Ensure the message is properly parsed
+    let msg: ArtistDiscoveryMsg;
     
     try {
+      // Handle potential message format issues
+      if (typeof message.message === 'string') {
+        msg = JSON.parse(message.message) as ArtistDiscoveryMsg;
+      } else if (message.message && typeof message.message === 'object') {
+        msg = message.message as ArtistDiscoveryMsg;
+      } else {
+        throw new Error(`Invalid message format: ${JSON.stringify(message)}`);
+      }
+      
+      const messageId = message.id;
+      console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
+      
       await processArtist(supabase, spotifyClient, msg);
+      
       // Archive processed message
-      await supabase.functions.invoke("deleteFromQueue", {
-        body: { queue_name: "artist_discovery", message_id: messageId }
+      const { error: deleteError } = await supabase.rpc("pg_delete_message", {
+        queue_name: "artist_discovery",
+        message_id: messageId
       });
-      console.log(`Successfully processed message ${messageId}`);
+      
+      if (deleteError) {
+        console.error(`Error deleting message ${messageId}:`, deleteError);
+      } else {
+        console.log(`Successfully processed message ${messageId}`);
+      }
     } catch (error) {
-      console.error(`Error processing artist message ${messageId}:`, error);
+      console.error(`Error processing artist message:`, error);
       // Message will return to queue after visibility timeout
     }
   });
 
   // Wait for all background tasks in a background process
-  EdgeRuntime.waitUntil(Promise.all(promises));
+  try {
+    EdgeRuntime.waitUntil(Promise.all(promises));
+    console.log(`Processing ${messages.length} messages in the background`);
+  } catch (error) {
+    console.error("Error in background processing:", error);
+  }
   
   return new Response(JSON.stringify({ 
     processed: messages.length,
     success: true
-  }), { headers: corsHeaders });
+  }), { 
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+  });
 });
 
 async function processArtist(
@@ -81,6 +114,7 @@ async function processArtist(
   spotifyClient: any, 
   msg: ArtistDiscoveryMsg
 ) {
+  console.log("Processing artist:", msg);
   const { artistId, artistName } = msg;
   
   if (!artistId && !artistName) {
@@ -95,11 +129,16 @@ async function processArtist(
     artistData = await spotifyClient.getArtistById(artistId);
   } else if (artistName) {
     // Search for artist by name
-    const artist = await spotifyClient.getArtistByName(artistName);
-    if (!artist) {
+    console.log(`Searching for artist by name: ${artistName}`);
+    const searchResponse = await spotifyClient.getArtistByName(artistName);
+    
+    if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items.length) {
       throw new Error(`Artist not found: ${artistName}`);
     }
-    artistData = artist;
+    
+    // Use the first artist result
+    artistData = searchResponse.artists.items[0];
+    console.log(`Found artist: ${artistData.name} (${artistData.id})`);
   }
   
   if (!artistData) {
@@ -121,19 +160,25 @@ async function processArtist(
     .single();
 
   if (error) {
+    console.error("Error storing artist:", error);
     throw new Error(`Error storing artist: ${error.message}`);
   }
 
+  console.log(`Stored artist in database with ID: ${artist.id}`);
+
   // Enqueue album discovery
-  await supabase.functions.invoke("sendToQueue", {
-    body: {
-      queue_name: "album_discovery",
-      message: { 
-        artistId: artist.id, 
-        offset: 0 
-      }
-    }
+  const { error: queueError } = await supabase.rpc('pg_enqueue', {
+    queue_name: 'album_discovery',
+    message_body: JSON.stringify({ 
+      artistId: artist.id, 
+      offset: 0 
+    })
   });
+
+  if (queueError) {
+    console.error("Error enqueueing album discovery:", queueError);
+    throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
+  }
 
   console.log(`Processed artist ${artistData.name}, enqueued album discovery for artist ID ${artist.id}`);
   return artist;

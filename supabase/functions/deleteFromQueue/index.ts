@@ -25,12 +25,19 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
+    console.log(`Deleting message ${message_id} from queue ${queue_name}`);
+    
     const { data, error } = await supabase.rpc('pg_delete_message', {
       queue_name,
       message_id
     });
     
-    if (error) throw error;
+    if (error) {
+      console.error(`Error deleting message ${message_id}:`, error);
+      throw error;
+    }
+    
+    console.log(`Successfully deleted message ${message_id} from queue ${queue_name}`);
     
     return new Response(
       JSON.stringify({ success: data }),

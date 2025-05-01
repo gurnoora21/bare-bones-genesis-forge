@@ -25,17 +25,22 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
-    const messageBody = typeof message === 'string' ? message : JSON.stringify(message);
+    console.log(`Sending message to queue ${queue_name}: ${JSON.stringify(message)}`);
     
-    const { data, error } = await supabase.rpc('pg_enqueue', {
+    const { data: messageId, error } = await supabase.rpc('pg_enqueue', {
       queue_name,
-      message_body: messageBody
+      message_body: JSON.stringify(message)
     });
     
-    if (error) throw error;
+    if (error) {
+      console.error(`Error sending to queue ${queue_name}:`, error);
+      throw error;
+    }
+    
+    console.log(`Successfully sent message to queue ${queue_name} with ID: ${messageId}`);
     
     return new Response(
-      JSON.stringify({ message_id: data }),
+      JSON.stringify({ success: true, messageId }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     
