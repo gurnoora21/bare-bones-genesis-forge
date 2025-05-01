@@ -12,9 +12,9 @@ declare global {
     };
   }
   
-  // Make EdgeRuntime available globally using 'var' declaration
-  // without redeclaring the type
-  var EdgeRuntime: Window['EdgeRuntime'];
+  // Make EdgeRuntime available globally without duplicate declaration
+  // by using declare var instead of plain var
+  declare var EdgeRuntime: Window['EdgeRuntime'];
   
   // Define Deno namespace for TypeScript compatibility
   namespace Deno {

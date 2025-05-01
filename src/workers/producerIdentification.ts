@@ -1,3 +1,4 @@
+
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker';
 import { EnvConfig } from '../lib/EnvConfig';
@@ -89,9 +90,9 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
         continue;
       }
 
-      // Fix: Make sure producer.id is a string with proper type handling
-      const producerId = producer && producer.id !== null && producer.id !== undefined 
-        ? producer.id.toString() 
+      // Make sure producer.id is properly typed as string
+      const producerId = producer && typeof producer.id !== 'undefined' 
+        ? String(producer.id) 
         : '';
       
       // Associate producer with track
