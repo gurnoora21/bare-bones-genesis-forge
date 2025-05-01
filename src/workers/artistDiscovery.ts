@@ -27,27 +27,24 @@ export class ArtistDiscoveryWorker extends BaseWorker<ArtistDiscoveryMessage> {
       throw new Error('Either artistId or artistName must be provided');
     }
 
-    let artistId = message.artistId;
     let artistData: any;
 
     // If we only have the artist name, search for it first
-    if (!artistId && message.artistName) {
-      const artist = await this.spotifyClient.getArtistByName(message.artistName);
-      if (!artist) {
+    if (!message.artistId && message.artistName) {
+      artistData = await this.spotifyClient.getArtistByName(message.artistName);
+      if (!artistData) {
         throw new Error(`Artist not found: ${message.artistName}`);
       }
-      artistId = artist.id;
-      artistData = artist;
     } else {
-      // Get artist details
-      artistData = await this.spotifyClient.getArtistById(artistId!);
+      // Get artist details by ID
+      artistData = await this.spotifyClient.getArtistById(message.artistId!);
     }
 
     // Store artist in database
     const { data: artist, error } = await this.supabase
       .from('artists')
       .upsert({
-        spotify_id: artistId,
+        spotify_id: artistData.id,
         name: artistData.name,
         followers: artistData.followers.total,
         popularity: artistData.popularity,
