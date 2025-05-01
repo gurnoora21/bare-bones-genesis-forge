@@ -387,6 +387,10 @@ export type Database = {
           track_count: number
         }[]
       }
+      manual_trigger_worker: {
+        Args: { worker_name: string }
+        Returns: Json
+      }
       pg_delete_message: {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
@@ -395,7 +399,7 @@ export type Database = {
         Args: {
           queue_name: string
           batch_size?: number
-          visibility_seconds?: number
+          visibility_timeout?: number
         }
         Returns: Json
       }

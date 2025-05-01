@@ -142,12 +142,11 @@ async function processTracks(
         .eq('normalized_name', normalizedName)
         .maybeSingle();
       
-      // Store track in database
+      // Store track in database - REMOVED artist_id field from here
       const { data: insertedTrack, error } = await supabase
         .from('tracks')
         .upsert({
           album_id: album.id,
-          artist_id: artist.id,  // Include artist ID directly for easier queries
           spotify_id: track.id,
           name: track.name,
           duration_ms: track.duration_ms,
