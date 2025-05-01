@@ -1,4 +1,3 @@
-
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker';
 import { EnvConfig } from '../lib/EnvConfig';
@@ -90,12 +89,15 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
         continue;
       }
 
+      // Make sure producer.id is a string
+      const producerId = typeof producer.id === 'string' ? producer.id : String(producer.id);
+      
       // Associate producer with track
       const { error: associationError } = await this.supabase
         .from('track_producers')
         .upsert({
           track_id: trackId,
-          producer_id: producer.id,
+          producer_id: producerId,
           confidence: producerCandidate.confidence,
           source: producerCandidate.source
         });
@@ -107,7 +109,7 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
       // If this is a new producer or hasn't been enriched yet, enqueue social enrichment
       if (!producer.enriched_at && !producer.enrichment_failed) {
         await this.enqueue('social_enrichment', {
-          producerId: producer.id,
+          producerId: producerId,
           producerName: producer.name
         });
       }

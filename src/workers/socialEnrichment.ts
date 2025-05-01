@@ -1,5 +1,6 @@
+
 import { createClient } from '@supabase/supabase-js';
-import { BaseWorker } from '../lib/BaseWorker.ts';
+import { BaseWorker } from '../lib/BaseWorker';
 import { EnvConfig } from '../lib/EnvConfig';
 
 interface SocialEnrichmentMessage {
@@ -17,8 +18,8 @@ export class SocialEnrichmentWorker extends BaseWorker<SocialEnrichmentMessage> 
     });
     
     // Configure rate limits for Instagram API (or other social media)
-    this.maxRequestsPerWindow.instagram = 10;  // 10 requests per minute
-    this.windowMs.instagram = 60000;           // 1 minute window
+    this.maxRequestsPerWindow['instagram'] = 10;  // 10 requests per minute
+    this.windowMs['instagram'] = 60000;           // 1 minute window
   }
 
   async processMessage(message: SocialEnrichmentMessage): Promise<void> {

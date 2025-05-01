@@ -17,6 +17,17 @@ export abstract class BaseWorker<T = any> {
   protected readonly maxRetries: number;
   protected supabase: ReturnType<typeof createClient>;
   
+  // Rate limiting properties
+  protected maxRequestsPerWindow: Record<string, number> = {};
+  protected windowMs: Record<string, number> = {};
+  protected lastRequestTime: Record<string, number> = {};
+  protected requestsInWindow: Record<string, number> = {};
+  
+  // Circuit breaker properties
+  protected circuitState: Record<string, 'closed' | 'open' | 'half-open'> = {};
+  protected failureCount: Record<string, number> = {};
+  protected nextAttempt: Record<string, number> = {};
+  
   constructor(options: WorkerOptions) {
     this.queueName = options.queueName;
     this.batchSize = options.batchSize || 10;
@@ -82,7 +93,8 @@ export abstract class BaseWorker<T = any> {
           await this.processMessage(messageData);
           
           // Delete message from queue on success
-          await EdgeFunctionAdapter.deleteFromQueue(this.queueName, msg.id);
+          const messageId = typeof msg.id === 'string' ? msg.id : String(msg.id);
+          await EdgeFunctionAdapter.deleteFromQueue(this.queueName, messageId);
           successful++;
           
         } catch (error) {
@@ -121,6 +133,121 @@ export abstract class BaseWorker<T = any> {
    */
   protected async enqueue(queueName: string, message: any): Promise<string> {
     return EdgeFunctionAdapter.sendToQueue(queueName, message);
+  }
+  
+  /**
+   * Wait for rate limit window to reset
+   */
+  protected async waitForRateLimit(service: string): Promise<void> {
+    const now = Date.now();
+    const maxRequests = this.maxRequestsPerWindow[service] || 10;
+    const windowTime = this.windowMs[service] || 1000;
+    
+    // Initialize tracking for this service
+    if (!this.lastRequestTime[service]) {
+      this.lastRequestTime[service] = now;
+      this.requestsInWindow[service] = 0;
+    }
+    
+    // Check if window should reset
+    if (now - this.lastRequestTime[service] > windowTime) {
+      this.lastRequestTime[service] = now;
+      this.requestsInWindow[service] = 0;
+      return;
+    }
+    
+    // Check if we need to wait
+    if (this.requestsInWindow[service] >= maxRequests) {
+      const waitTime = windowTime - (now - this.lastRequestTime[service]);
+      if (waitTime > 0) {
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        
+        // Reset after waiting
+        this.lastRequestTime[service] = Date.now();
+        this.requestsInWindow[service] = 0;
+      }
+    }
+    
+    // Increment request count
+    this.requestsInWindow[service]++;
+  }
+  
+  /**
+   * Circuit breaker pattern for external services
+   */
+  protected async withCircuitBreaker<R>(service: string, fn: () => Promise<R>): Promise<R> {
+    // Initialize circuit state
+    if (!this.circuitState[service]) {
+      this.circuitState[service] = 'closed';
+      this.failureCount[service] = 0;
+      this.nextAttempt[service] = 0;
+    }
+    
+    const now = Date.now();
+    
+    // Check if circuit is open
+    if (this.circuitState[service] === 'open') {
+      if (now < this.nextAttempt[service]) {
+        throw new Error(`Circuit for ${service} is open`);
+      }
+      
+      // Move to half-open state
+      this.circuitState[service] = 'half-open';
+    }
+    
+    try {
+      const result = await fn();
+      
+      // Success, close the circuit
+      this.circuitState[service] = 'closed';
+      this.failureCount[service] = 0;
+      
+      return result;
+    } catch (error) {
+      // Increment failure count
+      this.failureCount[service]++;
+      
+      // Check if we should open the circuit
+      if (this.failureCount[service] >= 3 || this.circuitState[service] === 'half-open') {
+        this.circuitState[service] = 'open';
+        
+        // Wait longer each time
+        const waitTime = Math.min(60000, 1000 * Math.pow(2, this.failureCount[service]));
+        this.nextAttempt[service] = now + waitTime;
+      }
+      
+      throw error;
+    }
+  }
+  
+  /**
+   * Cached fetch for external HTTP requests
+   */
+  protected async cachedFetch<R>(url: string, options: RequestInit = {}, cacheTtl = 3600000): Promise<R> {
+    // Simple in-memory cache (in production you'd use Redis or similar)
+    const cacheKey = `${url}:${JSON.stringify(options)}`;
+    const cache = (global as any).__fetchCache = (global as any).__fetchCache || {};
+    
+    const cachedItem = cache[cacheKey];
+    if (cachedItem && cachedItem.expires > Date.now()) {
+      return cachedItem.data;
+    }
+    
+    const response = await fetch(url, options);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    
+    // Cache the result
+    cache[cacheKey] = {
+      data,
+      expires: Date.now() + cacheTtl
+    };
+    
+    return data;
   }
   
   /**

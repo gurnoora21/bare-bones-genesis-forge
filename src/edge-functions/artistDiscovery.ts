@@ -1,21 +1,37 @@
 
-import { serve } from "https://deno.land/std/http/server.ts";
+// Import DenoTypes for type compatibility
+import '../lib/DenoTypes';
+
 import { createClient } from "@supabase/supabase-js";
-import { SpotifyClient } from "../lib/SpotifyClient.ts";
+import { SpotifyClient } from "../lib/SpotifyClient";
 
 interface ArtistDiscoveryMsg {
   artistId?: string;
   artistName?: string;
 }
 
-// Initialize the Spotify client
-const spotifyClient = new SpotifyClient();
+// Use a dynamic import for Deno http/server
+async function serve(handler: (req: Request) => Promise<Response>) {
+  if (typeof globalThis !== 'undefined' && 'Deno' in globalThis) {
+    const module = await import("https://deno.land/std/http/server.ts");
+    return module.serve(handler);
+  }
+  return null;
+}
 
-serve(async (req) => {
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-  );
+// Initialize the Spotify client
+const spotifyClient = SpotifyClient.getInstance();
+
+const handler = async (req: Request) => {
+  // Get environment variables safely using a helper function
+  const SUPABASE_URL = typeof globalThis !== 'undefined' && 'Deno' in globalThis 
+    ? (globalThis as any).Deno.env.get("SUPABASE_URL")!
+    : '';
+  const SUPABASE_SERVICE_ROLE_KEY = typeof globalThis !== 'undefined' && 'Deno' in globalThis 
+    ? (globalThis as any).Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    : '';
+    
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
   // Process queue batch
   const { data: messages, error } = await supabase.functions.invoke("read-queue", {
@@ -58,13 +74,18 @@ serve(async (req) => {
   });
 
   // Wait for all background tasks in a background process
-  EdgeRuntime.waitUntil(Promise.all(promises));
+  if (typeof EdgeRuntime !== 'undefined') {
+    EdgeRuntime.waitUntil(Promise.all(promises));
+  } else {
+    // In a non-Edge environment, wait synchronously
+    await Promise.all(promises);
+  }
   
   return new Response(JSON.stringify({ 
     processed: messages.length,
     success: true
   }));
-});
+};
 
 async function processArtist(
   supabase: any, 
@@ -128,3 +149,9 @@ async function processArtist(
   console.log(`Processed artist ${artistData.name}, enqueued album discovery for artist ID ${artist.id}`);
   return artist;
 }
+
+// Initialize the server in Deno environments
+serve(handler);
+
+// Export the handler for Node.js environments
+export { handler };

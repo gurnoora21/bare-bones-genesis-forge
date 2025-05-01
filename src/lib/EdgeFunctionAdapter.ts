@@ -2,6 +2,24 @@
 import { createClient } from '@supabase/supabase-js';
 import { EnvConfig } from './EnvConfig';
 
+// Import DenoTypes for type compatibility
+import './DenoTypes';
+
+/**
+ * Check if we're running in a Deno environment
+ */
+const isDeno = typeof globalThis !== 'undefined' && 'Deno' in globalThis;
+
+/**
+ * Get environment variable safely in either Deno or Node
+ */
+function getEnvVar(key: string): string {
+  if (isDeno) {
+    return (globalThis as any).Deno.env.get(key) || '';
+  }
+  return EnvConfig[key as keyof typeof EnvConfig] || '';
+}
+
 /**
  * Adapter for implementing functions that can run both 
  * in Node.js and as Supabase Edge Functions in Deno
@@ -12,10 +30,10 @@ export class EdgeFunctionAdapter {
    */
   static async sendToQueue(queueName: string, message: any): Promise<string> {
     // For Edge Function environment
-    if (typeof EdgeRuntime !== 'undefined') {
+    if (isDeno) {
       const supabase = createClient(
-        Deno.env.get("SUPABASE_URL")!,
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+        getEnvVar("SUPABASE_URL"),
+        getEnvVar("SUPABASE_SERVICE_ROLE_KEY")
       );
       
       const { data, error } = await supabase.functions.invoke("send-to-queue", {
@@ -50,10 +68,10 @@ export class EdgeFunctionAdapter {
    */
   static async readFromQueue(queueName: string, batchSize = 5, visibilityTimeout = 60): Promise<any[]> {
     // For Edge Function environment
-    if (typeof EdgeRuntime !== 'undefined') {
+    if (isDeno) {
       const supabase = createClient(
-        Deno.env.get("SUPABASE_URL")!,
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+        getEnvVar("SUPABASE_URL"),
+        getEnvVar("SUPABASE_SERVICE_ROLE_KEY")
       );
       
       const { data, error } = await supabase.functions.invoke("read-queue", {
@@ -95,10 +113,10 @@ export class EdgeFunctionAdapter {
    */
   static async deleteFromQueue(queueName: string, messageId: string): Promise<boolean> {
     // For Edge Function environment
-    if (typeof EdgeRuntime !== 'undefined') {
+    if (isDeno) {
       const supabase = createClient(
-        Deno.env.get("SUPABASE_URL")!,
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+        getEnvVar("SUPABASE_URL"),
+        getEnvVar("SUPABASE_SERVICE_ROLE_KEY")
       );
       
       const { data, error } = await supabase.functions.invoke("delete-from-queue", {
