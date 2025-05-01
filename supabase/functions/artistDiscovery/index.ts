@@ -42,7 +42,18 @@ serve(async (req) => {
   }
 
   // Parse the JSONB result from pg_dequeue
-  const messages = queueData ? JSON.parse(JSON.stringify(queueData)) : [];
+  let messages = [];
+  try {
+    // Handle both string and object formats
+    if (typeof queueData === 'string') {
+      messages = JSON.parse(queueData);
+    } else if (queueData) {
+      messages = queueData;
+    }
+  } catch (e) {
+    console.error("Error parsing queue data:", e);
+    console.log("Raw queue data:", queueData);
+  }
 
   console.log(`Retrieved ${messages.length} messages from queue`);
 
@@ -167,7 +178,7 @@ async function processArtist(
   console.log(`Stored artist in database with ID: ${artist.id}`);
 
   // Enqueue album discovery
-  const { error: queueError } = await supabase.rpc('pg_enqueue', {
+  const { data: enqueueData, error: queueError } = await supabase.rpc('pg_enqueue', {
     queue_name: 'album_discovery',
     message_body: JSON.stringify({ 
       artistId: artist.id, 
