@@ -29,7 +29,7 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
-    // Enqueue artist discovery task
+    // Use the pg_enqueue wrapper function instead of directly calling pgmq.send
     const { data: messageId, error } = await supabase.rpc('pg_enqueue', {
       queue_name: 'artist_discovery',
       message_body: JSON.stringify({ artistName })
