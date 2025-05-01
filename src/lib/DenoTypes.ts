@@ -17,7 +17,7 @@ declare global {
   
   // Define Deno namespace for TypeScript compatibility
   namespace Deno {
-    function env: {
+    const env: {
       get(key: string): string | undefined;
     };
   }
