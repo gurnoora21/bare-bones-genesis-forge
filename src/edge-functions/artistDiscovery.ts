@@ -1,4 +1,3 @@
-
 // Import DenoTypes for type compatibility
 import '../lib/DenoTypes';
 
@@ -10,15 +9,14 @@ interface ArtistDiscoveryMsg {
   artistName?: string;
 }
 
-// Use a dynamic import for Deno http/server
+// Use a different approach to handle Deno environments
 async function serve(handler: (req: Request) => Promise<Response>) {
   if (typeof globalThis !== 'undefined' && 'Deno' in globalThis) {
-    // Use dynamic import instead of static import to avoid TypeScript errors
-    try {
-      const { serve: denoServe } = await import("https://deno.land/std@0.177.0/http/server.ts");
-      return denoServe(handler);
-    } catch (error) {
-      console.error("Failed to import Deno http/server:", error);
+    // Instead of importing from deno.land, check if Deno.serve is available
+    if ('serve' in (globalThis as any).Deno) {
+      return (globalThis as any).Deno.serve(handler);
+    } else {
+      console.error("Deno.serve is not available");
       return null;
     }
   }

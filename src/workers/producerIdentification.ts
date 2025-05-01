@@ -89,8 +89,10 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
         continue;
       }
 
-      // Make sure producer.id is a string
-      const producerId = producer?.id ? producer.id.toString() : '';
+      // Fix: Make sure producer.id is a string with proper type handling
+      const producerId = producer && producer.id !== null && producer.id !== undefined 
+        ? producer.id.toString() 
+        : '';
       
       // Associate producer with track
       const { error: associationError } = await this.supabase
