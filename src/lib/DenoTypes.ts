@@ -11,8 +11,7 @@ declare global {
     waitUntil: (promise: Promise<any>) => void;
   }
   
-  // Declare EdgeRuntime as a variable without redeclaration
-  // Using var instead of const to avoid block-scoped declaration issues
+  // Declare EdgeRuntime as a global variable without redeclaration
   var EdgeRuntime: EdgeRuntimeInterface;
   
   // Define Deno namespace for TypeScript compatibility

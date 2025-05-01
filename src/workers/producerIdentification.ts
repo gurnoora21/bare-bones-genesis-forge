@@ -96,7 +96,7 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
         continue;
       }
 
-      // Explicitly convert the producer id to string
+      // Convert producer id to string to fix type error
       const producerId: string = String(producer.id);
       
       // Associate producer with track
