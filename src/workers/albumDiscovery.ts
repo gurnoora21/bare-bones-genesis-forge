@@ -2,6 +2,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker.ts';
 import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+import { EnvConfig } from '../lib/EnvConfig';
 
 interface AlbumDiscoveryMessage {
   artistId: string;
@@ -34,6 +35,11 @@ export class AlbumDiscoveryWorker extends BaseWorker<AlbumDiscoveryMessage> {
 
     if (artistError || !artist) {
       throw new Error(`Artist not found with ID: ${artistId}`);
+    }
+
+    // Ensure spotify_id is a string
+    if (typeof artist.spotify_id !== 'string') {
+      throw new Error(`Invalid Spotify ID for artist ${artistId}`);
     }
 
     // Fetch albums from Spotify
@@ -122,21 +128,15 @@ export class AlbumDiscoveryWorker extends BaseWorker<AlbumDiscoveryMessage> {
   }
 }
 
-// Edge function handler
-Deno.serve(async (req) => {
+// Node.js version of Edge function handler
+export async function handleAlbumDiscovery(): Promise<any> {
   try {
     const worker = new AlbumDiscoveryWorker();
     const metrics = await worker.processBatch();
     
-    return new Response(JSON.stringify(metrics), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return metrics;
   } catch (error) {
     console.error('Error in album discovery worker:', error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return { error: error instanceof Error ? error.message : 'Unknown error' };
   }
-});
+}

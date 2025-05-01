@@ -1,7 +1,7 @@
-
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker.ts';
 import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+import { EnvConfig } from '../lib/EnvConfig';
 
 interface ArtistDiscoveryMessage {
   artistId?: string;
@@ -110,21 +110,15 @@ export class ArtistDiscoveryWorker extends BaseWorker<ArtistDiscoveryMessage> {
   }
 }
 
-// Edge function handler
-Deno.serve(async (req) => {
+// Node.js version of Edge function handler
+export async function handleArtistDiscovery(): Promise<any> {
   try {
     const worker = new ArtistDiscoveryWorker();
     const metrics = await worker.processBatch();
     
-    return new Response(JSON.stringify(metrics), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return metrics;
   } catch (error) {
     console.error('Error in artist discovery worker:', error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return { error: error instanceof Error ? error.message : 'Unknown error' };
   }
-});
+}

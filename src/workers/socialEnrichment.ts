@@ -1,6 +1,6 @@
-
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker.ts';
+import { EnvConfig } from '../lib/EnvConfig';
 
 interface SocialEnrichmentMessage {
   producerId: string;
@@ -36,6 +36,11 @@ export class SocialEnrichmentWorker extends BaseWorker<SocialEnrichmentMessage> 
     }
 
     try {
+      // Ensure producer.name is a string
+      if (typeof producer.name !== 'string') {
+        throw new Error(`Invalid producer name for producer ${producerId}`);
+      }
+      
       // Try to find Instagram profile
       const instagramData = await this.findInstagramProfile(producer.name);
       
@@ -76,7 +81,7 @@ export class SocialEnrichmentWorker extends BaseWorker<SocialEnrichmentMessage> 
         // Instagram doesn't have an official API for this purpose,
         // so this would typically use a service like Proxycurl, SerpAPI, or similar
         
-        const instagramApiKey = Deno.env.get('INSTAGRAM_API_KEY');
+        const instagramApiKey = EnvConfig.INSTAGRAM_API_KEY;
         if (!instagramApiKey) {
           throw new Error('Instagram API key not configured');
         }
@@ -110,21 +115,15 @@ export class SocialEnrichmentWorker extends BaseWorker<SocialEnrichmentMessage> 
   }
 }
 
-// Edge function handler
-Deno.serve(async (req) => {
+// Node.js version of Edge function handler
+export async function handleSocialEnrichment(): Promise<any> {
   try {
     const worker = new SocialEnrichmentWorker();
     const metrics = await worker.processBatch();
     
-    return new Response(JSON.stringify(metrics), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return metrics;
   } catch (error) {
     console.error('Error in social enrichment worker:', error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return { error: error instanceof Error ? error.message : 'Unknown error' };
   }
-});
+}

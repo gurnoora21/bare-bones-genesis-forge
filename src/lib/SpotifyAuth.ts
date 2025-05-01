@@ -1,5 +1,6 @@
 
 import { createClient } from '@supabase/supabase-js';
+import { EnvConfig } from './EnvConfig';
 
 export interface SpotifyToken {
   access_token: string;
@@ -14,8 +15,8 @@ export class SpotifyAuth {
 
   private constructor() {
     this.supabase = createClient(
-      Deno.env.get('SUPABASE_URL') || '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+      EnvConfig.SUPABASE_URL,
+      EnvConfig.SUPABASE_SERVICE_ROLE_KEY
     );
   }
 
@@ -33,8 +34,8 @@ export class SpotifyAuth {
     }
 
     // If not, get a new token
-    const clientId = Deno.env.get('SPOTIFY_CLIENT_ID');
-    const clientSecret = Deno.env.get('SPOTIFY_CLIENT_SECRET');
+    const clientId = EnvConfig.SPOTIFY_CLIENT_ID;
+    const clientSecret = EnvConfig.SPOTIFY_CLIENT_SECRET;
 
     if (!clientId || !clientSecret) {
       throw new Error('Missing Spotify credentials');

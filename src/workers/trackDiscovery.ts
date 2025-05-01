@@ -1,7 +1,7 @@
-
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker.ts';
 import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+import { EnvConfig } from '../lib/EnvConfig';
 
 interface TrackDiscoveryMessage {
   albumId: string;
@@ -36,6 +36,11 @@ export class TrackDiscoveryWorker extends BaseWorker<TrackDiscoveryMessage> {
 
     if (albumError || !album) {
       throw new Error(`Album not found with ID: ${albumId}`);
+    }
+
+    // Ensure spotify_id is a string
+    if (typeof album.spotify_id !== 'string') {
+      throw new Error(`Invalid Spotify ID for album ${albumId}`);
     }
 
     // Get tracks from Spotify
@@ -159,21 +164,15 @@ export class TrackDiscoveryWorker extends BaseWorker<TrackDiscoveryMessage> {
   }
 }
 
-// Edge function handler
-Deno.serve(async (req) => {
+// Node.js version of Edge function handler
+export async function handleTrackDiscovery(): Promise<any> {
   try {
     const worker = new TrackDiscoveryWorker();
     const metrics = await worker.processBatch();
     
-    return new Response(JSON.stringify(metrics), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return metrics;
   } catch (error) {
     console.error('Error in track discovery worker:', error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return { error: error instanceof Error ? error.message : 'Unknown error' };
   }
-});
+}

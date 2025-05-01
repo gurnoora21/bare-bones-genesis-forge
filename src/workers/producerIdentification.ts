@@ -1,7 +1,7 @@
-
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker.ts';
 import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+import { EnvConfig } from '../lib/EnvConfig';
 
 interface ProducerIdentificationMessage {
   trackId: string;
@@ -56,6 +56,11 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
 
     if (artistError || !artistData) {
       throw new Error(`Artist not found with ID: ${artistId}`);
+    }
+
+    // Ensure artist name is a string
+    if (typeof artistData.name !== 'string') {
+      throw new Error(`Invalid artist name for artist ${artistId}`);
     }
 
     // Get producers from Spotify metadata if available
@@ -161,7 +166,7 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
       // First, search for the song on Genius
       await this.waitForRateLimit('genius');
       
-      const geniusAccessToken = Deno.env.get('GENIUS_ACCESS_TOKEN');
+      const geniusAccessToken = EnvConfig.GENIUS_ACCESS_TOKEN;
       if (!geniusAccessToken) {
         throw new Error('Genius API token not configured');
       }
@@ -273,21 +278,15 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
   }
 }
 
-// Edge function handler
-Deno.serve(async (req) => {
+// Node.js version of Edge function handler
+export async function handleProducerIdentification(): Promise<any> {
   try {
     const worker = new ProducerIdentificationWorker();
     const metrics = await worker.processBatch();
     
-    return new Response(JSON.stringify(metrics), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return metrics;
   } catch (error) {
     console.error('Error in producer identification worker:', error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return { error: error instanceof Error ? error.message : 'Unknown error' };
   }
-});
+}

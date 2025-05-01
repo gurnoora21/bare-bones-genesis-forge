@@ -1,5 +1,6 @@
 
 import { createClient } from '@supabase/supabase-js';
+import { EnvConfig } from './EnvConfig';
 
 // Interface for metrics tracking
 export interface ProcessingMetrics {
@@ -59,8 +60,8 @@ export class BaseWorker<T = any> {
   constructor(options: WorkerOptions) {
     // Get Supabase credentials from environment
     this.supabase = createClient(
-      Deno.env.get('SUPABASE_URL') || '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+      EnvConfig.SUPABASE_URL,
+      EnvConfig.SUPABASE_SERVICE_ROLE_KEY
     );
     
     this.queueName = options.queueName;
@@ -96,7 +97,7 @@ export class BaseWorker<T = any> {
       
       if (error) throw error;
       
-      if (!messages || messages.length === 0) {
+      if (!messages || !Array.isArray(messages) || messages.length === 0) {
         metrics.finishedAt = new Date();
         return metrics;
       }
@@ -104,7 +105,7 @@ export class BaseWorker<T = any> {
       metrics.processedCount = messages.length;
       
       // Process each message in the batch
-      const processPromises = messages.map(async (message) => {
+      const processPromises = messages.map(async (message: any) => {
         try {
           const payload = JSON.parse(message.message_body);
           
