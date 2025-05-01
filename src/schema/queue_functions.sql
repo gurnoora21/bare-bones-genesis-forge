@@ -8,15 +8,26 @@ SELECT pgmq.create('track_discovery');
 SELECT pgmq.create('producer_identification');
 SELECT pgmq.create('social_enrichment');
 
--- Function to enqueue a message
+-- Function to enqueue a message with JSONB type support
+DROP FUNCTION IF EXISTS pg_enqueue(TEXT, TEXT);
+
 CREATE OR REPLACE FUNCTION pg_enqueue(
   queue_name TEXT,
-  message_body TEXT
+  message_body TEXT  -- We'll keep this as TEXT but cast to JSONB internally
 ) RETURNS UUID AS $$
 DECLARE
   msg_id UUID;
+  jsonb_message JSONB;
 BEGIN
-  SELECT pgmq.send(queue_name, message_body) INTO msg_id;
+  -- Convert the text message to JSONB
+  BEGIN
+    jsonb_message := message_body::JSONB;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'Invalid JSON format: %', message_body;
+  END;
+  
+  -- Now call pgmq.send with the properly typed parameters
+  SELECT pgmq.send(queue_name, jsonb_message) INTO msg_id;
   RETURN msg_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -61,7 +72,7 @@ BEGIN
   IF success THEN
     -- Re-send the message with original body
     PERFORM pgmq.send(queue_name, (
-      SELECT message_body 
+      SELECT message_body::JSONB
       FROM pgmq.get_queue_table_name(queue_name) 
       WHERE id = message_id
     ));
@@ -151,8 +162,12 @@ SELECT cron.schedule(
 CREATE OR REPLACE FUNCTION start_artist_discovery(artist_name TEXT) RETURNS UUID AS $$
 DECLARE
   msg_id UUID;
+  payload JSONB;
 BEGIN
-  SELECT pgmq.send('artist_discovery', json_build_object('artistName', artist_name)::TEXT) INTO msg_id;
+  -- Create a proper JSONB payload
+  payload := jsonb_build_object('artistName', artist_name);
+  -- Send it to the queue
+  SELECT pgmq.send('artist_discovery', payload) INTO msg_id;
   RETURN msg_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
