@@ -6,7 +6,7 @@
 
 // Define EdgeRuntime for TypeScript compatibility
 declare global {
-  // Define EdgeRuntime interface
+  // Define EdgeRuntime interface if it doesn't exist
   interface EdgeRuntimeInterface {
     waitUntil: (promise: Promise<any>) => void;
   }
