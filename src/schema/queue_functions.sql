@@ -78,13 +78,12 @@ SELECT cron.schedule(
   '*/2 * * * *',
   $$
   SELECT
-    supabase.http((
-      'POST', 
-      (SELECT value FROM secrets.env WHERE key = 'SUPABASE_URL') || '/functions/v1/artistDiscovery',
-      '{"Content-type":"application/json"}',
-      '{}',
-      0
-    ))
+    net.http_post(
+      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/artistDiscovery',
+      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
+      body:= '{}'::jsonb,
+      timeout_milliseconds:= 0
+    );
   $$
 );
 
@@ -94,13 +93,12 @@ SELECT cron.schedule(
   '*/5 * * * *',
   $$
   SELECT
-    supabase.http((
-      'POST', 
-      (SELECT value FROM secrets.env WHERE key = 'SUPABASE_URL') || '/functions/v1/albumDiscovery',
-      '{"Content-type":"application/json"}',
-      '{}',
-      0
-    ))
+    net.http_post(
+      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/albumDiscovery',
+      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
+      body:= '{}'::jsonb,
+      timeout_milliseconds:= 0
+    );
   $$
 );
 
@@ -110,13 +108,12 @@ SELECT cron.schedule(
   '*/5 * * * *',
   $$
   SELECT
-    supabase.http((
-      'POST', 
-      (SELECT value FROM secrets.env WHERE key = 'SUPABASE_URL') || '/functions/v1/trackDiscovery',
-      '{"Content-type":"application/json"}',
-      '{}',
-      0
-    ))
+    net.http_post(
+      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/trackDiscovery',
+      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
+      body:= '{}'::jsonb,
+      timeout_milliseconds:= 0
+    );
   $$
 );
 
@@ -126,13 +123,12 @@ SELECT cron.schedule(
   '*/10 * * * *',
   $$
   SELECT
-    supabase.http((
-      'POST', 
-      (SELECT value FROM secrets.env WHERE key = 'SUPABASE_URL') || '/functions/v1/producerIdentification',
-      '{"Content-type":"application/json"}',
-      '{}',
-      0
-    ))
+    net.http_post(
+      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/producerIdentification',
+      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
+      body:= '{}'::jsonb,
+      timeout_milliseconds:= 0
+    );
   $$
 );
 
@@ -142,13 +138,12 @@ SELECT cron.schedule(
   '0 * * * *',
   $$
   SELECT
-    supabase.http((
-      'POST', 
-      (SELECT value FROM secrets.env WHERE key = 'SUPABASE_URL') || '/functions/v1/socialEnrichment',
-      '{"Content-type":"application/json"}',
-      '{}',
-      0
-    ))
+    net.http_post(
+      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/socialEnrichment',
+      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
+      body:= '{}'::jsonb,
+      timeout_milliseconds:= 0
+    );
   $$
 );
 

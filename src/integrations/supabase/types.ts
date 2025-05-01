@@ -366,6 +366,26 @@ export type Database = {
           track_count: number
         }[]
       }
+      pg_delete_message: {
+        Args: { queue_name: string; message_id: string }
+        Returns: boolean
+      }
+      pg_dequeue: {
+        Args: {
+          queue_name: string
+          batch_size?: number
+          visibility_timeout?: number
+        }
+        Returns: Json
+      }
+      pg_enqueue: {
+        Args: { queue_name: string; message_body: string }
+        Returns: string
+      }
+      pg_release_message: {
+        Args: { queue_name: string; message_id: string }
+        Returns: boolean
+      }
       search_producers: {
         Args: { search_term: string }
         Returns: {
@@ -376,6 +396,14 @@ export type Database = {
           track_count: number
           artist_count: number
         }[]
+      }
+      start_artist_discovery: {
+        Args: { artist_name: string }
+        Returns: string
+      }
+      start_bulk_artist_discovery: {
+        Args: { genre?: string; min_popularity?: number; limit_count?: number }
+        Returns: string[]
       }
     }
     Enums: {

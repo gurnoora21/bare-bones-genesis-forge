@@ -1,145 +1,182 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 
-// Spotify API client for Edge Functions
-
+/**
+ * SpotifyClient handles authentication and API calls to the Spotify Web API,
+ * implementing proper rate limiting and retry logic.
+ */
 export class SpotifyClient {
   private clientId: string;
   private clientSecret: string;
-  private token: string | null = null;
-  private tokenExpires: number = 0;
-  private readonly baseUrl = "https://api.spotify.com/v1";
+  private accessToken: string | null;
+  private tokenExpiry: number;
   
   constructor() {
     this.clientId = Deno.env.get("SPOTIFY_CLIENT_ID") || "";
     this.clientSecret = Deno.env.get("SPOTIFY_CLIENT_SECRET") || "";
+    this.accessToken = null;
+    this.tokenExpiry = 0;
     
     if (!this.clientId || !this.clientSecret) {
-      throw new Error("Spotify API credentials not configured");
+      throw new Error("Spotify client ID and client secret must be provided as environment variables");
     }
   }
-  
-  // Core auth and request methods
-  private async getToken(): Promise<string> {
-    if (this.token && Date.now() < this.tokenExpires) {
-      return this.token;
+
+  /**
+   * Get an access token for the Spotify API
+   */
+  async getAccessToken(): Promise<string> {
+    const now = Date.now();
+    
+    // If we have a valid token that's not expired, return it
+    if (this.accessToken && now < this.tokenExpiry - 60000) {
+      return this.accessToken;
     }
     
-    const response = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
+    // Otherwise, get a new token
+    try {
+      const response = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": `Basic ${btoa(`${this.clientId}:${this.clientSecret}`)}`
+        },
+        body: "grant_type=client_credentials"
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Failed to get access token: ${response.statusText}`);
+      }
+      
+      const data = await response.json();
+      this.accessToken = data.access_token;
+      this.tokenExpiry = now + (data.expires_in * 1000);
+      return this.accessToken;
+    } catch (error) {
+      console.error("Error getting Spotify access token:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Make an authenticated request to the Spotify API with rate limiting and retries
+   */
+  async apiRequest(endpoint: string, method = "GET", body?: any): Promise<any> {
+    const token = await this.getAccessToken();
+    const url = endpoint.startsWith("https://") 
+      ? endpoint 
+      : `https://api.spotify.com/v1${endpoint}`;
+    
+    const options: RequestInit = {
+      method,
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": `Basic ${btoa(`${this.clientId}:${this.clientSecret}`)}`
-      },
-      body: "grant_type=client_credentials"
-    });
-    
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Spotify token request failed: ${error}`);
-    }
-    
-    const data = await response.json();
-    this.token = data.access_token;
-    this.tokenExpires = Date.now() + (data.expires_in * 1000);
-    return this.token;
-  }
-  
-  private async request(endpoint: string, method: string = "GET", data?: any): Promise<any> {
-    const token = await this.getToken();
-    
-    const headers: HeadersInit = {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json"
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
     };
     
-    const options: RequestInit = { method, headers };
-    if (data) {
-      options.body = JSON.stringify(data);
+    if (body && (method === "POST" || method === "PUT")) {
+      options.body = JSON.stringify(body);
     }
     
-    const response = await fetch(`${this.baseUrl}${endpoint}`, options);
+    // Implement exponential backoff retries
+    const maxRetries = 5;
+    let retryCount = 0;
+    let lastError: Error | null = null;
     
-    if (response.status === 429) {
-      const retryAfter = parseInt(response.headers.get("Retry-After") || "1", 10);
-      console.log(`Rate limited by Spotify. Retrying after ${retryAfter} seconds`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      return this.request(endpoint, method, data);
+    while (retryCount < maxRetries) {
+      try {
+        const response = await fetch(url, options);
+        
+        if (response.status === 204) {
+          return null; // No content
+        }
+        
+        if (response.status === 429) {
+          // Rate limited - get retry after time
+          const retryAfter = parseInt(response.headers.get("Retry-After") || "1", 10);
+          console.log(`Rate limited, waiting for ${retryAfter} seconds`);
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+          retryCount++;
+          continue;
+        }
+        
+        if (!response.ok) {
+          throw new Error(`Spotify API error: ${response.status} ${await response.text()}`);
+        }
+        
+        return await response.json();
+      } catch (error) {
+        console.error(`API request failed (attempt ${retryCount + 1}/${maxRetries}):`, error);
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        // Exponential backoff with jitter
+        const baseDelay = Math.pow(2, retryCount) * 1000;
+        const jitter = Math.random() * 1000;
+        const delay = baseDelay + jitter;
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+        retryCount++;
+      }
     }
     
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Spotify API request failed (${response.status}): ${error}`);
-    }
-    
-    return await response.json();
+    throw lastError || new Error("Max retries exceeded");
   }
+
+  // Artist-related methods
   
-  // Artist methods
   async getArtistById(id: string): Promise<any> {
-    return this.request(`/artists/${id}`);
+    return this.apiRequest(`/artists/${id}`);
   }
   
   async getArtistByName(name: string): Promise<any> {
-    const response = await this.request(`/search?q=${encodeURIComponent(name)}&type=artist&limit=1`);
-    return response.artists.items.length > 0 ? response.artists.items[0] : null;
+    const result = await this.apiRequest(`/search?q=${encodeURIComponent(name)}&type=artist&limit=1`);
+    
+    if (result.artists && result.artists.items && result.artists.items.length > 0) {
+      return result.artists.items[0];
+    }
+    
+    return null;
   }
   
-  // Album methods
-  async getArtistAlbums(artistId: string, offset: number = 0, limit: number = 50): Promise<any> {
-    return this.request(`/artists/${artistId}/albums?limit=${limit}&offset=${offset}&include_groups=album,single`);
+  async getArtistAlbums(artistId: string, offset = 0, limit = 50): Promise<any> {
+    return this.apiRequest(`/artists/${artistId}/albums?offset=${offset}&limit=${limit}&include_groups=album,single`);
   }
+
+  // Album-related methods
   
   async getAlbumDetails(albumIds: string[]): Promise<any[]> {
-    if (albumIds.length === 0) {
-      return [];
-    }
+    // Spotify allows batching up to 20 album IDs in one request
+    const results = [];
     
-    const batchSize = 20;
-    const results: any[] = [];
-    
-    for (let i = 0; i < albumIds.length; i += batchSize) {
-      const batch = albumIds.slice(i, i + batchSize);
-      const response = await this.request(`/albums?ids=${batch.join(",")}`);
-      results.push(...response.albums);
+    for (let i = 0; i < albumIds.length; i += 20) {
+      const batchIds = albumIds.slice(i, i + 20);
+      const response = await this.apiRequest(`/albums?ids=${batchIds.join(',')}`);
+      
+      if (response && response.albums) {
+        results.push(...response.albums);
+      }
     }
     
     return results;
   }
   
-  // Track methods
-  async getAlbumTracks(albumId: string, offset: number = 0, limit: number = 50): Promise<any> {
-    return this.request(`/albums/${albumId}/tracks?limit=${limit}&offset=${offset}`);
+  async getAlbumTracks(albumId: string, offset = 0, limit = 50): Promise<any> {
+    return this.apiRequest(`/albums/${albumId}/tracks?offset=${offset}&limit=${limit}`);
   }
+
+  // Track-related methods
   
   async getTrackDetails(trackIds: string[]): Promise<any[]> {
-    if (trackIds.length === 0) {
-      return [];
-    }
+    // Spotify allows batching up to 50 track IDs in one request
+    const results = [];
     
-    const batchSize = 50;
-    const results: any[] = [];
-    
-    for (let i = 0; i < trackIds.length; i += batchSize) {
-      const batch = trackIds.slice(i, i + batchSize);
-      const response = await this.request(`/tracks?ids=${batch.join(",")}`);
-      results.push(...response.tracks.filter((t: any) => t !== null));
-    }
-    
-    return results;
-  }
-  
-  // Audio features
-  async getAudioFeatures(trackIds: string[]): Promise<any[]> {
-    if (trackIds.length === 0) {
-      return [];
-    }
-    
-    const batchSize = 100;
-    const results: any[] = [];
-    
-    for (let i = 0; i < trackIds.length; i += batchSize) {
-      const batch = trackIds.slice(i, i + batchSize);
-      const response = await this.request(`/audio-features?ids=${batch.join(",")}`);
-      results.push(...response.audio_features.filter((f: any) => f !== null));
+    for (let i = 0; i < trackIds.length; i += 50) {
+      const batchIds = trackIds.slice(i, i + 50);
+      const response = await this.apiRequest(`/tracks?ids=${batchIds.join(',')}`);
+      
+      if (response && response.tracks) {
+        results.push(...response.tracks);
+      }
     }
     
     return results;

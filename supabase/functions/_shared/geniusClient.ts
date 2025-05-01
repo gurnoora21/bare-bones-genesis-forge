@@ -1,128 +1,175 @@
 
-// Genius API client for Edge Functions
-
+/**
+ * GeniusClient handles authentication and API calls to the Genius API,
+ * implementing proper rate limiting and retry logic.
+ */
 export class GeniusClient {
   private accessToken: string;
-  private readonly baseUrl = "https://api.genius.com";
-  private rateLimitDelay = 200; // ms between requests
-  private lastRequestTime = 0;
+  private lastRequestTime: number;
+  private requestDelay: number; // Minimum milliseconds between requests
   
   constructor() {
     this.accessToken = Deno.env.get("GENIUS_ACCESS_TOKEN") || "";
+    this.lastRequestTime = 0;
+    this.requestDelay = 200; // 5 requests per second max
     
     if (!this.accessToken) {
-      console.warn("Genius API token not configured, some producer data may be missing");
+      throw new Error("Genius access token must be provided as environment variable");
     }
   }
-  
-  private async throttledRequest(url: string): Promise<any> {
-    // Respect rate limits with simple throttling
+
+  /**
+   * Make a rate-limited request to the Genius API
+   */
+  async apiRequest(endpoint: string): Promise<any> {
+    const url = endpoint.startsWith("https://")
+      ? endpoint
+      : `https://api.genius.com${endpoint}`;
+    
+    // Implement rate limiting
     const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
+    const timeToWait = Math.max(0, this.requestDelay - (now - this.lastRequestTime));
     
-    if (timeSinceLastRequest < this.rateLimitDelay) {
-      await new Promise(resolve => 
-        setTimeout(resolve, this.rateLimitDelay - timeSinceLastRequest)
-      );
+    if (timeToWait > 0) {
+      await new Promise(resolve => setTimeout(resolve, timeToWait));
     }
     
-    this.lastRequestTime = Date.now();
+    // Implement exponential backoff retries
+    const maxRetries = 3;
+    let retryCount = 0;
+    let lastError: Error | null = null;
     
-    const response = await fetch(url, {
-      headers: {
-        "Authorization": `Bearer ${this.accessToken}`,
-        "Content-Type": "application/json"
+    while (retryCount < maxRetries) {
+      try {
+        this.lastRequestTime = Date.now();
+        
+        const response = await fetch(url, {
+          headers: {
+            "Authorization": `Bearer ${this.accessToken}`
+          }
+        });
+        
+        if (response.status === 429) {
+          // Rate limited - back off more aggressively
+          console.log("Genius API rate limited, backing off");
+          await new Promise(resolve => setTimeout(resolve, 2000 * Math.pow(2, retryCount)));
+          retryCount++;
+          continue;
+        }
+        
+        if (!response.ok) {
+          throw new Error(`Genius API error: ${response.status} ${await response.text()}`);
+        }
+        
+        return await response.json();
+      } catch (error) {
+        console.error(`Genius API request failed (attempt ${retryCount + 1}/${maxRetries}):`, error);
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        // Exponential backoff with jitter
+        const baseDelay = Math.pow(2, retryCount) * 1000;
+        const jitter = Math.random() * 1000;
+        const delay = baseDelay + jitter;
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+        retryCount++;
       }
-    });
-    
-    if (response.status === 429) {
-      this.rateLimitDelay += 100; // Increase delay on rate limit
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      return this.throttledRequest(url);
     }
     
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Genius API request failed (${response.status}): ${error}`);
-    }
-    
-    return await response.json();
+    throw lastError || new Error("Max retries exceeded");
   }
-  
+
+  /**
+   * Search for a song on Genius
+   */
   async search(trackName: string, artistName: string): Promise<any> {
-    if (!this.accessToken) return null;
-    
-    // Format query string
     const query = encodeURIComponent(`${trackName} ${artistName}`);
-    const url = `${this.baseUrl}/search?q=${query}`;
+    const result = await this.apiRequest(`/search?q=${query}`);
     
-    try {
-      const data = await this.throttledRequest(url);
-      
-      if (data.response.hits && data.response.hits.length > 0) {
-        // Find best match
-        return data.response.hits[0].result;
-      }
-      
-      return null;
-    } catch (error) {
-      console.error(`Error searching Genius: ${error}`);
-      return null;
+    if (result.response && result.response.hits && result.response.hits.length > 0) {
+      // Find the most relevant hit (usually the first one)
+      const hit = result.response.hits.find((h: any) => h.type === "song") || result.response.hits[0];
+      return hit.result;
     }
+    
+    return null;
   }
-  
+
+  /**
+   * Get detailed song information including producer credits
+   */
   async getSong(songId: number): Promise<any> {
-    if (!this.accessToken) return null;
+    const result = await this.apiRequest(`/songs/${songId}`);
     
-    const url = `${this.baseUrl}/songs/${songId}`;
-    
-    try {
-      const data = await this.throttledRequest(url);
-      return data.response.song;
-    } catch (error) {
-      console.error(`Error getting song details from Genius: ${error}`);
-      return null;
+    if (result.response && result.response.song) {
+      return result.response.song;
     }
-  }
-  
-  extractProducers(songData: any): Array<{name: string, confidence: number, source: string}> {
-    const producers: Array<{name: string, confidence: number, source: string}> = [];
     
-    try {
-      // Extract producer credits from Genius data
-      if (songData.producer_artists) {
-        songData.producer_artists.forEach((producer: any) => {
+    return null;
+  }
+
+  /**
+   * Extract producer information from song details
+   */
+  extractProducers(songDetails: any): { name: string, confidence: number, source: string }[] {
+    const producers: { name: string, confidence: number, source: string }[] = [];
+    
+    // Check for direct producer_artists field
+    if (songDetails.producer_artists && Array.isArray(songDetails.producer_artists)) {
+      songDetails.producer_artists.forEach((producer: any) => {
+        if (producer && producer.name) {
           producers.push({
             name: producer.name,
-            confidence: 0.95,
-            source: 'genius_producer_credit'
-          });
-        });
-      }
-      
-      // Try to find producer info in song description
-      if (songData.description && songData.description.plain) {
-        const producerMatches = songData.description.plain
-          .match(/produced by[:\s]+([^.\n,]+)/gi);
-        
-        if (producerMatches) {
-          producerMatches.forEach((match: string) => {
-            const producerName = match
-              .replace(/produced by[:\s]+/i, '')
-              .trim();
-            
-            if (producerName) {
-              producers.push({
-                name: producerName,
-                confidence: 0.8,
-                source: 'genius_description'
-              });
-            }
+            confidence: 0.95, // High confidence since these are explicitly labeled
+            source: 'genius_producer_artists'
           });
         }
-      }
-    } catch (error) {
-      console.warn('Error extracting producers from Genius data:', error);
+      });
+    }
+    
+    // Check custom performance roles
+    if (songDetails.custom_performances && Array.isArray(songDetails.custom_performances)) {
+      songDetails.custom_performances.forEach((performance: any) => {
+        if (performance.label && 
+            (performance.label.toLowerCase().includes('produc') || 
+             performance.label.toLowerCase().includes('beat'))) {
+          
+          performance.artists.forEach((artist: any) => {
+            producers.push({
+              name: artist.name,
+              confidence: 0.9,
+              source: 'genius_custom_performances'
+            });
+          });
+        }
+      });
+    }
+    
+    // Check description for producer mentions
+    if (songDetails.description && songDetails.description.html) {
+      const description = songDetails.description.html;
+      
+      // Simple producer extraction via patterns like "Produced by X" or "Producer: X"
+      const producerPatterns = [
+        /[Pp]roduced by ([^<.,]+)/g,
+        /[Pp]roducer(?:s)?:? ([^<.,]+)/g,
+        /[Bb]eat(?:s)? by ([^<.,]+)/g
+      ];
+      
+      producerPatterns.forEach(pattern => {
+        let match;
+        while ((match = pattern.exec(description)) !== null) {
+          const producer = match[1].trim();
+          // Avoid capturing too much text
+          if (producer.length < 50 && producer.split(" ").length < 6) {
+            producers.push({
+              name: producer,
+              confidence: 0.7, // Lower confidence for text extraction
+              source: 'genius_description'
+            });
+          }
+        }
+      });
     }
     
     return producers;
