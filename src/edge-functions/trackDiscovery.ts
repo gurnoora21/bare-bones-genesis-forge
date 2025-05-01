@@ -1,7 +1,9 @@
 
-import { serve } from "https://deno.land/std/http/server.ts";
+// Import DenoTypes for type compatibility
+import '../lib/DenoTypes';
+
 import { createClient } from "@supabase/supabase-js";
-import { SpotifyClient } from "../lib/SpotifyClient.ts";
+import { SpotifyClient } from "../lib/SpotifyClient";
 
 interface TrackDiscoveryMsg {
   albumId: string;
@@ -10,17 +12,33 @@ interface TrackDiscoveryMsg {
   offset?: number;
 }
 
-serve(async (req) => {
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-  );
+// Use a safe approach to handle Deno environments
+async function serve(handler: (req: Request) => Promise<Response>) {
+  if (typeof globalThis !== 'undefined' && 'Deno' in globalThis) {
+    // Instead of importing from deno.land, check if Deno.serve is available
+    if ('serve' in (globalThis as any).Deno) {
+      return (globalThis as any).Deno.serve(handler);
+    } else {
+      console.error("Deno.serve is not available");
+      return null;
+    }
+  }
+  return null;
+}
 
-  // Initialize Spotify client
-  const spotifyClient = new SpotifyClient(
-    Deno.env.get("SPOTIFY_CLIENT_ID")!,
-    Deno.env.get("SPOTIFY_CLIENT_SECRET")!
-  );
+// Initialize the Spotify client
+const spotifyClient = new SpotifyClient('', ''); // We'll get actual credentials later
+
+const handler = async (req: Request) => {
+  // Get environment variables safely
+  const SUPABASE_URL = typeof globalThis !== 'undefined' && 'Deno' in globalThis 
+    ? (globalThis as any).Deno.env.get("SUPABASE_URL")!
+    : '';
+  const SUPABASE_SERVICE_ROLE_KEY = typeof globalThis !== 'undefined' && 'Deno' in globalThis 
+    ? (globalThis as any).Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    : '';
+    
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
   // Process queue batch
   const { data: messages, error } = await supabase.functions.invoke("read-queue", {
@@ -36,19 +54,28 @@ serve(async (req) => {
     return new Response(JSON.stringify({ error }), { status: 500 });
   }
 
+  if (!messages || messages.length === 0) {
+    return new Response(JSON.stringify({ processed: 0, message: "No messages to process" }));
+  }
+
   // Process messages with background tasks
   const promises = messages.map(async (message) => {
-    const msg = message.message as TrackDiscoveryMsg;
+    // Ensure the message is properly typed
+    const msg = typeof message.message === 'string' 
+      ? JSON.parse(message.message) as TrackDiscoveryMsg 
+      : message.message as TrackDiscoveryMsg;
+      
     const messageId = message.id;
     
     try {
-      await processTracks(supabase, spotifyClient, msg);
+      await processTracks(supabase, msg);
       // Archive processed message
       await supabase.functions.invoke("delete-from-queue", {
         body: { queue_name: "track_discovery", message_id: messageId }
       });
+      console.log(`Successfully processed track message ${messageId}`);
     } catch (error) {
-      console.error(`Error processing track message:`, error);
+      console.error(`Error processing track message ${messageId}:`, error);
       // Message will return to queue after visibility timeout
     }
   });
@@ -57,44 +84,56 @@ serve(async (req) => {
   if (typeof EdgeRuntime !== 'undefined') {
     EdgeRuntime.waitUntil(Promise.all(promises));
   } else {
+    // In a non-Edge environment, wait synchronously
     await Promise.all(promises);
   }
   
-  return new Response(JSON.stringify({ processed: messages.length }));
-});
+  return new Response(JSON.stringify({ 
+    processed: messages.length,
+    success: true
+  }));
+};
 
-async function processTracks(supabase, spotifyClient: SpotifyClient, msg: TrackDiscoveryMsg) {
+async function processTracks(
+  supabase: any, 
+  msg: TrackDiscoveryMsg
+) {
   const { albumId, albumName, artistId, offset = 0 } = msg;
   
   // Get album's database ID
   const { data: album, error: albumError } = await supabase
     .from('albums')
-    .select('id')
-    .eq('spotify_id', albumId)
+    .select('id, spotify_id')
+    .eq('id', albumId)
     .single();
 
   if (albumError || !album) {
-    throw new Error(`Album ${albumId} not found in database`);
+    throw new Error(`Album not found with ID: ${albumId}`);
   }
 
   // Get artist's database ID for normalized tracks
   const { data: artist, error: artistError } = await supabase
     .from('artists')
-    .select('id')
-    .eq('spotify_id', artistId)
+    .select('id, name')
+    .eq('id', artistId)
     .single();
 
   if (artistError || !artist) {
-    throw new Error(`Artist ${artistId} not found in database`);
+    throw new Error(`Artist not found with ID: ${artistId}`);
   }
 
+  // Ensure spotify_id is a string
+  if (typeof album.spotify_id !== 'string') {
+    throw new Error(`Invalid Spotify ID for album ${albumId}`);
+  }
+  
   // Fetch tracks from Spotify
-  const tracks = await spotifyClient.getAlbumTracks(albumId, offset);
-  console.log(`Found ${tracks.items.length} tracks in album ${albumName}`);
+  const tracksData = await spotifyClient.getAlbumTracks(album.spotify_id, offset);
+  console.log(`Found ${tracksData.items.length} tracks in album ${albumName}`);
 
   // Filter and normalize tracks
-  const tracksToProcess = tracks.items.filter(track => 
-    isArtistPrimaryOnTrack(track, artistId)
+  const tracksToProcess = tracksData.items.filter(track => 
+    isArtistPrimaryOnTrack(track, artist.id)
   );
 
   // Get detailed track info in batches of 50 (Spotify API limit)
@@ -123,6 +162,7 @@ async function processTracks(supabase, spotifyClient: SpotifyClient, msg: TrackD
         .from('tracks')
         .upsert({
           album_id: album.id,
+          artist_id: artist.id,  // Include artist ID directly for easier queries
           spotify_id: track.id,
           name: track.name,
           duration_ms: track.duration_ms,
@@ -177,12 +217,17 @@ async function processTracks(supabase, spotifyClient: SpotifyClient, msg: TrackD
   }
 
   // If there are more tracks, enqueue next page
-  if (tracks.items.length > 0 && offset + tracks.items.length < tracks.total) {
-    const newOffset = offset + tracks.items.length;
+  if (tracksData.items.length > 0 && offset + tracksData.items.length < tracksData.total) {
+    const newOffset = offset + tracksData.items.length;
     await supabase.functions.invoke("send-to-queue", {
       body: {
         queue_name: "track_discovery",
-        message: { albumId, albumName, artistId, offset: newOffset }
+        message: { 
+          albumId, 
+          albumName, 
+          artistId, 
+          offset: newOffset 
+        }
       }
     });
     console.log(`Enqueued next page of tracks for album ${albumName} with offset ${newOffset}`);
@@ -201,104 +246,14 @@ function normalizeTrackName(name: string): string {
     .replace(/\s+/g, ' '); // Normalize whitespace
 }
 
-function isArtistPrimaryOnTrack(track, artistId: string): boolean {
+function isArtistPrimaryOnTrack(track: any, artistId: string): boolean {
   return track.artists && 
          track.artists.length > 0 && 
          track.artists[0].id === artistId;
 }
 
-// Create a specific SpotifyClient wrapper for Edge Functions
-class SpotifyClient {
-  private token: string | null = null;
-  private tokenExpiry: number = 0;
-  private clientId: string;
-  private clientSecret: string;
+// Initialize the server in Deno environments
+serve(handler);
 
-  constructor(clientId: string, clientSecret: string) {
-    this.clientId = clientId;
-    this.clientSecret = clientSecret;
-  }
-
-  private async getToken(): Promise<string> {
-    if (this.token && this.tokenExpiry > Date.now()) {
-      return this.token;
-    }
-
-    const response = await fetch('https://accounts.spotify.com/api/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${btoa(`${this.clientId}:${this.clientSecret}`)}`
-      },
-      body: 'grant_type=client_credentials'
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to get Spotify token: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    this.token = data.access_token;
-    this.tokenExpiry = Date.now() + (data.expires_in * 1000) - 60000; // Subtract 1 minute as buffer
-    return this.token;
-  }
-
-  private async apiRequest<T>(url: string): Promise<T> {
-    const token = await this.getToken();
-    const headers = { 'Authorization': `Bearer ${token}` };
-    
-    // Handle rate limiting with retries
-    let retries = 0;
-    const maxRetries = 3;
-    
-    while (retries <= maxRetries) {
-      try {
-        const response = await fetch(url, { headers });
-        
-        // Handle rate limiting
-        if (response.status === 429) {
-          const retryAfter = parseInt(response.headers.get('Retry-After') || '1', 10);
-          await new Promise(r => setTimeout(r, retryAfter * 1000));
-          retries++;
-          continue;
-        }
-        
-        if (!response.ok) {
-          throw new Error(`Spotify API error: ${response.status} ${response.statusText}`);
-        }
-        
-        return await response.json();
-      } catch (error) {
-        if (retries >= maxRetries) throw error;
-        
-        // Exponential backoff
-        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, retries)));
-        retries++;
-      }
-    }
-    
-    throw new Error('Maximum retries exceeded');
-  }
-
-  async getAlbumTracks(albumId: string, offset = 0, limit = 50): Promise<any> {
-    return this.apiRequest(
-      `https://api.spotify.com/v1/albums/${albumId}/tracks?limit=${limit}&offset=${offset}`
-    );
-  }
-
-  async getTrackDetails(trackIds: string[]): Promise<any[]> {
-    if (trackIds.length === 0) return [];
-    
-    // Handle up to 50 tracks at once (Spotify API limit)
-    if (trackIds.length === 1) {
-      const track = await this.apiRequest(`https://api.spotify.com/v1/tracks/${trackIds[0]}`);
-      return [track];
-    }
-    
-    const response = await this.apiRequest(
-      `https://api.spotify.com/v1/tracks?ids=${trackIds.join(',')}`
-    );
-    
-    return response.tracks || [];
-  }
-}
+// Export the handler for Node.js environments
+export { handler };

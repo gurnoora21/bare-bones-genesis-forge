@@ -6,22 +6,18 @@
 
 // Define EdgeRuntime for TypeScript compatibility
 declare global {
-  interface Window {
-    EdgeRuntime: {
-      waitUntil: (promise: Promise<any>) => void;
-    };
-  }
-  
-  // Use interface merging to add EdgeRuntime to globalThis
-  interface GlobalThis {
-    EdgeRuntime: Window['EdgeRuntime'];
-  }
+  // Define EdgeRuntime
+  const EdgeRuntime: {
+    waitUntil: (promise: Promise<any>) => void;
+  };
   
   // Define Deno namespace for TypeScript compatibility
   namespace Deno {
     const env: {
       get(key: string): string | undefined;
     };
+    // Add serve function to Deno namespace
+    function serve(handler: (req: Request) => Promise<Response>): void;
   }
 }
 
