@@ -26,9 +26,10 @@ export async function triggerArtistDiscovery(artistName: string): Promise<string
  * @returns The response from the worker
  */
 export async function triggerWorker(workerName: string): Promise<any> {
+  // Using a raw SQL call since the RPC isn't in TypeScript types yet
   const { data, error } = await supabase.rpc('manual_trigger_worker', {
     worker_name: workerName
-  });
+  } as any);
   
   if (error) {
     console.error(`Error triggering worker ${workerName}:`, error);
@@ -43,8 +44,9 @@ export async function triggerWorker(workerName: string): Promise<any> {
  * Check the status of all worker cron jobs
  * @returns Array of cron job status information
  */
-export async function checkWorkerCrons(): Promise<any[]> {
-  const { data, error } = await supabase.rpc('check_worker_crons');
+export async function checkWorkerCrons(): Promise<any> {
+  // Using a raw SQL call since the RPC isn't in TypeScript types yet
+  const { data, error } = await supabase.rpc('check_worker_crons' as any);
   
   if (error) {
     console.error('Error checking worker crons:', error);
