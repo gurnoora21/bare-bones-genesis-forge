@@ -1,6 +1,7 @@
+
 import { createClient } from '@supabase/supabase-js';
-import { BaseWorker } from '../lib/BaseWorker.ts';
-import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+import { BaseWorker } from '../lib/BaseWorker';
+import { SpotifyClient } from '../lib/SpotifyClient';
 import { EnvConfig } from '../lib/EnvConfig';
 
 interface ArtistDiscoveryMessage {
@@ -9,7 +10,7 @@ interface ArtistDiscoveryMessage {
 }
 
 export class ArtistDiscoveryWorker extends BaseWorker<ArtistDiscoveryMessage> {
-  private spotifyAuth: SpotifyAuth;
+  private spotifyClient: SpotifyClient;
 
   constructor() {
     super({
@@ -18,7 +19,7 @@ export class ArtistDiscoveryWorker extends BaseWorker<ArtistDiscoveryMessage> {
       visibilityTimeout: 120,
       maxRetries: 3
     });
-    this.spotifyAuth = SpotifyAuth.getInstance();
+    this.spotifyClient = SpotifyClient.getInstance();
   }
 
   async processMessage(message: ArtistDiscoveryMessage): Promise<void> {
@@ -31,14 +32,16 @@ export class ArtistDiscoveryWorker extends BaseWorker<ArtistDiscoveryMessage> {
 
     // If we only have the artist name, search for it first
     if (!artistId && message.artistName) {
-      artistId = await this.findArtistByName(message.artistName);
-      if (!artistId) {
+      const artist = await this.spotifyClient.getArtistByName(message.artistName);
+      if (!artist) {
         throw new Error(`Artist not found: ${message.artistName}`);
       }
+      artistId = artist.id;
+      artistData = artist;
+    } else {
+      // Get artist details
+      artistData = await this.spotifyClient.getArtistById(artistId!);
     }
-
-    // Get artist details
-    artistData = await this.getArtistDetails(artistId!);
 
     // Store artist in database
     const { data: artist, error } = await this.supabase
@@ -65,48 +68,6 @@ export class ArtistDiscoveryWorker extends BaseWorker<ArtistDiscoveryMessage> {
     });
 
     console.log(`Processed artist: ${artist.name} (ID: ${artist.id})`);
-  }
-
-  private async findArtistByName(artistName: string): Promise<string | null> {
-    await this.waitForRateLimit('spotify');
-
-    return this.withCircuitBreaker('spotify', async () => {
-      const token = await this.spotifyAuth.getToken();
-      const encodedName = encodeURIComponent(artistName);
-      
-      const response = await this.cachedFetch<any>(
-        `https://api.spotify.com/v1/search?q=${encodedName}&type=artist&limit=1`,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
-      );
-
-      const artists = response.artists?.items;
-      if (!artists || artists.length === 0) {
-        return null;
-      }
-
-      return artists[0].id;
-    });
-  }
-
-  private async getArtistDetails(artistId: string): Promise<any> {
-    await this.waitForRateLimit('spotify');
-
-    return this.withCircuitBreaker('spotify', async () => {
-      const token = await this.spotifyAuth.getToken();
-      
-      return this.cachedFetch<any>(
-        `https://api.spotify.com/v1/artists/${artistId}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
-      );
-    });
   }
 }
 

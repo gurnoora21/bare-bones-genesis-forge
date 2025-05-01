@@ -1,6 +1,7 @@
+
 import { createClient } from '@supabase/supabase-js';
-import { BaseWorker } from '../lib/BaseWorker.ts';
-import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+import { BaseWorker } from '../lib/BaseWorker';
+import { SpotifyClient } from '../lib/SpotifyClient';
 import { EnvConfig } from '../lib/EnvConfig';
 
 interface TrackDiscoveryMessage {
@@ -11,7 +12,7 @@ interface TrackDiscoveryMessage {
 }
 
 export class TrackDiscoveryWorker extends BaseWorker<TrackDiscoveryMessage> {
-  private spotifyAuth: SpotifyAuth;
+  private spotifyClient: SpotifyClient;
   private readonly TRACKS_PER_PAGE = 50;  // Spotify maximum
 
   constructor() {
@@ -21,7 +22,7 @@ export class TrackDiscoveryWorker extends BaseWorker<TrackDiscoveryMessage> {
       visibilityTimeout: 180,
       maxRetries: 3
     });
-    this.spotifyAuth = SpotifyAuth.getInstance();
+    this.spotifyClient = SpotifyClient.getInstance();
   }
 
   async processMessage(message: TrackDiscoveryMessage): Promise<void> {
@@ -30,7 +31,7 @@ export class TrackDiscoveryWorker extends BaseWorker<TrackDiscoveryMessage> {
     // Get album details from database (to get spotify_id)
     const { data: album, error: albumError } = await this.supabase
       .from('albums')
-      .select('id, spotify_id')
+      .select('spotify_id')
       .eq('id', albumId)
       .single();
 
@@ -43,35 +44,34 @@ export class TrackDiscoveryWorker extends BaseWorker<TrackDiscoveryMessage> {
       throw new Error(`Invalid Spotify ID for album ${albumId}`);
     }
 
-    // Get tracks from Spotify
-    const tracksData = await this.getAlbumTracks(album.spotify_id, offset);
-    console.log(`Retrieved ${tracksData.items.length} tracks for album ${albumId}, offset ${offset}`);
+    // Fetch tracks from Spotify
+    const tracksData = await this.spotifyClient.getAlbumTracks(album.spotify_id, offset);
+    console.log(`Retrieved ${tracksData.items.length} tracks for album ${albumName}, offset ${offset}`);
 
-    // Get detailed track information
-    const trackIds = tracksData.items.map(t => t.id);
-    let detailedTracks = [];
-    
-    if (trackIds.length > 0) {
-      // Get detailed track data in batches (Spotify limit: 50)
-      for (let i = 0; i < trackIds.length; i += 50) {
-        const batchIds = trackIds.slice(i, i + 50).join(',');
-        const batchData = await this.getTracksDetails(batchIds);
-        detailedTracks = [...detailedTracks, ...batchData.tracks];
-      }
+    if (tracksData.items.length === 0) {
+      return; // No tracks to process
     }
 
+    // Extract track IDs for batch retrieval
+    const trackIds = tracksData.items.map(track => track.id);
+
+    // Get detailed track information in batch
+    const fullTracks = await this.spotifyClient.getTrackDetails(trackIds);
+
     // Process each track
-    for (const trackData of detailedTracks) {
+    for (const trackData of fullTracks) {
       // Store track in database
       const { data: track, error } = await this.supabase
         .from('tracks')
         .upsert({
           album_id: albumId,
-          name: trackData.name,
+          artist_id: artistId,
           spotify_id: trackData.id,
+          name: trackData.name,
           duration_ms: trackData.duration_ms,
+          track_number: trackData.track_number,
           popularity: trackData.popularity,
-          spotify_preview_url: trackData.preview_url,
+          preview_url: trackData.preview_url,
           metadata: trackData
         })
         .select()
@@ -82,85 +82,24 @@ export class TrackDiscoveryWorker extends BaseWorker<TrackDiscoveryMessage> {
         continue; // Continue with other tracks
       }
 
-      // Create or update normalized track entry
-      const normalizedTrackName = this.normalizeTrackName(trackData.name);
-      
-      // Upsert into normalized_tracks table
-      await this.supabase.from('normalized_tracks').upsert({
-        artist_id: artistId,
-        normalized_name: normalizedTrackName,
-        representative_track_id: track.id
-      }, { onConflict: 'artist_id,normalized_name' });
-
       // Enqueue producer identification
       await this.enqueue('producer_identification', {
         trackId: track.id,
         trackName: track.name,
-        albumId: albumId,
-        artistId: artistId
+        albumId,
+        artistId
       });
     }
 
-    // Check if there are more tracks
+    // If there are more tracks, enqueue the next batch
     if (tracksData.next) {
       await this.enqueue('track_discovery', {
-        albumId: albumId,
-        albumName: albumName,
-        artistId: artistId,
+        albumId,
+        albumName,
+        artistId,
         offset: offset + this.TRACKS_PER_PAGE
       });
     }
-  }
-
-  private normalizeTrackName(trackName: string): string {
-    // Remove featured artists (everything after " feat.", " ft.", " (feat", etc.)
-    let normalized = trackName.replace(/\s+(?:feat|ft|featuring)\.?\s+.*$/i, '')
-      .replace(/\s*\((?:feat|ft|featuring)\.?\s+.*\).*$/i, '');
-    
-    // Remove text in parentheses (like "radio edit", "remix", etc.)
-    normalized = normalized.replace(/\s*\([^)]*\)\s*/g, ' ');
-    
-    // Remove special characters and extra spaces
-    normalized = normalized.replace(/[^\w\s]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-    
-    return normalized;
-  }
-
-  private async getAlbumTracks(spotifyAlbumId: string, offset: number): Promise<any> {
-    await this.waitForRateLimit('spotify');
-
-    return this.withCircuitBreaker('spotify', async () => {
-      const token = await this.spotifyAuth.getToken();
-      
-      return this.cachedFetch<any>(
-        `https://api.spotify.com/v1/albums/${spotifyAlbumId}/tracks?limit=${this.TRACKS_PER_PAGE}&offset=${offset}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
-      );
-    });
-  }
-
-  private async getTracksDetails(trackIds: string): Promise<any> {
-    await this.waitForRateLimit('spotify');
-
-    return this.withCircuitBreaker('spotify', async () => {
-      const token = await this.spotifyAuth.getToken();
-      
-      return this.cachedFetch<any>(
-        `https://api.spotify.com/v1/tracks?ids=${trackIds}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
-      );
-    });
   }
 }
 

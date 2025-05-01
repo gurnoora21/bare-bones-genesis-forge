@@ -1,7 +1,7 @@
 
 import { createClient } from '@supabase/supabase-js';
-import { BaseWorker } from '../lib/BaseWorker.ts';
-import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+import { BaseWorker } from '../lib/BaseWorker';
+import { SpotifyClient } from '../lib/SpotifyClient';
 import { EnvConfig } from '../lib/EnvConfig';
 
 interface AlbumDiscoveryMessage {
@@ -10,7 +10,7 @@ interface AlbumDiscoveryMessage {
 }
 
 export class AlbumDiscoveryWorker extends BaseWorker<AlbumDiscoveryMessage> {
-  private spotifyAuth: SpotifyAuth;
+  private spotifyClient: SpotifyClient;
   private readonly ALBUMS_PER_PAGE = 50;  // Spotify maximum
 
   constructor() {
@@ -20,7 +20,7 @@ export class AlbumDiscoveryWorker extends BaseWorker<AlbumDiscoveryMessage> {
       visibilityTimeout: 180,
       maxRetries: 3
     });
-    this.spotifyAuth = SpotifyAuth.getInstance();
+    this.spotifyClient = SpotifyClient.getInstance();
   }
 
   async processMessage(message: AlbumDiscoveryMessage): Promise<void> {
@@ -43,26 +43,34 @@ export class AlbumDiscoveryWorker extends BaseWorker<AlbumDiscoveryMessage> {
     }
 
     // Fetch albums from Spotify
-    const albumsData = await this.getArtistAlbums(artist.spotify_id, offset);
+    const albumsData = await this.spotifyClient.getArtistAlbums(artist.spotify_id, offset);
     console.log(`Retrieved ${albumsData.items.length} albums for artist ${artistId}, offset ${offset}`);
 
-    // Process albums
-    for (const albumData of albumsData.items) {
-      // Skip compilations, appearances, etc. if needed
-      if (albumData.album_type !== 'album' && albumData.album_type !== 'single') {
-        continue;
-      }
-      
-      // Get full album details (batch this in a real implementation)
-      const fullAlbumData = await this.getAlbumDetails(albumData.id);
-      
+    if (albumsData.items.length === 0) {
+      return; // No albums to process
+    }
+
+    // Extract album IDs for batch retrieval
+    const albumIds = albumsData.items
+      .filter(album => album.album_type === 'album' || album.album_type === 'single')
+      .map(album => album.id);
+
+    if (albumIds.length === 0) {
+      return; // No album or single type albums found
+    }
+
+    // Get detailed album information in batches
+    const fullAlbums = await this.spotifyClient.getAlbumDetails(albumIds);
+
+    // Process each album
+    for (const fullAlbumData of fullAlbums) {
       // Store album in database
       const { data: album, error } = await this.supabase
         .from('albums')
         .upsert({
           artist_id: artistId,
-          name: fullAlbumData.name,
           spotify_id: fullAlbumData.id,
+          name: fullAlbumData.name,
           release_date: fullAlbumData.release_date,
           cover_url: fullAlbumData.images[0]?.url,
           metadata: fullAlbumData
@@ -79,7 +87,7 @@ export class AlbumDiscoveryWorker extends BaseWorker<AlbumDiscoveryMessage> {
       await this.enqueue('track_discovery', {
         albumId: album.id,
         albumName: album.name,
-        artistId: artistId,
+        artistId,
         offset: 0
       });
     }
@@ -87,44 +95,10 @@ export class AlbumDiscoveryWorker extends BaseWorker<AlbumDiscoveryMessage> {
     // If there are more albums, enqueue the next batch
     if (albumsData.next) {
       await this.enqueue('album_discovery', {
-        artistId: artistId,
+        artistId,
         offset: offset + this.ALBUMS_PER_PAGE
       });
     }
-  }
-
-  private async getArtistAlbums(spotifyArtistId: string, offset: number): Promise<any> {
-    await this.waitForRateLimit('spotify');
-
-    return this.withCircuitBreaker('spotify', async () => {
-      const token = await this.spotifyAuth.getToken();
-      
-      return this.cachedFetch<any>(
-        `https://api.spotify.com/v1/artists/${spotifyArtistId}/albums?limit=${this.ALBUMS_PER_PAGE}&offset=${offset}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
-      );
-    });
-  }
-
-  private async getAlbumDetails(albumId: string): Promise<any> {
-    await this.waitForRateLimit('spotify');
-
-    return this.withCircuitBreaker('spotify', async () => {
-      const token = await this.spotifyAuth.getToken();
-      
-      return this.cachedFetch<any>(
-        `https://api.spotify.com/v1/albums/${albumId}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
-      );
-    });
   }
 }
 
