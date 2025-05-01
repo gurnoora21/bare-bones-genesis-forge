@@ -90,10 +90,14 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
         continue;
       }
 
-      // Make sure producer.id is properly typed as string
-      const producerId = producer && typeof producer.id !== 'undefined' 
-        ? String(producer.id) 
-        : '';
+      // Make sure producer exists and has an id before proceeding
+      if (!producer || typeof producer.id === 'undefined') {
+        console.error(`Missing producer data for ${producerCandidate.name}`);
+        continue;
+      }
+
+      // Properly convert the id to string to ensure type safety
+      const producerId = String(producer.id);
       
       // Associate producer with track
       const { error: associationError } = await this.supabase
