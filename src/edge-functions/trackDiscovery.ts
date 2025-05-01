@@ -26,8 +26,8 @@ async function serve(handler: (req: Request) => Promise<Response>) {
   return null;
 }
 
-// Initialize the Spotify client
-const spotifyClient = new SpotifyClient('', ''); // We'll get actual credentials later
+// Initialize the Spotify client using the singleton pattern
+const spotifyClient = SpotifyClient.getInstance();
 
 const handler = async (req: Request) => {
   // Get environment variables safely

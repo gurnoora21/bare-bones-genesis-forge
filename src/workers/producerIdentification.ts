@@ -102,14 +102,14 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
       const { error: associationError } = await this.supabase
         .from('track_producers')
         .upsert({
-          track_id: trackId,
+          track_id: message.trackId,  // Fixed: use message.trackId instead of trackId
           producer_id: producerId,
           confidence: producerCandidate.confidence,
           source: producerCandidate.source
         });
 
       if (associationError) {
-        console.error(`Error associating producer ${producerId} with track ${trackId}:`, associationError);
+        console.error(`Error associating producer ${producerId} with track ${message.trackId}:`, associationError);
       }
 
       // If this is a new producer or hasn't been enriched yet, enqueue social enrichment
