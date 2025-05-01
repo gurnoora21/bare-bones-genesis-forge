@@ -74,8 +74,16 @@ export async function checkWorkerCrons(): Promise<any> {
 export async function debugQueueContents(queueName: string): Promise<any> {
   console.log(`Inspecting contents of queue "${queueName}"`);
   
-  // Direct SQL query to check queue contents
-  const { data, error } = await supabase.from(`pgmq.${queueName}_queue`).select('*').limit(100);
+  // Instead of directly querying the PGMQ table (which isn't in our TypeScript types),
+  // use a raw SQL query with the `rpc` method to get queue contents
+  const { data, error } = await supabase.rpc(
+    'pg_dequeue', 
+    { 
+      queue_name: queueName,
+      batch_size: 100,
+      visibility_seconds: 5 // Short visibility so we don't block actual processing
+    }
+  );
   
   if (error) {
     console.error(`Error inspecting queue ${queueName}:`, error);
@@ -83,5 +91,21 @@ export async function debugQueueContents(queueName: string): Promise<any> {
   }
   
   console.log(`Queue "${queueName}" contents:`, data);
+  
+  // Return messages to queue immediately after inspection
+  try {
+    if (data && Array.isArray(data)) {
+      for (const msg of data) {
+        await supabase.rpc('pg_release_message', {
+          queue_name: queueName,
+          message_id: msg.id
+        });
+      }
+      console.log(`Released ${data.length} messages back to queue "${queueName}"`);
+    }
+  } catch (releaseError) {
+    console.error(`Error releasing messages back to queue:`, releaseError);
+  }
+  
   return data;
 }
