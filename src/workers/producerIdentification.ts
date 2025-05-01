@@ -1,3 +1,4 @@
+
 import { createClient } from '@supabase/supabase-js';
 import { BaseWorker } from '../lib/BaseWorker';
 import { EnvConfig } from '../lib/EnvConfig';
@@ -102,7 +103,7 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
       const { error: associationError } = await this.supabase
         .from('track_producers')
         .upsert({
-          track_id: message.trackId,  // Fixed: use message.trackId instead of trackId
+          track_id: message.trackId,
           producer_id: producerId,
           confidence: producerCandidate.confidence,
           source: producerCandidate.source

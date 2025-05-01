@@ -6,12 +6,13 @@
 
 // Define EdgeRuntime for TypeScript compatibility
 declare global {
-  // Define EdgeRuntime interface without redeclaring
+  // Define EdgeRuntime interface
   interface EdgeRuntimeInterface {
     waitUntil: (promise: Promise<any>) => void;
   }
   
-  // Reference EdgeRuntime as a global variable
+  // Declare EdgeRuntime as a variable without redeclaration
+  // Using var instead of const to avoid block-scoped declaration issues
   var EdgeRuntime: EdgeRuntimeInterface;
   
   // Define Deno namespace for TypeScript compatibility
