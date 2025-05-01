@@ -1,6 +1,5 @@
+
 import { createClient } from '@supabase/supabase-js';
-import { BaseWorker } from '../lib/BaseWorker.ts';
-import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
 import { EnvConfig } from '../lib/EnvConfig';
 
 interface ProducerIdentificationMessage {
@@ -16,23 +15,91 @@ interface ProducerCandidate {
   source: string;
 }
 
-export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificationMessage> {
-  private spotifyAuth: SpotifyAuth;
-
+export class ProducerIdentificationWorker {
+  private supabase;
+  private queueName = 'producer_identification';
+  private batchSize = 5;
+  private visibilityTimeout = 240;
+  private maxRetries = 3;
+  
+  // Rate limiting properties
+  private requestCounts: Record<string, { count: number; resetTime: number }> = {};
+  private maxRequestsPerWindow: Record<string, number> = {
+    genius: 5  // 5 requests per second for Genius
+  };
+  private windowMs: Record<string, number> = {
+    genius: 1000  // 1 second window for Genius
+  };
+  
   constructor() {
-    super({
-      queueName: 'producer_identification',
-      batchSize: 5,
-      visibilityTimeout: 240,
-      maxRetries: 3
-    });
-    this.spotifyAuth = SpotifyAuth.getInstance();
-    
-    // Configure rate limits for Genius API
-    this.maxRequestsPerWindow.genius = 5;  // 5 requests per second
-    this.windowMs.genius = 1000;           // 1 second window
+    this.supabase = createClient(
+      EnvConfig.SUPABASE_URL,
+      EnvConfig.SUPABASE_SERVICE_ROLE_KEY
+    );
   }
 
+  async processBatch(): Promise<any> {
+    try {
+      // Get messages from queue
+      const { data: messages, error } = await this.supabase.rpc('pg_dequeue', {
+        queue_name: this.queueName,
+        batch_size: this.batchSize,
+        visibility_timeout: this.visibilityTimeout
+      });
+      
+      if (error) throw error;
+      
+      if (!messages || !Array.isArray(messages) || messages.length === 0) {
+        return { processedCount: 0, successCount: 0, errorCount: 0 };
+      }
+      
+      const processPromises = messages.map(async (message: any) => {
+        try {
+          // Parse the message body - ensure it's a string before parsing
+          const messageBody = typeof message.message_body === 'string' 
+            ? message.message_body 
+            : JSON.stringify(message.message_body);
+            
+          const payload = JSON.parse(messageBody) as ProducerIdentificationMessage;
+          
+          // Process the message
+          await this.processMessage(payload);
+          
+          // Delete the message from the queue after successful processing
+          await this.supabase.rpc('pg_delete_message', {
+            queue_name: this.queueName,
+            message_id: message.id
+          });
+          
+          return true;
+        } catch (err) {
+          console.error(`Error processing message:`, err);
+          
+          // Return the message to the queue for retry
+          await this.supabase.rpc('pg_release_message', {
+            queue_name: this.queueName,
+            message_id: message.id
+          });
+          
+          return false;
+        }
+      });
+      
+      const results = await Promise.allSettled(processPromises);
+      const successCount = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
+      
+      return {
+        processedCount: messages.length,
+        successCount,
+        errorCount: messages.length - successCount
+      };
+    } catch (err) {
+      console.error('Error processing batch:', err);
+      return { processedCount: 0, successCount: 0, errorCount: 1, error: err };
+    }
+  }
+
+  // Main message processing function
   async processMessage(message: ProducerIdentificationMessage): Promise<void> {
     const { trackId, trackName, albumId, artistId } = message;
 
@@ -113,11 +180,23 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
 
       // If this is a new producer or hasn't been enriched yet, enqueue social enrichment
       if (!producer.enriched_at && !producer.enrichment_failed) {
-        await this.enqueue('social_enrichment', {
+        await this.enqueueMessage('social_enrichment', {
           producerId: producer.id,
           producerName: producer.name
         });
       }
+    }
+  }
+
+  private async enqueueMessage(queueName: string, message: any): Promise<void> {
+    const { error } = await this.supabase.rpc('pg_enqueue', {
+      queue_name: queueName,
+      message_body: JSON.stringify(message)
+    });
+    
+    if (error) {
+      console.error(`Error enqueuing message to ${queueName}:`, error);
+      throw error;
     }
   }
 
@@ -172,41 +251,48 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
       }
       
       const searchQuery = `${trackName} ${artistName}`;
-      const searchResponse = await this.withCircuitBreaker('genius', async () => {
-        return this.cachedFetch<any>(
-          `https://api.genius.com/search?q=${encodeURIComponent(searchQuery)}`,
-          {
-            headers: {
-              'Authorization': `Bearer ${geniusAccessToken}`
-            }
+      const response = await fetch(
+        `https://api.genius.com/search?q=${encodeURIComponent(searchQuery)}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${geniusAccessToken}`
           }
-        );
-      });
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error(`Genius search failed: ${response.statusText}`);
+      }
+      
+      const searchData = await response.json();
       
       // Get the first result
-      const firstResult = searchResponse.response.hits[0]?.result;
+      const firstResult = searchData.response.hits[0]?.result;
       if (!firstResult) {
         return producers;
       }
       
       // Get song details
       await this.waitForRateLimit('genius');
-      const songDetailsResponse = await this.withCircuitBreaker('genius', async () => {
-        return this.cachedFetch<any>(
-          `https://api.genius.com/songs/${firstResult.id}`,
-          {
-            headers: {
-              'Authorization': `Bearer ${geniusAccessToken}`
-            }
+      const songResponse = await fetch(
+        `https://api.genius.com/songs/${firstResult.id}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${geniusAccessToken}`
           }
-        );
-      });
+        }
+      );
       
-      const songData = songDetailsResponse.response.song;
+      if (!songResponse.ok) {
+        throw new Error(`Genius song details failed: ${songResponse.statusText}`);
+      }
+      
+      const songData = await songResponse.json();
+      const song = songData.response.song;
       
       // Extract producers from song details
-      if (songData.producer_artists) {
-        songData.producer_artists.forEach((producer: any) => {
+      if (song.producer_artists) {
+        song.producer_artists.forEach((producer: any) => {
           producers.push({
             name: producer.name,
             confidence: 0.95,
@@ -216,15 +302,15 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
       }
       
       // Look for producer mentions in description
-      if (songData.description?.dom?.children) {
+      if (song.description?.dom?.children) {
         // Note: This is a simplified version. In a real implementation,
         // you might need more sophisticated text processing.
-        const description = JSON.stringify(songData.description.dom.children);
+        const description = JSON.stringify(song.description.dom.children);
         
         // Look for producers mentioned in description
         const producerMatches = description.match(/produced by ([^,.]+)/gi);
         if (producerMatches) {
-          producerMatches.forEach(match => {
+          producerMatches.forEach((match: string) => {
             const producerName = match.replace(/produced by /i, '').trim();
             producers.push({
               name: producerName,
@@ -275,6 +361,28 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
     }
     
     return Array.from(uniqueProducers.values());
+  }
+
+  private async waitForRateLimit(apiName: string): Promise<void> {
+    const now = Date.now();
+    
+    if (!this.requestCounts[apiName]) {
+      this.requestCounts[apiName] = { count: 0, resetTime: now + this.windowMs[apiName] };
+    }
+    
+    if (now > this.requestCounts[apiName].resetTime) {
+      // Reset the counter for a new time window
+      this.requestCounts[apiName] = { count: 0, resetTime: now + this.windowMs[apiName] };
+    }
+    
+    if (this.requestCounts[apiName].count >= this.maxRequestsPerWindow[apiName]) {
+      // Wait until the rate limit resets
+      const waitTime = this.requestCounts[apiName].resetTime - now;
+      await new Promise(resolve => setTimeout(resolve, waitTime > 0 ? waitTime : 1));
+      this.requestCounts[apiName] = { count: 0, resetTime: Date.now() + this.windowMs[apiName] };
+    }
+    
+    this.requestCounts[apiName].count++;
   }
 }
 
