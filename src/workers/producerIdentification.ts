@@ -1,0 +1,293 @@
+
+import { createClient } from '@supabase/supabase-js';
+import { BaseWorker } from '../lib/BaseWorker.ts';
+import { SpotifyAuth } from '../lib/SpotifyAuth.ts';
+
+interface ProducerIdentificationMessage {
+  trackId: string;
+  trackName: string;
+  albumId: string;
+  artistId: string;
+}
+
+interface ProducerCandidate {
+  name: string;
+  confidence: number;
+  source: string;
+}
+
+export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificationMessage> {
+  private spotifyAuth: SpotifyAuth;
+
+  constructor() {
+    super({
+      queueName: 'producer_identification',
+      batchSize: 5,
+      visibilityTimeout: 240,
+      maxRetries: 3
+    });
+    this.spotifyAuth = SpotifyAuth.getInstance();
+    
+    // Configure rate limits for Genius API
+    this.maxRequestsPerWindow.genius = 5;  // 5 requests per second
+    this.windowMs.genius = 1000;           // 1 second window
+  }
+
+  async processMessage(message: ProducerIdentificationMessage): Promise<void> {
+    const { trackId, trackName, albumId, artistId } = message;
+
+    // Get track details
+    const { data: trackData, error: trackError } = await this.supabase
+      .from('tracks')
+      .select('id, name, metadata, spotify_id')
+      .eq('id', trackId)
+      .single();
+
+    if (trackError || !trackData) {
+      throw new Error(`Track not found with ID: ${trackId}`);
+    }
+
+    // Get artist details (for search)
+    const { data: artistData, error: artistError } = await this.supabase
+      .from('artists')
+      .select('id, name')
+      .eq('id', artistId)
+      .single();
+
+    if (artistError || !artistData) {
+      throw new Error(`Artist not found with ID: ${artistId}`);
+    }
+
+    // Get producers from Spotify metadata if available
+    const spotifyProducers = this.extractProducersFromSpotify(trackData.metadata);
+    
+    // Get producers from Genius API
+    const geniusProducers = await this.getProducersFromGenius(trackData.name, artistData.name);
+    
+    // Combine producer candidates and remove duplicates
+    const allProducerCandidates = this.combineAndDedupProducers([
+      ...spotifyProducers,
+      ...geniusProducers
+    ]);
+
+    // Process each producer
+    for (const producerCandidate of allProducerCandidates) {
+      // Normalize producer name
+      const normalizedName = this.normalizeProducerName(producerCandidate.name);
+      
+      if (!normalizedName) continue; // Skip empty names
+      
+      // Upsert producer
+      const { data: producer, error } = await this.supabase
+        .from('producers')
+        .upsert({
+          name: producerCandidate.name,
+          normalized_name: normalizedName
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error(`Error upserting producer ${producerCandidate.name}:`, error);
+        continue;
+      }
+
+      // Associate producer with track
+      const { error: associationError } = await this.supabase
+        .from('track_producers')
+        .upsert({
+          track_id: trackId,
+          producer_id: producer.id,
+          confidence: producerCandidate.confidence,
+          source: producerCandidate.source
+        });
+
+      if (associationError) {
+        console.error(`Error associating producer ${producer.id} with track ${trackId}:`, associationError);
+      }
+
+      // If this is a new producer or hasn't been enriched yet, enqueue social enrichment
+      if (!producer.enriched_at && !producer.enrichment_failed) {
+        await this.enqueue('social_enrichment', {
+          producerId: producer.id,
+          producerName: producer.name
+        });
+      }
+    }
+  }
+
+  private extractProducersFromSpotify(metadata: any): ProducerCandidate[] {
+    const producers: ProducerCandidate[] = [];
+    
+    try {
+      // Extract producers from Spotify metadata
+      if (metadata?.producers) {
+        metadata.producers.forEach((producer: string) => {
+          producers.push({
+            name: producer,
+            confidence: 0.9,
+            source: 'spotify_metadata'
+          });
+        });
+      }
+      
+      // Look for producer information in track credits if available
+      if (metadata?.credits) {
+        const producerCredits = metadata.credits.filter((credit: any) => 
+          credit.role?.toLowerCase().includes('produc') || 
+          credit.role?.toLowerCase().includes('beat') ||
+          credit.role?.toLowerCase().includes('instrumental')
+        );
+        
+        producerCredits.forEach((credit: any) => {
+          producers.push({
+            name: credit.name,
+            confidence: 0.85,
+            source: 'spotify_credits'
+          });
+        });
+      }
+    } catch (e) {
+      console.warn('Error extracting Spotify producers:', e);
+    }
+    
+    return producers;
+  }
+
+  private async getProducersFromGenius(trackName: string, artistName: string): Promise<ProducerCandidate[]> {
+    const producers: ProducerCandidate[] = [];
+    
+    try {
+      // First, search for the song on Genius
+      await this.waitForRateLimit('genius');
+      
+      const geniusAccessToken = Deno.env.get('GENIUS_ACCESS_TOKEN');
+      if (!geniusAccessToken) {
+        throw new Error('Genius API token not configured');
+      }
+      
+      const searchQuery = `${trackName} ${artistName}`;
+      const searchResponse = await this.withCircuitBreaker('genius', async () => {
+        return this.cachedFetch<any>(
+          `https://api.genius.com/search?q=${encodeURIComponent(searchQuery)}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${geniusAccessToken}`
+            }
+          }
+        );
+      });
+      
+      // Get the first result
+      const firstResult = searchResponse.response.hits[0]?.result;
+      if (!firstResult) {
+        return producers;
+      }
+      
+      // Get song details
+      await this.waitForRateLimit('genius');
+      const songDetailsResponse = await this.withCircuitBreaker('genius', async () => {
+        return this.cachedFetch<any>(
+          `https://api.genius.com/songs/${firstResult.id}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${geniusAccessToken}`
+            }
+          }
+        );
+      });
+      
+      const songData = songDetailsResponse.response.song;
+      
+      // Extract producers from song details
+      if (songData.producer_artists) {
+        songData.producer_artists.forEach((producer: any) => {
+          producers.push({
+            name: producer.name,
+            confidence: 0.95,
+            source: 'genius_producer_artists'
+          });
+        });
+      }
+      
+      // Look for producer mentions in description
+      if (songData.description?.dom?.children) {
+        // Note: This is a simplified version. In a real implementation,
+        // you might need more sophisticated text processing.
+        const description = JSON.stringify(songData.description.dom.children);
+        
+        // Look for producers mentioned in description
+        const producerMatches = description.match(/produced by ([^,.]+)/gi);
+        if (producerMatches) {
+          producerMatches.forEach(match => {
+            const producerName = match.replace(/produced by /i, '').trim();
+            producers.push({
+              name: producerName,
+              confidence: 0.75,
+              source: 'genius_description'
+            });
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('Error getting Genius producers:', e);
+    }
+    
+    return producers;
+  }
+
+  private normalizeProducerName(name: string): string {
+    if (!name) return '';
+    
+    // Remove extraneous information
+    let normalized = name
+      .replace(/\([^)]*\)/g, '') // Remove text in parentheses
+      .replace(/\[[^\]]*\]/g, '') // Remove text in brackets
+      
+    // Remove special characters and trim
+    normalized = normalized
+      .replace(/[^\w\s]/g, ' ') // Replace special chars with space
+      .replace(/\s+/g, ' ')     // Replace multiple spaces with a single space
+      .trim()
+      .toLowerCase();
+      
+    return normalized;
+  }
+
+  private combineAndDedupProducers(producers: ProducerCandidate[]): ProducerCandidate[] {
+    const uniqueProducers = new Map<string, ProducerCandidate>();
+    
+    for (const producer of producers) {
+      const normalizedName = this.normalizeProducerName(producer.name);
+      
+      if (!normalizedName) continue;
+      
+      const existing = uniqueProducers.get(normalizedName);
+      
+      if (!existing || producer.confidence > existing.confidence) {
+        uniqueProducers.set(normalizedName, producer);
+      }
+    }
+    
+    return Array.from(uniqueProducers.values());
+  }
+}
+
+// Edge function handler
+Deno.serve(async (req) => {
+  try {
+    const worker = new ProducerIdentificationWorker();
+    const metrics = await worker.processBatch();
+    
+    return new Response(JSON.stringify(metrics), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Error in producer identification worker:', error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+});
