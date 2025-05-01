@@ -112,7 +112,7 @@ export class ProducerIdentificationWorker extends BaseWorker<ProducerIdentificat
         });
 
       if (associationError) {
-        console.error(`Error associating producer ${producer.id} with track ${trackId}:`, associationError);
+        console.error(`Error associating producer ${producerId} with track ${trackId}:`, associationError);
       }
 
       // If this is a new producer or hasn't been enriched yet, enqueue social enrichment
