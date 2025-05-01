@@ -13,8 +13,14 @@ interface ArtistDiscoveryMsg {
 // Use a dynamic import for Deno http/server
 async function serve(handler: (req: Request) => Promise<Response>) {
   if (typeof globalThis !== 'undefined' && 'Deno' in globalThis) {
-    const module = await import("https://deno.land/std/http/server.ts");
-    return module.serve(handler);
+    // Use dynamic import instead of static import to avoid TypeScript errors
+    try {
+      const { serve: denoServe } = await import("https://deno.land/std@0.177.0/http/server.ts");
+      return denoServe(handler);
+    } catch (error) {
+      console.error("Failed to import Deno http/server:", error);
+      return null;
+    }
   }
   return null;
 }

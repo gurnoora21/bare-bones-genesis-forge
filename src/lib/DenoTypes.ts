@@ -12,7 +12,7 @@ declare global {
     };
   }
   
-  // Make EdgeRuntime available globally
+  // Make EdgeRuntime available globally without redeclaring
   var EdgeRuntime: Window['EdgeRuntime'];
   
   // Define Deno namespace for TypeScript compatibility

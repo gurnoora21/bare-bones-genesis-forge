@@ -1,4 +1,3 @@
-
 import { createClient } from '@supabase/supabase-js';
 import { EnvConfig } from './EnvConfig';
 import { EdgeFunctionAdapter } from './EdgeFunctionAdapter';
@@ -273,7 +272,7 @@ export abstract class BaseWorker<T = any> {
         return '';
       }
       
-      return data.id;
+      return data?.id?.toString() || '';
     } catch (error) {
       console.error(`[${this.queueName}] Error starting metric:`, error);
       return '';
