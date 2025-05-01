@@ -12,9 +12,10 @@ declare global {
     };
   }
   
-  // Since we're in a global context, simply reference the EdgeRuntime type
-  // without redeclaring it
-  var EdgeRuntime: Window['EdgeRuntime'];
+  // Use interface merging instead of redeclaring the variable
+  interface GlobalThis {
+    EdgeRuntime: Window['EdgeRuntime'];
+  }
   
   // Define Deno namespace for TypeScript compatibility
   namespace Deno {
