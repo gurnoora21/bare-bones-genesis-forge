@@ -3,14 +3,55 @@
 CREATE EXTENSION IF NOT EXISTS "pg_net";
 CREATE EXTENSION IF NOT EXISTS "pg_cron";
 
--- Ensure the crons are properly set up by dropping and recreating them
+-- Make sure the cron schema exists and has the tables it needs
+DO $$
+BEGIN
+  -- Create the cfg table if it doesn't exist (pg_cron uses this)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'cron' AND table_name = 'cfg') THEN
+    CREATE TABLE IF NOT EXISTS cron.cfg (
+      singleton text PRIMARY KEY,
+      fx_schema text,
+      ax_schema text,
+      ex_schema text,
+      database_name text
+    );
+  END IF;
+END$$;
+
+-- Ensure the settings table exists with proper values
+CREATE TABLE IF NOT EXISTS public.settings (
+  key text PRIMARY KEY,
+  value text NOT NULL,
+  created_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now()
+);
+
+-- Insert/update the Supabase URL and anon key settings
+INSERT INTO public.settings (key, value)
+VALUES 
+  ('supabase_url', 'https://wshetxovyxtfqohhbvpg.supabase.co'),
+  ('supabase_anon_key', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzaGV0eG92eXh0ZnFvaGhidnBnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDYwODI4OTIsImV4cCI6MjA2MTY1ODg5Mn0.tCQlhWOa0AFX4rcVUyVXFXBaG9Oeibn7N0cJbdmIwOs')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+
+-- Set search_path to make settings available
+DO $$
+BEGIN
+  EXECUTE 'ALTER DATABASE postgres SET "app.settings.supabase_url" = ' || quote_literal((SELECT value FROM public.settings WHERE key = 'supabase_url'));
+  EXECUTE 'ALTER DATABASE postgres SET "app.settings.supabase_anon_key" = ' || quote_literal((SELECT value FROM public.settings WHERE key = 'supabase_anon_key'));
+END $$;
 
 -- Drop existing cron jobs if they exist
-SELECT cron.unschedule('artist-discovery-worker') WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'artist-discovery-worker');
-SELECT cron.unschedule('album-discovery-worker') WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'album-discovery-worker');
-SELECT cron.unschedule('track-discovery-worker') WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'track-discovery-worker');
-SELECT cron.unschedule('producer-identification-worker') WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'producer-identification-worker');
-SELECT cron.unschedule('social-enrichment-worker') WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'social-enrichment-worker');
+DO $$
+BEGIN
+  PERFORM cron.unschedule('artist-discovery-worker');
+  PERFORM cron.unschedule('album-discovery-worker');
+  PERFORM cron.unschedule('track-discovery-worker');
+  PERFORM cron.unschedule('producer-identification-worker');
+  PERFORM cron.unschedule('social-enrichment-worker');
+EXCEPTION 
+  WHEN OTHERS THEN
+    RAISE NOTICE 'Error unscheduling cron jobs: %', SQLERRM;
+END $$;
 
 -- Artist discovery - every 2 minutes
 SELECT cron.schedule(
@@ -87,28 +128,6 @@ SELECT cron.schedule(
   $$
 );
 
--- First, insert the settings if they don't exist
-INSERT INTO public.settings (key, value)
-VALUES 
-  ('supabase_url', (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL')),
-  ('supabase_anon_key', (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY'))
-ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-
--- Create a function to get settings
-CREATE OR REPLACE FUNCTION app.get_setting(setting_name text)
-RETURNS text AS $$
-BEGIN
-  RETURN (SELECT value FROM public.settings WHERE key = setting_name);
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Set search_path to make settings available
-DO $$
-BEGIN
-  EXECUTE 'ALTER DATABASE postgres SET "app.settings.supabase_url" = ' || quote_literal((SELECT value FROM public.settings WHERE key = 'supabase_url'));
-  EXECUTE 'ALTER DATABASE postgres SET "app.settings.supabase_anon_key" = ' || quote_literal((SELECT value FROM public.settings WHERE key = 'supabase_anon_key'));
-END $$;
-
 -- Create function to manually trigger workers
 CREATE OR REPLACE FUNCTION public.manual_trigger_worker(worker_name text) RETURNS jsonb AS $$
 DECLARE
@@ -155,11 +174,3 @@ BEGIN
   );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Create settings table if it doesn't exist
-CREATE TABLE IF NOT EXISTS public.settings (
-  key text PRIMARY KEY,
-  value text NOT NULL,
-  created_at timestamp with time zone DEFAULT now(),
-  updated_at timestamp with time zone DEFAULT now()
-);

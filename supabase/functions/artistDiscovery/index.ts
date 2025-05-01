@@ -28,6 +28,7 @@ serve(async (req) => {
 
   try {
     // Process queue batch
+    console.log("Attempting to dequeue from artist_discovery queue");
     const { data: queueData, error: queueError } = await supabase.rpc('pg_dequeue', { 
       queue_name: "artist_discovery",
       batch_size: 5,
@@ -36,6 +37,18 @@ serve(async (req) => {
 
     if (queueError) {
       console.error("Error reading from queue:", queueError);
+      // Try to log this to the worker_issues table for troubleshooting
+      try {
+        await supabase.from('worker_issues').insert({
+          worker_name: 'artistDiscovery',
+          issue_type: 'queue_error',
+          message: `Error reading from queue: ${queueError.message}`,
+          details: { error: queueError }
+        });
+      } catch (logError) {
+        console.error("Failed to log error to worker_issues:", logError);
+      }
+      
       return new Response(JSON.stringify({ error: queueError }), { 
         status: 500, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -45,14 +58,14 @@ serve(async (req) => {
     // Parse the JSONB result from pg_dequeue
     let messages = [];
     try {
+      console.log("Raw queue data received:", typeof queueData, queueData ? JSON.stringify(queueData) : "null");
+      
       // Handle either string or object formats
       if (typeof queueData === 'string') {
         messages = JSON.parse(queueData);
       } else if (queueData) {
         messages = queueData;
       }
-
-      console.log("Raw queue data:", JSON.stringify(queueData));
     } catch (e) {
       console.error("Error parsing queue data:", e);
       console.log("Raw queue data:", queueData);

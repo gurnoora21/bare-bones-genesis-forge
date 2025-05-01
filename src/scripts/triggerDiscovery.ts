@@ -7,6 +7,8 @@ import { supabase } from '../integrations/supabase/client';
  * @returns The message ID in the queue
  */
 export async function triggerArtistDiscovery(artistName: string): Promise<string> {
+  console.log(`Starting artist discovery for "${artistName}"`);
+  
   const { data, error } = await supabase.rpc('start_artist_discovery', {
     artist_name: artistName
   });
@@ -26,6 +28,8 @@ export async function triggerArtistDiscovery(artistName: string): Promise<string
  * @returns The response from the worker
  */
 export async function triggerWorker(workerName: string): Promise<any> {
+  console.log(`Manually triggering worker "${workerName}"`);
+  
   // Use a type assertion to bypass the TypeScript error
   // This is necessary because the RPC function isn't in the generated TypeScript definitions yet
   const { data, error } = await supabase.rpc(
@@ -47,6 +51,8 @@ export async function triggerWorker(workerName: string): Promise<any> {
  * @returns Array of cron job status information
  */
 export async function checkWorkerCrons(): Promise<any> {
+  console.log("Checking worker cron status...");
+  
   // Use a type assertion to bypass the TypeScript error
   // This is necessary because the RPC function isn't in the generated TypeScript definitions yet
   const { data, error } = await supabase.rpc('check_worker_crons' as any);
@@ -57,5 +63,25 @@ export async function checkWorkerCrons(): Promise<any> {
   }
   
   console.log('Worker cron status:', data);
+  return data;
+}
+
+/**
+ * Get contents of a queue for debugging
+ * @param queueName The name of the queue to inspect
+ * @returns Queue contents data
+ */
+export async function debugQueueContents(queueName: string): Promise<any> {
+  console.log(`Inspecting contents of queue "${queueName}"`);
+  
+  // Direct SQL query to check queue contents
+  const { data, error } = await supabase.from(`pgmq.${queueName}_queue`).select('*').limit(100);
+  
+  if (error) {
+    console.error(`Error inspecting queue ${queueName}:`, error);
+    throw error;
+  }
+  
+  console.log(`Queue "${queueName}" contents:`, data);
   return data;
 }
