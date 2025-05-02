@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -105,10 +106,10 @@ serve(async (req) => {
     }
 
     // Create a quick response to avoid timeout
-    const response = new Response(JSON.stringify({ 
-      processing: true, 
-      message_count: messages.length 
-    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const response = new Response(
+      JSON.stringify({ processing: true, message_count: messages.length }), 
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
 
     // Process messages in background to avoid CPU timeout
     EdgeRuntime.waitUntil((async () => {
@@ -154,106 +155,70 @@ serve(async (req) => {
             console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
             
             try {
-              // IMPORTANT FIX: Add additional fallback for Redis connection issues
+              // IMPROVED ERROR HANDLING: Try direct processing first, then fall back to cache-less method
               try {
+                // Try processing with caching first
                 await processArtist(supabase, spotifyClient, msg);
-                
-                // Use direct DELETE operation instead of calling the problematic function
-                console.log(`Deleting message ${messageId} from queue artist_discovery`);
-                
-                try {
-                  // Use the direct edge function for deleting, which is more reliable
-                  const deleteResponse = await fetch(
-                    `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
-                    {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-                      },
-                      body: JSON.stringify({ 
-                        queue_name: "artist_discovery", 
-                        message_id: messageId 
-                      })
-                    }
-                  );
-                  
-                  const deleteResult = await deleteResponse.json();
-                  
-                  if (deleteResponse.ok) {
-                    console.log(`Successfully processed message ${messageId}`);
-                    successCount++;
-                  } else {
-                    console.error(`Error deleting message ${messageId}:`, deleteResult);
-                    await logWorkerIssue(
-                      supabase,
-                      "artistDiscovery", 
-                      "queue_delete", 
-                      `Error deleting message ${messageId}`, 
-                      { error: deleteResult }
-                    );
+                console.log(`Successfully processed artist with normal method`);
+              } catch (processingError) {
+                // If the error is related to Redis formatting, try the fallback method
+                if (processingError.message && (
+                  processingError.message.includes("Redis") || 
+                  processingError.message.includes("unsupported arg type")
+                )) {
+                  console.log("Falling back to processing without Redis cache due to:", processingError.message);
+                  await processArtistWithoutCache(supabase, spotifyClient, msg);
+                  console.log(`Successfully processed artist with fallback method`);
+                } else {
+                  // If it's not Redis-related, rethrow
+                  throw processingError;
+                }
+              }
+              
+              // Use direct DELETE operation instead of calling the problematic function
+              console.log(`Deleting message ${messageId} from queue artist_discovery`);
+              
+              try {
+                // Use the direct edge function for deleting, which is more reliable
+                const deleteResponse = await fetch(
+                  `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
+                  {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+                    },
+                    body: JSON.stringify({ 
+                      queue_name: "artist_discovery", 
+                      message_id: messageId 
+                    })
                   }
-                } catch (deleteError) {
-                  console.error(`Error calling deleteFromQueue function:`, deleteError);
+                );
+                
+                const deleteResult = await deleteResponse.json();
+                
+                if (deleteResponse.ok) {
+                  console.log(`Successfully processed message ${messageId}`);
+                  successCount++;
+                } else {
+                  console.error(`Error deleting message ${messageId}:`, deleteResult);
                   await logWorkerIssue(
                     supabase,
                     "artistDiscovery", 
                     "queue_delete", 
-                    `Error calling deleteFromQueue for message ${messageId}`, 
-                    { error: deleteError }
+                    `Error deleting message ${messageId}`, 
+                    { error: deleteResult }
                   );
                 }
-              } catch (redisError) {
-                // Special handling for Redis errors which might be formatting related
-                if (redisError.message && redisError.message.includes("ERR unsupported arg type")) {
-                  console.error("Redis formatting error:", redisError);
-                  await logWorkerIssue(
-                    supabase,
-                    "artistDiscovery", 
-                    "redis_format_error", 
-                    `Redis formatting error: ${redisError.message}`, 
-                    { message: msg, error: redisError.message }
-                  );
-                  
-                  // Try to process with Redis caching disabled as a fallback
-                  try {
-                    // Process directly without cache
-                    await processArtistWithoutCache(supabase, spotifyClient, msg);
-                    
-                    // Delete the message if successful
-                    await fetch(
-                      `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
-                      {
-                        method: "POST",
-                        headers: {
-                          "Content-Type": "application/json",
-                          "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-                        },
-                        body: JSON.stringify({ 
-                          queue_name: "artist_discovery", 
-                          message_id: messageId 
-                        })
-                      }
-                    );
-                    
-                    console.log(`Successfully processed message ${messageId} with Redis caching disabled`);
-                    successCount++;
-                  } catch (fallbackError) {
-                    console.error(`Fallback processing failed:`, fallbackError);
-                    errorCount++;
-                  }
-                } else {
-                  // Other Redis errors
-                  console.error(`Error processing artist:`, redisError);
-                  await logWorkerIssue(
-                    supabase,
-                    "artistDiscovery", 
-                    "processing_error", 
-                    `Error processing artist: ${redisError.message}`, 
-                    { message: msg, error: redisError.message }
-                  );
-                  errorCount++;
-                }
+              } catch (deleteError) {
+                console.error(`Error calling deleteFromQueue function:`, deleteError);
+                await logWorkerIssue(
+                  supabase,
+                  "artistDiscovery", 
+                  "queue_delete", 
+                  `Error calling deleteFromQueue for message ${messageId}`, 
+                  { error: deleteError }
+                );
               }
             } catch (processError) {
               console.error(`Error processing artist message:`, processError);
