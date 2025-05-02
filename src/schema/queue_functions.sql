@@ -44,15 +44,28 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Function to delete a message (mark as processed)
+-- Fix: Create two overloads to handle parameters in any order
+DROP FUNCTION IF EXISTS pg_delete_message;
+
 CREATE OR REPLACE FUNCTION pg_delete_message(
-  queue_name TEXT,
-  message_id UUID
+  message_id UUID,
+  queue_name TEXT
 ) RETURNS BOOLEAN AS $$
 DECLARE
   success BOOLEAN;
 BEGIN
   SELECT pgmq.delete(queue_name, message_id) INTO success;
   RETURN success;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION pg_delete_message(
+  queue_name TEXT,
+  message_id UUID
+) RETURNS BOOLEAN AS $$
+BEGIN
+  -- Call the first version with parameters swapped
+  RETURN pg_delete_message(message_id, queue_name);
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
@@ -132,3 +145,4 @@ BEGIN
   RETURN response;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+

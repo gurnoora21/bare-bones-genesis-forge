@@ -27,11 +27,11 @@ serve(async (req) => {
     
     console.log(`Deleting message ${message_id} from queue ${queue_name}`);
     
-    // Fix: Calling pg_delete_message with correct parameter order (message_id first, queue_name second)
-    const { data, error } = await supabase.rpc('pg_delete_message', {
-      message_id,
-      queue_name
-    });
+    // Direct SQL query to avoid parameter order issues with RPC
+    const { data, error } = await supabase.from('pgmq_jobs')
+      .delete()
+      .eq('id', message_id)
+      .eq('queue_name', queue_name);
     
     if (error) {
       console.error(`Error deleting message ${message_id}:`, error);
@@ -41,7 +41,7 @@ serve(async (req) => {
     console.log(`Successfully deleted message ${message_id} from queue ${queue_name}`);
     
     return new Response(
-      JSON.stringify({ success: data }),
+      JSON.stringify({ success: true }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     

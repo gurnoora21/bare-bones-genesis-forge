@@ -141,24 +141,50 @@ serve(async (req) => {
             try {
               await processArtist(supabase, spotifyClient, msg);
               
-              // Archive processed message - FIX: Pass parameters in correct order (message_id first, then queue_name)
-              const { error: deleteError } = await supabase.rpc('pg_delete_message', {
-                message_id: messageId,
-                queue_name: "artist_discovery"
-              });
+              // Use direct DELETE operation instead of calling the problematic function
+              console.log(`Deleting message ${messageId} from queue artist_discovery`);
               
-              if (deleteError) {
-                console.error(`Error deleting message ${messageId}:`, deleteError);
+              try {
+                // Use the direct edge function for deleting, which is more reliable
+                const deleteResponse = await fetch(
+                  "https://wshetxovyxtfqohhbvpg.supabase.co/functions/v1/deleteFromQueue",
+                  {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+                    },
+                    body: JSON.stringify({ 
+                      message_id: messageId, 
+                      queue_name: "artist_discovery" 
+                    })
+                  }
+                );
+                
+                const deleteResult = await deleteResponse.json();
+                
+                if (deleteResponse.ok) {
+                  console.log(`Successfully processed message ${messageId}`);
+                  successCount++;
+                } else {
+                  console.error(`Error deleting message ${messageId}:`, deleteResult);
+                  await logWorkerIssue(
+                    supabase,
+                    "artistDiscovery", 
+                    "queue_delete", 
+                    `Error deleting message ${messageId}`, 
+                    { error: deleteResult }
+                  );
+                }
+              } catch (deleteError) {
+                console.error(`Error calling deleteFromQueue function:`, deleteError);
                 await logWorkerIssue(
                   supabase,
                   "artistDiscovery", 
                   "queue_delete", 
-                  `Error deleting message ${messageId}`, 
+                  `Error calling deleteFromQueue for message ${messageId}`, 
                   { error: deleteError }
                 );
-              } else {
-                console.log(`Successfully processed message ${messageId}`);
-                successCount++;
               }
             } catch (processError) {
               console.error(`Error processing artist message:`, processError);
