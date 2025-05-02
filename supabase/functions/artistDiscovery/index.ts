@@ -141,10 +141,10 @@ serve(async (req) => {
             try {
               await processArtist(supabase, spotifyClient, msg);
               
-              // Archive processed message
+              // Archive processed message - FIX: Pass parameters in correct order (message_id first, then queue_name)
               const { error: deleteError } = await supabase.rpc('pg_delete_message', {
-                queue_name: "artist_discovery",
-                message_id: messageId
+                message_id: messageId,
+                queue_name: "artist_discovery"
               });
               
               if (deleteError) {

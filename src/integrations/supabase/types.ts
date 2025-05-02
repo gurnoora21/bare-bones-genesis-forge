@@ -379,6 +379,20 @@ export type Database = {
       }
     }
     Functions: {
+      check_worker_crons: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          jobid: number
+          schedule: string
+          command: string
+          nodename: string
+          nodeport: number
+          database: string
+          username: string
+          active: boolean
+          next_run: string
+        }[]
+      }
       get_producer_collaborations: {
         Args: { producer_id: string }
         Returns: {
@@ -392,7 +406,9 @@ export type Database = {
         Returns: Json
       }
       pg_delete_message: {
-        Args: { queue_name: string; message_id: string }
+        Args:
+          | { message_id: string; queue_name: string }
+          | { queue_name: string; message_id: string }
         Returns: boolean
       }
       pg_dequeue: {
@@ -406,6 +422,10 @@ export type Database = {
       pg_enqueue: {
         Args: { queue_name: string; message_body: Json }
         Returns: number
+      }
+      pg_queue_status: {
+        Args: { queue_name: string }
+        Returns: Json
       }
       pg_release_message: {
         Args: { queue_name: string; message_id: string }

@@ -27,9 +27,10 @@ serve(async (req) => {
     
     console.log(`Deleting message ${message_id} from queue ${queue_name}`);
     
+    // Fix: Calling pg_delete_message with correct parameter order (message_id first, queue_name second)
     const { data, error } = await supabase.rpc('pg_delete_message', {
-      queue_name,
-      message_id
+      message_id,
+      queue_name
     });
     
     if (error) {
