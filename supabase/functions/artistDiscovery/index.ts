@@ -35,6 +35,96 @@ async function logWorkerIssue(
   }
 }
 
+// IMPROVED: Helper function to ensure message deletion with retries
+async function ensureMessageDeleted(
+  supabase: any,
+  queueName: string,
+  messageId: string,
+  maxRetries: number = 3
+): Promise<boolean> {
+  console.log(`Attempting to delete message ${messageId} from queue ${queueName} with up to ${maxRetries} retries`);
+  
+  let deleted = false;
+  let attempts = 0;
+  
+  while (!deleted && attempts < maxRetries) {
+    attempts++;
+    
+    try {
+      // Try using the deleteFromQueue edge function
+      const deleteResponse = await fetch(
+        `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+          },
+          body: JSON.stringify({ 
+            queue_name: queueName, 
+            message_id: messageId 
+          })
+        }
+      );
+      
+      const deleteResult = await deleteResponse.json();
+      
+      if (deleteResponse.ok && deleteResult.success) {
+        console.log(`Successfully deleted message ${messageId} from ${queueName} (attempt ${attempts})`);
+        deleted = true;
+      } else {
+        console.warn(`Delete attempt ${attempts} failed for message ${messageId}: ${JSON.stringify(deleteResult)}`);
+        
+        // Fallback: try using RPC
+        if (attempts === maxRetries - 1) {
+          console.log(`Trying RPC fallback for message ${messageId}`);
+          const { error } = await supabase.rpc('pg_delete_message', {
+            queue_name: queueName,
+            message_id: messageId
+          });
+          
+          if (!error) {
+            console.log(`Successfully deleted message ${messageId} using RPC fallback`);
+            deleted = true;
+          } else {
+            console.error(`RPC fallback failed for message ${messageId}: ${error.message}`);
+          }
+        }
+        
+        // Wait before retrying (exponential backoff)
+        if (!deleted && attempts < maxRetries) {
+          const delayMs = Math.pow(2, attempts) * 100;
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      }
+      
+      // Verify deletion if still not confirmed
+      if (!deleted && attempts === maxRetries - 1) {
+        // Check if the message is actually gone
+        const { data: verifyData, error: verifyError } = await supabase.rpc('confirm_message_deletion', {
+          queue_name: queueName,
+          message_id: messageId
+        });
+        
+        if (!verifyError && verifyData === true) {
+          console.log(`Message ${messageId} verified as deleted despite error responses`);
+          deleted = true;
+        }
+      }
+    } catch (e) {
+      console.error(`Error during deletion attempt ${attempts} for message ${messageId}:`, e);
+      
+      // Wait before retrying
+      if (attempts < maxRetries) {
+        const delayMs = Math.pow(2, attempts) * 100;
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  
+  return deleted;
+}
+
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
@@ -155,10 +245,13 @@ serve(async (req) => {
             console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
             
             try {
+              let processed = false;
+              
               // IMPROVED ERROR HANDLING: Try direct processing first, then fall back to cache-less method
               try {
                 // Try processing with caching first
                 await processArtist(supabase, spotifyClient, msg);
+                processed = true;
                 console.log(`Successfully processed artist with normal method`);
               } catch (processingError) {
                 // If the error is related to Redis formatting, try the fallback method
@@ -168,6 +261,7 @@ serve(async (req) => {
                 )) {
                   console.log("Falling back to processing without Redis cache due to:", processingError.message);
                   await processArtistWithoutCache(supabase, spotifyClient, msg);
+                  processed = true;
                   console.log(`Successfully processed artist with fallback method`);
                 } else {
                   // If it's not Redis-related, rethrow
@@ -175,50 +269,25 @@ serve(async (req) => {
                 }
               }
               
-              // Use direct DELETE operation instead of calling the problematic function
-              console.log(`Deleting message ${messageId} from queue artist_discovery`);
-              
-              try {
-                // Use the direct edge function for deleting, which is more reliable
-                const deleteResponse = await fetch(
-                  `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
-                  {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                      "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-                    },
-                    body: JSON.stringify({ 
-                      queue_name: "artist_discovery", 
-                      message_id: messageId 
-                    })
-                  }
-                );
+              // Only delete the message if processing was successful
+              if (processed) {
+                // IMPROVED: Use the ensureMessageDeleted helper for reliable deletion
+                const deleteSuccess = await ensureMessageDeleted(supabase, "artist_discovery", messageId);
                 
-                const deleteResult = await deleteResponse.json();
-                
-                if (deleteResponse.ok) {
-                  console.log(`Successfully processed message ${messageId}`);
+                if (deleteSuccess) {
+                  console.log(`Successfully processed and deleted message ${messageId}`);
                   successCount++;
                 } else {
-                  console.error(`Error deleting message ${messageId}:`, deleteResult);
+                  console.error(`Failed to delete message ${messageId} after multiple attempts`);
                   await logWorkerIssue(
                     supabase,
                     "artistDiscovery", 
-                    "queue_delete", 
-                    `Error deleting message ${messageId}`, 
-                    { error: deleteResult }
+                    "queue_delete_failure", 
+                    `Failed to delete message ${messageId} after processing`, 
+                    { messageId }
                   );
+                  errorCount++;
                 }
-              } catch (deleteError) {
-                console.error(`Error calling deleteFromQueue function:`, deleteError);
-                await logWorkerIssue(
-                  supabase,
-                  "artistDiscovery", 
-                  "queue_delete", 
-                  `Error calling deleteFromQueue for message ${messageId}`, 
-                  { error: deleteError }
-                );
               }
             } catch (processError) {
               console.error(`Error processing artist message:`, processError);

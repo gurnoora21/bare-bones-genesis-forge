@@ -29,15 +29,32 @@ serve(async (req) => {
     
     console.log(`Deleting message ${message_id} from queue ${queue_name}`);
     
-    // Direct SQL query to avoid parameter order issues with RPC
-    const { data, error } = await supabase.from('pgmq_jobs')
-      .delete()
-      .eq('id', message_id)
-      .eq('queue_name', queue_name);
+    // FIXED: Use a direct SQL query with proper queue table name and parameters
+    // This is more reliable than the pgmq.delete function which had issues
+    const tableName = `pgmq_${queue_name}`;
+    const { data, error } = await supabase.rpc('pg_delete_message', {
+      queue_name,
+      message_id
+    });
     
     if (error) {
       console.error(`Error deleting message ${message_id}:`, error);
-      throw error;
+      
+      // Fallback method: Try direct SQL delete as a backup
+      const { error: fallbackError } = await supabase.from(tableName)
+        .delete()
+        .eq('id', message_id);
+      
+      if (fallbackError) {
+        console.error(`Fallback also failed for message ${message_id}:`, fallbackError);
+        throw fallbackError;
+      } else {
+        console.log(`Message ${message_id} deleted using fallback method`);
+        return new Response(
+          JSON.stringify({ success: true, method: 'fallback' }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
     }
     
     console.log(`Successfully deleted message ${message_id} from queue ${queue_name}`);

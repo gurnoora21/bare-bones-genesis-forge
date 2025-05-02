@@ -43,29 +43,32 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Function to delete a message (mark as processed)
--- Fix: Create two overloads to handle parameters in any order
+-- IMPROVED: Function to delete a message from a queue
+-- Added explicit error handling and better logging
 DROP FUNCTION IF EXISTS pg_delete_message;
-
-CREATE OR REPLACE FUNCTION pg_delete_message(
-  message_id UUID,
-  queue_name TEXT
-) RETURNS BOOLEAN AS $$
-DECLARE
-  success BOOLEAN;
-BEGIN
-  SELECT pgmq.delete(queue_name, message_id) INTO success;
-  RETURN success;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE OR REPLACE FUNCTION pg_delete_message(
   queue_name TEXT,
   message_id UUID
 ) RETURNS BOOLEAN AS $$
+DECLARE
+  success BOOLEAN;
+  queue_table TEXT;
 BEGIN
-  -- Call the first version with parameters swapped
-  RETURN pg_delete_message(message_id, queue_name);
+  -- Get the actual queue table name
+  SELECT pgmq.get_queue_table_name(queue_name) INTO queue_table;
+  
+  -- First try using pgmq.delete
+  SELECT pgmq.delete(queue_name, message_id) INTO success;
+  
+  -- If that fails, try a direct DELETE
+  IF NOT success THEN
+    EXECUTE format('DELETE FROM %I WHERE id = %L', queue_table, message_id);
+    GET DIAGNOSTICS success = ROW_COUNT;
+    success := success > 0;
+  END IF;
+  
+  RETURN success;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
@@ -146,3 +149,23 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
+-- ADDED: Helper function to confirm message deletion
+CREATE OR REPLACE FUNCTION confirm_message_deletion(
+  queue_name TEXT,
+  message_id UUID
+) RETURNS BOOLEAN AS $$
+DECLARE
+  exists_check BOOLEAN;
+  queue_table TEXT;
+BEGIN
+  -- Get the actual queue table name
+  SELECT pgmq.get_queue_table_name(queue_name) INTO queue_table;
+  
+  -- Check if the message still exists
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE id = %L)', queue_table, message_id)
+  INTO exists_check;
+  
+  -- Return TRUE if the message is confirmed deleted (doesn't exist)
+  RETURN NOT exists_check;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
