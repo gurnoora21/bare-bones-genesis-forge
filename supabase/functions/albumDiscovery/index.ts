@@ -98,7 +98,10 @@ serve(async (req) => {
           await processAlbums(supabase, spotifyClient, msg);
           // Archive processed message
           await supabase.functions.invoke("deleteFromQueue", {
-            body: { queue_name: "album_discovery", message_id: messageId }
+            body: { 
+              queue_name: "album_discovery", 
+              message_id: messageId 
+            }
           });
           console.log(`Successfully processed album message ${messageId}`);
           successCount++;

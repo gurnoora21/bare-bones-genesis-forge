@@ -34,16 +34,22 @@ export class UpstashRedis {
   
   /**
    * Make an authenticated request to the Upstash Redis REST API
+   * Fixed to ensure commands are properly formatted for Upstash REST API
    */
   private async request(commands: string[][]): Promise<any> {
     try {
+      // Ensure each command element is a string (Upstash REST API requirement)
+      const formattedCommands = commands.map(cmd => 
+        cmd.map(item => typeof item === 'number' ? String(item) : item)
+      );
+      
       const response = await fetch(this.url, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${this.token}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(commands)
+        body: JSON.stringify(formattedCommands)
       });
       
       if (!response.ok) {
@@ -194,7 +200,7 @@ export class UpstashRedis {
     try {
       const pipeline = [
         ["HMGET", key, "tokens", "last_refill"],
-        ["EXPIRE", key, interval * 2]
+        ["EXPIRE", key, String(interval * 2)]
       ];
       
       const [bucketData] = await this.pipelineExec(pipeline);
@@ -300,16 +306,16 @@ export class UpstashRedis {
           const [type, day, ...rest] = key.split(':');
           
           if (type === 'error') {
-            pipeline.push(["HINCRBY", `errors:${api}:${day}`, rest.join(':'), count]);
-            pipeline.push(["EXPIRE", `errors:${api}:${day}`, 60 * 60 * 24 * 30]);
+            pipeline.push(["HINCRBY", `errors:${api}:${day}`, rest.join(':'), String(count)]);
+            pipeline.push(["EXPIRE", `errors:${api}:${day}`, String(60 * 60 * 24 * 30)]);
           } else if (key.split(':').length === 2) {
             // Daily stats
-            pipeline.push(["HINCRBY", `stats:${api}:${day}`, rest[0], count]);
-            pipeline.push(["EXPIRE", `stats:${api}:${day}`, 60 * 60 * 24 * 30]);
+            pipeline.push(["HINCRBY", `stats:${api}:${day}`, rest[0], String(count)]);
+            pipeline.push(["EXPIRE", `stats:${api}:${day}`, String(60 * 60 * 24 * 30)]);
           } else {
             // Hourly stats
-            pipeline.push(["HINCRBY", `stats:${api}:${day}:${rest[0]}`, rest[1], count]);
-            pipeline.push(["EXPIRE", `stats:${api}:${day}:${rest[0]}`, 60 * 60 * 24 * 30]);
+            pipeline.push(["HINCRBY", `stats:${api}:${day}:${rest[0]}`, rest[1], String(count)]);
+            pipeline.push(["EXPIRE", `stats:${api}:${day}:${rest[0]}`, String(60 * 60 * 24 * 30)]);
           }
         }
       }

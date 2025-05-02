@@ -66,7 +66,7 @@ export class LocalTokenBucket {
       const now = Math.floor(Date.now() / 1000);
       const result = await this.redis.pipelineExec([
         ["HMGET", this.redisKey, "tokens", "last_refill"],
-        ["EXPIRE", this.redisKey, this.interval * 2]
+        ["EXPIRE", this.redisKey, String(this.interval * 2)]
       ]);
       
       if (result && result[0] && Array.isArray(result[0])) {
