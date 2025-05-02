@@ -13,6 +13,28 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Add a worker issue logging function
+async function logWorkerIssue(
+  supabase: any,
+  workerName: string,
+  issueType: string,
+  message: string,
+  details: any = {}
+) {
+  try {
+    await supabase.from('worker_issues').insert({
+      worker_name: workerName,
+      issue_type: issueType,
+      message: message,
+      details: details,
+      resolved: false
+    });
+    console.error(`[${workerName}] ${issueType}: ${message}`);
+  } catch (error) {
+    console.error("Failed to log worker issue:", error);
+  }
+}
+
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
@@ -37,17 +59,13 @@ serve(async (req) => {
 
     if (queueError) {
       console.error("Error reading from queue:", queueError);
-      // Try to log this to the worker_issues table for troubleshooting
-      try {
-        await supabase.from('worker_issues').insert({
-          worker_name: 'artistDiscovery',
-          issue_type: 'queue_error',
-          message: `Error reading from queue: ${queueError.message}`,
-          details: { error: queueError }
-        });
-      } catch (logError) {
-        console.error("Failed to log error to worker_issues:", logError);
-      }
+      await logWorkerIssue(
+        supabase,
+        "artistDiscovery", 
+        "queue_error", 
+        `Error reading from queue: ${queueError.message}`, 
+        { error: queueError }
+      );
       
       return new Response(JSON.stringify({ error: queueError }), { 
         status: 500, 
@@ -69,6 +87,13 @@ serve(async (req) => {
     } catch (e) {
       console.error("Error parsing queue data:", e);
       console.log("Raw queue data:", queueData);
+      await logWorkerIssue(
+        supabase,
+        "artistDiscovery", 
+        "queue_parsing", 
+        `Error parsing queue data: ${e.message}`, 
+        { queueData, error: e.message }
+      );
     }
 
     console.log(`Retrieved ${messages.length} messages from queue`);
@@ -80,64 +105,110 @@ serve(async (req) => {
       );
     }
 
-    // Initialize the Spotify client
-    const spotifyClient = new SpotifyClient();
+    // Create a quick response to avoid timeout
+    const response = new Response(JSON.stringify({ 
+      processing: true, 
+      message_count: messages.length 
+    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
-    // Process messages with background tasks
-    const promises = messages.map(async (message) => {
-      // Ensure the message is properly parsed
+    // Process messages in background to avoid CPU timeout
+    EdgeRuntime.waitUntil((async () => {
       try {
-        let msg: ArtistDiscoveryMsg;
-        
-        // Handle potential message format issues
-        console.log("Processing message:", JSON.stringify(message));
-        
-        if (typeof message.message === 'string') {
-          msg = JSON.parse(message.message) as ArtistDiscoveryMsg;
-        } else if (message.message && typeof message.message === 'object') {
-          msg = message.message as ArtistDiscoveryMsg;
-        } else {
-          throw new Error(`Invalid message format: ${JSON.stringify(message)}`);
-        }
-        
-        const messageId = message.id;
-        console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
-        
-        await processArtist(supabase, spotifyClient, msg);
-        
-        // Archive processed message
-        const { error: deleteError } = await supabase.rpc('pg_delete_message', {
-          queue_name: "artist_discovery",
-          message_id: messageId
-        });
-        
-        if (deleteError) {
-          console.error(`Error deleting message ${messageId}:`, deleteError);
-        } else {
-          console.log(`Successfully processed message ${messageId}`);
-        }
-      } catch (error) {
-        console.error(`Error processing artist message:`, error);
-        // Message will return to queue after visibility timeout
-      }
-    });
+        // Initialize the Spotify client
+        const spotifyClient = new SpotifyClient();
+        let successCount = 0;
+        let errorCount = 0;
 
-    // Wait for all background tasks in a background process
-    try {
-      EdgeRuntime.waitUntil(Promise.all(promises));
-      console.log(`Processing ${messages.length} messages in the background`);
-    } catch (error) {
-      console.error("Error in background processing:", error);
-    }
+        for (const message of messages) {
+          // Ensure the message is properly parsed
+          try {
+            let msg: ArtistDiscoveryMsg;
+            
+            // Handle potential message format issues
+            console.log("Processing message:", JSON.stringify(message));
+            
+            if (typeof message.message === 'string') {
+              msg = JSON.parse(message.message) as ArtistDiscoveryMsg;
+            } else if (message.message && typeof message.message === 'object') {
+              msg = message.message as ArtistDiscoveryMsg;
+            } else {
+              throw new Error(`Invalid message format: ${JSON.stringify(message)}`);
+            }
+            
+            const messageId = message.id;
+            console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
+            
+            try {
+              await processArtist(supabase, spotifyClient, msg);
+              
+              // Archive processed message
+              const { error: deleteError } = await supabase.rpc('pg_delete_message', {
+                queue_name: "artist_discovery",
+                message_id: messageId
+              });
+              
+              if (deleteError) {
+                console.error(`Error deleting message ${messageId}:`, deleteError);
+                await logWorkerIssue(
+                  supabase,
+                  "artistDiscovery", 
+                  "queue_delete", 
+                  `Error deleting message ${messageId}`, 
+                  { error: deleteError }
+                );
+              } else {
+                console.log(`Successfully processed message ${messageId}`);
+                successCount++;
+              }
+            } catch (processError) {
+              console.error(`Error processing artist message:`, processError);
+              await logWorkerIssue(
+                supabase,
+                "artistDiscovery", 
+                "processing_error", 
+                `Error processing artist: ${processError.message}`, 
+                { message: msg, error: processError.message }
+              );
+              errorCount++;
+              // Message will return to queue after visibility timeout
+            }
+          } catch (messageError) {
+            console.error(`Error parsing message:`, messageError);
+            await logWorkerIssue(
+              supabase,
+              "artistDiscovery", 
+              "message_parse", 
+              `Error parsing message: ${messageError.message}`, 
+              { message, error: messageError.message }
+            );
+            errorCount++;
+          }
+        }
+
+        console.log(`Background processing complete: ${successCount} successful, ${errorCount} failed`);
+      } catch (backgroundError) {
+        console.error("Error in background processing:", backgroundError);
+        await logWorkerIssue(
+          supabase,
+          "artistDiscovery", 
+          "background_error", 
+          `Background processing error: ${backgroundError.message}`, 
+          { error: backgroundError.message }
+        );
+      }
+    })());
     
-    return new Response(JSON.stringify({ 
-      processed: messages.length,
-      success: true
-    }), { 
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-    });
+    return response;
   } catch (mainError) {
     console.error("Major error in artistDiscovery function:", mainError);
+    await logWorkerIssue(
+      supabase,
+      "artistDiscovery", 
+      "fatal_error", 
+      `Major error: ${mainError.message}`, 
+      { error: mainError.message, stack: mainError.stack }
+    );
+    
     return new Response(JSON.stringify({ error: mainError.message }), { 
       status: 500, 
       headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -181,7 +252,7 @@ async function processArtist(
     throw new Error("Failed to fetch artist data");
   }
 
-  // Store in database
+  // Store in database with explicit conflict handling
   const { data: artist, error } = await supabase
     .from('artists')
     .upsert({
@@ -191,6 +262,9 @@ async function processArtist(
       popularity: artistData.popularity,
       image_url: artistData.images?.[0]?.url,
       metadata: artistData
+    }, {
+      onConflict: 'spotify_id',
+      ignoreDuplicates: false
     })
     .select('id')
     .single();

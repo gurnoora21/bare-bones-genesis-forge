@@ -13,6 +13,28 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Add a worker issue logging function
+async function logWorkerIssue(
+  supabase: any,
+  workerName: string,
+  issueType: string,
+  message: string,
+  details: any = {}
+) {
+  try {
+    await supabase.from('worker_issues').insert({
+      worker_name: workerName,
+      issue_type: issueType,
+      message: message,
+      details: details,
+      resolved: false
+    });
+    console.error(`[${workerName}] ${issueType}: ${message}`);
+  } catch (error) {
+    console.error("Failed to log worker issue:", error);
+  }
+}
+
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
@@ -35,6 +57,13 @@ serve(async (req) => {
 
   if (error) {
     console.error("Error reading from queue:", error);
+    await logWorkerIssue(
+      supabase,
+      "albumDiscovery", 
+      "queue_error", 
+      "Error reading from queue", 
+      { error }
+    );
     return new Response(JSON.stringify({ error }), { status: 500, headers: corsHeaders });
   }
 
@@ -42,38 +71,59 @@ serve(async (req) => {
     return new Response(JSON.stringify({ processed: 0, message: "No messages to process" }), { headers: corsHeaders });
   }
 
+  // Create a quick response to avoid timeout
+  const response = new Response(JSON.stringify({ 
+    processing: true, 
+    message_count: messages.length 
+  }), { headers: corsHeaders });
+
   // Initialize the Spotify client
   const spotifyClient = new SpotifyClient();
 
   // Process messages with background tasks
-  const promises = messages.map(async (message) => {
-    // Ensure the message is properly typed
-    const msg = typeof message.message === 'string' 
-      ? JSON.parse(message.message) as AlbumDiscoveryMsg 
-      : message.message as AlbumDiscoveryMsg;
-      
-    const messageId = message.id;
+  EdgeRuntime.waitUntil((async () => {
+    let successCount = 0;
+    let errorCount = 0;
     
-    try {
-      await processAlbums(supabase, spotifyClient, msg);
-      // Archive processed message
-      await supabase.functions.invoke("deleteFromQueue", {
-        body: { queue_name: "album_discovery", message_id: messageId }
-      });
-      console.log(`Successfully processed album message ${messageId}`);
-    } catch (error) {
-      console.error(`Error processing album message ${messageId}:`, error);
-      // Message will return to queue after visibility timeout
+    for (const message of messages) {
+      try {
+        // Ensure the message is properly typed
+        const msg = typeof message.message === 'string' 
+          ? JSON.parse(message.message) as AlbumDiscoveryMsg 
+          : message.message as AlbumDiscoveryMsg;
+          
+        const messageId = message.id;
+        
+        try {
+          await processAlbums(supabase, spotifyClient, msg);
+          // Archive processed message
+          await supabase.functions.invoke("deleteFromQueue", {
+            body: { queue_name: "album_discovery", message_id: messageId }
+          });
+          console.log(`Successfully processed album message ${messageId}`);
+          successCount++;
+        } catch (processError) {
+          console.error(`Error processing album message ${messageId}:`, processError);
+          await logWorkerIssue(
+            supabase,
+            "albumDiscovery", 
+            "processing_error", 
+            `Error processing message ${messageId}: ${processError.message}`,
+            { messageId, msg, error: processError.message }
+          );
+          errorCount++;
+          // Message will return to queue after visibility timeout
+        }
+      } catch (messageError) {
+        console.error(`Error parsing message:`, messageError);
+        errorCount++;
+      }
     }
-  });
-
-  // Wait for all background tasks in a background process
-  EdgeRuntime.waitUntil(Promise.all(promises));
+    
+    console.log(`Completed background processing: ${successCount} successful, ${errorCount} failed`);
+  })());
   
-  return new Response(JSON.stringify({ 
-    processed: messages.length,
-    success: true
-  }), { headers: corsHeaders });
+  return response;
 });
 
 async function processAlbums(
@@ -117,42 +167,72 @@ async function processAlbums(
 
   // Process each album
   for (const fullAlbumData of fullAlbums) {
-    // Store album in database
-    const { data: album, error } = await supabase
-      .from('albums')
-      .upsert({
-        artist_id: artistId,
-        spotify_id: fullAlbumData.id,
-        name: fullAlbumData.name,
-        release_date: formatReleaseDate(fullAlbumData.release_date),
-        cover_url: fullAlbumData.images[0]?.url,
-        metadata: fullAlbumData
-      })
-      .select()
-      .single();
+    try {
+      // Store album in database with better error handling
+      const { data: album, error } = await supabase
+        .from('albums')
+        .upsert({
+          artist_id: artistId,
+          spotify_id: fullAlbumData.id,
+          name: fullAlbumData.name,
+          release_date: formatReleaseDate(fullAlbumData.release_date),
+          cover_url: fullAlbumData.images[0]?.url,
+          metadata: fullAlbumData
+        }, {
+          onConflict: 'spotify_id',
+          ignoreDuplicates: false
+        })
+        .select()
+        .single();
 
-    if (error) {
-      console.error(`Error storing album ${fullAlbumData.name}:`, error);
-      continue; // Continue with other albums
-    }
-
-    // Enqueue track discovery
-    await supabase.functions.invoke("sendToQueue", {
-      body: {
-        queue_name: "track_discovery",
-        message: { 
-          albumId: album.id,
-          albumName: album.name,
-          artistId
-        }
+      if (error) {
+        console.error(`Error storing album ${fullAlbumData.name}:`, error);
+        await logWorkerIssue(
+          supabase,
+          "albumDiscovery", 
+          "database_error", 
+          `Error storing album ${fullAlbumData.name}`, 
+          { 
+            error, 
+            albumData: {
+              id: fullAlbumData.id,
+              name: fullAlbumData.name
+            }
+          }
+        );
+        continue; // Continue with other albums
       }
-    });
-    
-    console.log(`Processed album ${album.name}, enqueued track discovery`);
+
+      // Enqueue track discovery
+      await supabase.functions.invoke("sendToQueue", {
+        body: {
+          queue_name: "track_discovery",
+          message: { 
+            albumId: album.id,
+            albumName: album.name,
+            artistId
+          }
+        }
+      });
+      
+      console.log(`Processed album ${album.name}, enqueued track discovery`);
+    } catch (albumError) {
+      console.error(`Error processing album ${fullAlbumData.name}:`, albumError);
+      await logWorkerIssue(
+        supabase,
+        "albumDiscovery", 
+        "album_processing", 
+        `Error processing album ${fullAlbumData.name}`, 
+        { 
+          error: albumError.message, 
+          albumId: fullAlbumData.id
+        }
+      );
+    }
   }
 
-  // If there are more albums, enqueue the next batch
-  if (albumsData.next) {
+  // If there are more albums, enqueue the next batch with proper termination condition
+  if (albumsData.next && albumsData.total > offset + albumsData.items.length) {
     await supabase.functions.invoke("sendToQueue", {
       body: {
         queue_name: "album_discovery",
@@ -162,7 +242,9 @@ async function processAlbums(
         }
       }
     });
-    console.log(`Enqueued next page of albums for artist ${artistId} with offset ${offset + albumsData.items.length}`);
+    console.log(`Enqueued next page of albums for artist ${artistId}: ${offset + albumsData.items.length}/${albumsData.total}`);
+  } else {
+    console.log(`Completed album discovery for artist ${artistId}: Found ${offset + albumsData.items.length} albums`);
   }
 }
 
