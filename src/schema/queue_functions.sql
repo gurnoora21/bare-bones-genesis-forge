@@ -97,98 +97,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Schedule cron jobs to process each queue regularly
-
--- Artist discovery - every 2 minutes
-SELECT cron.schedule(
-  'artist-discovery-worker',
-  '*/2 * * * *',
-  $$
-  SELECT
-    net.http_post(
-      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/artistDiscovery',
-      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
-      body:= '{}'::jsonb,
-      timeout_milliseconds:= 0
-    );
-  $$
-);
-
--- Album discovery - every 5 minutes
-SELECT cron.schedule(
-  'album-discovery-worker',
-  '*/5 * * * *',
-  $$
-  SELECT
-    net.http_post(
-      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/albumDiscovery',
-      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
-      body:= '{}'::jsonb,
-      timeout_milliseconds:= 0
-    );
-  $$
-);
-
--- Track discovery - every 5 minutes
-SELECT cron.schedule(
-  'track-discovery-worker',
-  '*/5 * * * *',
-  $$
-  SELECT
-    net.http_post(
-      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/trackDiscovery',
-      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
-      body:= '{}'::jsonb,
-      timeout_milliseconds:= 0
-    );
-  $$
-);
-
--- Producer identification - every 10 minutes
-SELECT cron.schedule(
-  'producer-identification-worker',
-  '*/10 * * * *',
-  $$
-  SELECT
-    net.http_post(
-      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/producerIdentification',
-      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
-      body:= '{}'::jsonb,
-      timeout_milliseconds:= 0
-    );
-  $$
-);
-
--- Social enrichment - every hour
-SELECT cron.schedule(
-  'social-enrichment-worker',
-  '0 * * * *',
-  $$
-  SELECT
-    net.http_post(
-      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/socialEnrichment',
-      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
-      body:= '{}'::jsonb,
-      timeout_milliseconds:= 0
-    );
-  $$
-);
-
--- System monitoring - every 30 minutes
-SELECT cron.schedule(
-  'system-monitoring',
-  '*/30 * * * *',
-  $$
-  SELECT
-    net.http_post(
-      url:= (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_URL') || '/functions/v1/monitorSystem',
-      headers:= '{\"Content-type\":\"application/json\", \"Authorization\": \"Bearer ' || (SELECT value FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY') || '\"}'::jsonb,
-      body:= '{}'::jsonb,
-      timeout_milliseconds:= 0
-    );
-  $$
-);
-
 -- Function to manually start the discovery process for an artist
 CREATE OR REPLACE FUNCTION start_artist_discovery(artist_name TEXT) RETURNS BIGINT AS $$
 DECLARE
@@ -200,33 +108,22 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Function to manually trigger any worker
+-- Function to manually trigger any worker using explicit URLs
 CREATE OR REPLACE FUNCTION manual_trigger_worker(worker_name TEXT) RETURNS JSONB AS $$
 DECLARE
   response JSONB;
   worker_url TEXT;
-  supabase_url TEXT;
-  supabase_anon_key TEXT;
 BEGIN
-  -- Get settings values 
-  SELECT value INTO supabase_url FROM vault.secrets WHERE name = 'SUPABASE_URL';
-  SELECT value INTO supabase_anon_key FROM vault.secrets WHERE name = 'SUPABASE_ANON_KEY';
+  -- Construct the worker URL with explicit URL
+  worker_url := 'https://wshetxovyxtfqohhbvpg.supabase.co/functions/v1/' || worker_name;
   
-  -- Check if settings exist
-  IF supabase_url IS NULL OR supabase_anon_key IS NULL THEN
-    RAISE EXCEPTION 'Missing Supabase settings';
-  END IF;
-  
-  -- Construct the worker URL using settings
-  worker_url := supabase_url || '/functions/v1/' || worker_name;
-  
-  -- Trigger the worker manually
+  -- Trigger the worker manually with explicit anon key
   SELECT 
     net.http_post(
       url:= worker_url,
       headers:= json_build_object(
         'Content-type', 'application/json', 
-        'Authorization', 'Bearer ' || supabase_anon_key
+        'Authorization', 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzaGV0eG92eXh0ZnFvaGhidnBnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDYwODI4OTIsImV4cCI6MjA2MTY1ODg5Mn0.tCQlhWOa0AFX4rcVUyVXFXBaG9Oeibn7N0cJbdmIwOs'
       )::jsonb,
       body:= '{}'::jsonb,
       timeout_milliseconds:= 0
