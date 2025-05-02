@@ -14,7 +14,8 @@ serve(async (req) => {
   }
 
   try {
-    const { queue_name, message_id } = await req.json();
+    const requestBody = await req.json();
+    const { queue_name, message_id } = requestBody;
     
     if (!queue_name || !message_id) {
       throw new Error("queue_name and message_id are required");
