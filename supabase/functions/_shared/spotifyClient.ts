@@ -1,3 +1,4 @@
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { getRateLimiter, RATE_LIMITERS } from "./rateLimiter.ts";
 
@@ -151,6 +152,52 @@ export class SpotifyClient {
   
   async getArtistAlbums(artistId: string, offset = 0, limit = 50): Promise<any> {
     return this.apiRequest(`/artists/${artistId}/albums?offset=${offset}&limit=${limit}&include_groups=album,single`, "GET", undefined, 60 * 60 * 12); // Cache for 12 hours
+  }
+
+  // NEW: Direct API methods that bypass caching and rate limiting for fallback scenarios
+  
+  /**
+   * Get artist by ID directly without caching
+   */
+  async getArtistByIdDirect(id: string): Promise<any> {
+    const token = await this.getAccessToken();
+    const url = `https://api.spotify.com/v1/artists/${id}`;
+    
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Spotify API error: ${response.status} ${await response.text()}`);
+    }
+    
+    return await response.json();
+  }
+  
+  /**
+   * Search for artist by name directly without caching
+   */
+  async searchArtistDirect(name: string): Promise<any> {
+    const token = await this.getAccessToken();
+    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(name)}&type=artist&limit=1`;
+    
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Spotify API error: ${response.status} ${await response.text()}`);
+    }
+    
+    return await response.json();
   }
 
   // Album-related methods with caching

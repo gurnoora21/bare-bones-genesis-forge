@@ -111,7 +111,6 @@ serve(async (req) => {
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
     // Process messages in background to avoid CPU timeout
-    // FIX: Incorrect parentheses structure in the waitUntil call
     EdgeRuntime.waitUntil((async () => {
       try {
         // Initialize the Spotify client
@@ -390,7 +389,7 @@ async function processArtist(
   return artist;
 }
 
-// Fallback implementation without Redis caching
+// Updated fallback implementation to use direct API methods without Redis caching
 async function processArtistWithoutCache(
   supabase: any, 
   spotifyClient: any, 
