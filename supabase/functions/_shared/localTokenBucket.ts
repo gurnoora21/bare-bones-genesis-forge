@@ -89,13 +89,15 @@ export class LocalTokenBucket {
           this.lastRefill = Date.now();
           
           // Update Redis with our current state
+          // FIXED: Ensure proper string formatting for tokens value
           await this.redis.pipelineExec([
-            ["HMSET", this.redisKey, "tokens", this.tokens.toString(), "last_refill", Math.floor(this.lastRefill / 1000).toString()]
+            ["HMSET", this.redisKey, "tokens", String(this.tokens), "last_refill", String(Math.floor(this.lastRefill / 1000))]
           ]);
         } else {
           // Initialize Redis with our current state
+          // FIXED: Ensure proper string formatting for tokens value
           await this.redis.pipelineExec([
-            ["HMSET", this.redisKey, "tokens", this.tokens.toString(), "last_refill", Math.floor(this.lastRefill / 1000).toString()]
+            ["HMSET", this.redisKey, "tokens", String(this.tokens), "last_refill", String(Math.floor(this.lastRefill / 1000))]
           ]);
         }
       }

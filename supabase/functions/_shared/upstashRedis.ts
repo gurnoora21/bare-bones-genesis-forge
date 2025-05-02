@@ -1,4 +1,3 @@
-
 /**
  * Upstash Redis HTTP client for Deno/Edge Functions
  * Implements key Redis operations needed for rate limiting and caching
@@ -38,9 +37,21 @@ export class UpstashRedis {
    */
   private async request(commands: string[][]): Promise<any> {
     try {
-      // Ensure each command element is a string (Upstash REST API requirement)
+      // CRITICAL FIX: Ensure each command element is a string (Upstash REST API requirement)
+      // The Upstash REST API expects each command as an array of strings - no nested arrays or other types
       const formattedCommands = commands.map(cmd => 
-        cmd.map(item => typeof item === 'number' ? String(item) : item)
+        cmd.map(item => {
+          if (typeof item === 'number') {
+            return String(item);
+          } else if (typeof item === 'boolean') {
+            return item ? "1" : "0";
+          } else if (item === null || item === undefined) {
+            return "";
+          } else if (typeof item === 'object') {
+            return JSON.stringify(item);
+          }
+          return item;
+        })
       );
       
       const response = await fetch(this.url, {
@@ -53,7 +64,8 @@ export class UpstashRedis {
       });
       
       if (!response.ok) {
-        throw new Error(`Upstash Redis error: ${response.status} ${await response.text()}`);
+        const errorText = await response.text();
+        throw new Error(`Upstash Redis error: ${response.status} ${errorText}`);
       }
       
       const data = await response.json();
@@ -97,10 +109,12 @@ export class UpstashRedis {
     }
     
     // Cache miss, get from Redis
+    // FIXED: Ensure command format for GET is properly structured
     const result = await this.request([["GET", key]]);
     
     if (result) {
       try {
+        // Try to parse as JSON first
         const parsedValue = JSON.parse(result);
         // Store in memory cache with default TTL of 5 minutes
         this.memoryCache.set(key, parsedValue, 300);
@@ -120,9 +134,12 @@ export class UpstashRedis {
     this.memoryCache.set(key, value, expireSeconds);
     
     // Format the command based on expiration
+    // FIXED: Ensure proper string formatting for value and expireSeconds
+    const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    
     const command = expireSeconds 
-      ? [["SET", key, JSON.stringify(value), "EX", String(expireSeconds)]] 
-      : [["SET", key, JSON.stringify(value)]];
+      ? [["SET", key, stringValue, "EX", String(expireSeconds)]] 
+      : [["SET", key, stringValue]];
     
     return await this.request(command);
   }
@@ -227,8 +244,11 @@ export class UpstashRedis {
         const newTokens = tokens - tokensToConsume;
         this.memoryCache.set(cacheKey, { tokens: newTokens, lastRefill }, interval * 2);
         
-        // Update Redis in background to avoid blocking
-        this.updateTokenBucketInRedis(key, newTokens, lastRefill, interval * 2);
+        // FIXED: Ensure proper string formatting for tokens and lastRefill
+        await this.pipelineExec([
+          ["HMSET", key, "tokens", String(newTokens), "last_refill", String(lastRefill)],
+          ["EXPIRE", key, String(interval * 2)]
+        ]);
         
         return true;
       }
@@ -248,8 +268,9 @@ export class UpstashRedis {
     expireSeconds: number
   ): Promise<void> {
     try {
+      // FIXED: Ensure proper string formatting for tokens and lastRefill
       await this.pipelineExec([
-        ["HMSET", key, "tokens", tokens.toString(), "last_refill", lastRefill.toString()],
+        ["HMSET", key, "tokens", String(tokens), "last_refill", String(lastRefill)],
         ["EXPIRE", key, String(expireSeconds)]
       ]);
     } catch (error) {

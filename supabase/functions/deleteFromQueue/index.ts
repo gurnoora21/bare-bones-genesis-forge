@@ -18,6 +18,7 @@ serve(async (req) => {
     const { queue_name, message_id } = requestBody;
     
     if (!queue_name || !message_id) {
+      console.error("Missing required parameters:", { queue_name, message_id });
       throw new Error("queue_name and message_id are required");
     }
     

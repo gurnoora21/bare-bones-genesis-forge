@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -115,7 +114,23 @@ serve(async (req) => {
     EdgeRuntime.waitUntil((async () => {
       try {
         // Initialize the Spotify client
-        const spotifyClient = new SpotifyClient();
+        // IMPORTANT FIX: Use try/catch for Spotify client initialization
+        // to prevent it from failing due to Redis connection issues
+        let spotifyClient;
+        try {
+          spotifyClient = new SpotifyClient();
+        } catch (spotifyError) {
+          console.error("Failed to initialize Spotify client:", spotifyError);
+          await logWorkerIssue(
+            supabase,
+            "artistDiscovery", 
+            "spotify_init_error", 
+            `Failed to initialize Spotify client: ${spotifyError.message}`, 
+            { error: spotifyError }
+          );
+          return; // Exit early if we can't initialize Spotify client
+        }
+        
         let successCount = 0;
         let errorCount = 0;
 
@@ -135,9 +150,11 @@ serve(async (req) => {
               throw new Error(`Invalid message format: ${JSON.stringify(message)}`);
             }
             
-            const messageId = message.id;
-            console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
-            
+          const messageId = message.id || message.msg_id;
+          console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
+          
+          try {
+            // IMPORTANT FIX: Add additional fallback for Redis connection issues
             try {
               await processArtist(supabase, spotifyClient, msg);
               
@@ -147,7 +164,7 @@ serve(async (req) => {
               try {
                 // Use the direct edge function for deleting, which is more reliable
                 const deleteResponse = await fetch(
-                  "https://wshetxovyxtfqohhbvpg.supabase.co/functions/v1/deleteFromQueue",
+                  `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
                   {
                     method: "POST",
                     headers: {
@@ -155,8 +172,8 @@ serve(async (req) => {
                       "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
                     },
                     body: JSON.stringify({ 
-                      message_id: messageId, 
-                      queue_name: "artist_discovery" 
+                      queue_name: "artist_discovery", 
+                      message_id: messageId 
                     })
                   }
                 );
@@ -186,26 +203,66 @@ serve(async (req) => {
                   { error: deleteError }
                 );
               }
-            } catch (processError) {
-              console.error(`Error processing artist message:`, processError);
-              await logWorkerIssue(
-                supabase,
-                "artistDiscovery", 
-                "processing_error", 
-                `Error processing artist: ${processError.message}`, 
-                { message: msg, error: processError.message }
-              );
-              errorCount++;
-              // Message will return to queue after visibility timeout
+            } catch (redisError) {
+              // Special handling for Redis errors which might be formatting related
+              if (redisError.message && redisError.message.includes("ERR unsupported arg type")) {
+                console.error("Redis formatting error:", redisError);
+                await logWorkerIssue(
+                  supabase,
+                  "artistDiscovery", 
+                  "redis_format_error", 
+                  `Redis formatting error: ${redisError.message}`, 
+                  { message: msg, error: redisError.message }
+                );
+                
+                // Try to process with Redis caching disabled as a fallback
+                try {
+                  // Process directly without cache
+                  await processArtistWithoutCache(supabase, spotifyClient, msg);
+                  
+                  // Delete the message if successful
+                  await fetch(
+                    `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
+                    {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+                      },
+                      body: JSON.stringify({ 
+                        queue_name: "artist_discovery", 
+                        message_id: messageId 
+                      })
+                    }
+                  );
+                  
+                  console.log(`Successfully processed message ${messageId} with Redis caching disabled`);
+                  successCount++;
+                } catch (fallbackError) {
+                  console.error(`Fallback processing failed:`, fallbackError);
+                  errorCount++;
+                }
+              } else {
+                // Other Redis errors
+                console.error(`Error processing artist:`, redisError);
+                await logWorkerIssue(
+                  supabase,
+                  "artistDiscovery", 
+                  "processing_error", 
+                  `Error processing artist: ${redisError.message}`, 
+                  { message: msg, error: redisError.message }
+                );
+                errorCount++;
+              }
             }
-          } catch (messageError) {
-            console.error(`Error parsing message:`, messageError);
+          } catch (processError) {
+            console.error(`Error processing artist message:`, processError);
             await logWorkerIssue(
               supabase,
               "artistDiscovery", 
-              "message_parse", 
-              `Error parsing message: ${messageError.message}`, 
-              { message, error: messageError.message }
+              "processing_error", 
+              `Error processing artist: ${processError.message}`, 
+              { message: msg, error: processError.message }
             );
             errorCount++;
           }
@@ -242,6 +299,7 @@ serve(async (req) => {
   }
 });
 
+// The original processArtist function
 async function processArtist(
   supabase: any, 
   spotifyClient: any, 
@@ -264,6 +322,85 @@ async function processArtist(
     // Search for artist by name
     console.log(`Searching for artist by name: ${artistName}`);
     const searchResponse = await spotifyClient.getArtistByName(artistName);
+    
+    if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items.length) {
+      throw new Error(`Artist not found: ${artistName}`);
+    }
+    
+    // Use the first artist result
+    artistData = searchResponse.artists.items[0];
+    console.log(`Found artist: ${artistData.name} (${artistData.id})`);
+  }
+  
+  if (!artistData) {
+    throw new Error("Failed to fetch artist data");
+  }
+
+  // Store in database with explicit conflict handling
+  const { data: artist, error } = await supabase
+    .from('artists')
+    .upsert({
+      spotify_id: artistData.id,
+      name: artistData.name,
+      followers: artistData.followers?.total || 0,
+      popularity: artistData.popularity,
+      image_url: artistData.images?.[0]?.url,
+      metadata: artistData
+    }, {
+      onConflict: 'spotify_id',
+      ignoreDuplicates: false
+    })
+    .select('id')
+    .single();
+
+  if (error) {
+    console.error("Error storing artist:", error);
+    throw new Error(`Error storing artist: ${error.message}`);
+  }
+
+  console.log(`Stored artist in database with ID: ${artist.id}`);
+
+  // Enqueue album discovery
+  const { data: enqueueData, error: queueError } = await supabase.rpc('pg_enqueue', {
+    queue_name: 'album_discovery',
+    message_body: JSON.stringify({ 
+      artistId: artist.id, 
+      offset: 0 
+    })
+  });
+
+  if (queueError) {
+    console.error("Error enqueueing album discovery:", queueError);
+    throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
+  }
+
+  console.log(`Processed artist ${artistData.name}, enqueued album discovery for artist ID ${artist.id}`);
+  return artist;
+}
+
+// Fallback implementation without Redis caching
+async function processArtistWithoutCache(
+  supabase: any, 
+  spotifyClient: any, 
+  msg: ArtistDiscoveryMsg
+) {
+  console.log("Processing artist without Redis cache:", msg);
+  const { artistId, artistName } = msg;
+  
+  if (!artistId && !artistName) {
+    throw new Error("Either artistId or artistName must be provided");
+  }
+
+  // Get the Spotify artist ID and details
+  let artistData;
+  
+  if (artistId) {
+    // Get artist by Spotify ID - direct call without cache
+    artistData = await spotifyClient.getArtistByIdDirect(artistId);
+  } else if (artistName) {
+    // Search for artist by name - direct call without cache
+    console.log(`Searching for artist by name (no cache): ${artistName}`);
+    const searchResponse = await spotifyClient.searchArtistDirect(artistName);
     
     if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items.length) {
       throw new Error(`Artist not found: ${artistName}`);
