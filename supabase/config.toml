@@ -83,3 +83,9 @@ gcp_jwt_path = "supabase/gcloud.json"
 verify_jwt = true
 [experimental.functions.sendSql]
 verify_jwt = true
+[experimental.functions.executeRawSql]
+verify_jwt = true
+[experimental.functions.manageQueue]
+verify_jwt = true
+[experimental.functions.queueMonitor]
+verify_jwt = true

@@ -15,7 +15,7 @@ serve(async (req) => {
 
   try {
     const requestBody = await req.json();
-    const { sql_query, params = [] } = requestBody;
+    const { sql_query, params = [], use_transaction = false } = requestBody;
     
     if (!sql_query) {
       throw new Error("sql_query is required");
@@ -28,19 +28,42 @@ serve(async (req) => {
     
     console.log(`Executing SQL query: ${sql_query}`);
     console.log(`With parameters: ${JSON.stringify(params)}`);
+    console.log(`Using transaction: ${use_transaction}`);
     
-    // Execute the raw SQL query
-    const { data, error } = await supabase.rpc('raw_sql_query', {
-      sql_query: sql_query,
-      params: params
-    });
+    let result;
     
-    if (error) {
-      throw error;
+    if (use_transaction) {
+      // Execute the SQL query in a transaction
+      const { data, error } = await supabase.rpc('raw_sql_query', {
+        sql_query: `
+          BEGIN;
+          ${sql_query}
+          COMMIT;
+        `,
+        params: params
+      });
+      
+      if (error) {
+        throw error;
+      }
+      
+      result = data;
+    } else {
+      // Execute the raw SQL query without transaction
+      const { data, error } = await supabase.rpc('raw_sql_query', {
+        sql_query: sql_query,
+        params: params
+      });
+      
+      if (error) {
+        throw error;
+      }
+      
+      result = data;
     }
     
     return new Response(
-      JSON.stringify({ data }),
+      JSON.stringify({ data: result }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     
