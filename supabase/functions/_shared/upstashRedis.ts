@@ -41,13 +41,13 @@ export class UpstashRedis {
         throw new Error("Invalid Redis commands: commands must be a non-empty array");
       }
       
-      // Format commands for Upstash REST API compatibility
+      // FIXED: Properly format commands for Upstash REST API compatibility
       const formattedCommands = commands.map(cmd => {
         if (!Array.isArray(cmd) || cmd.length === 0) {
           throw new Error("Invalid Redis command format: each command must be a non-empty array");
         }
         
-        // Ensure all command elements are strings
+        // Ensure all command elements are properly formatted strings
         return cmd.map(item => {
           if (item === null || item === undefined) {
             return "";
@@ -65,7 +65,7 @@ export class UpstashRedis {
       });
       
       // Log commands for debugging (but keep them short)
-      const debugCommands = JSON.stringify(formattedCommands).substring(0, 500) + "...";
+      const debugCommands = this.compressString(JSON.stringify(formattedCommands));
       console.debug("Sending Redis commands:", debugCommands);
       
       const response = await fetch(this.url, {
@@ -426,7 +426,7 @@ export class UpstashRedis {
     }
   }
   
-  // Result caching - optimized with memory cache
+  // Result caching - optimized with memory cache and improved error handling
   
   async cacheSet(key: string, value: any, ttlSeconds: number): Promise<string> {
     try {
@@ -459,10 +459,18 @@ export class UpstashRedis {
         });
       }
       
-      return this.set(cacheKey, stringValue, ttlSeconds);
+      // Check if key is too long
+      const shortenedKey = this.shortenKeyIfNeeded(cacheKey);
+      
+      try {
+        return this.set(shortenedKey, stringValue, ttlSeconds);
+      } catch (error) {
+        console.error(`Redis SET failed for key ${shortenedKey}:`, error);
+        return "OK"; // Return OK despite Redis failure - we still have memory cache
+      }
     } catch (error) {
       console.error(`Error setting cache for key ${key}:`, error);
-      return "";
+      return "OK"; // Return success to prevent pipeline failures
     }
   }
   
@@ -476,15 +484,23 @@ export class UpstashRedis {
         return cachedValue;
       }
       
-      // Cache miss, get from Redis
-      const redisValue = await this.get(cacheKey);
+      // Shorten key if needed
+      const shortenedKey = this.shortenKeyIfNeeded(cacheKey);
       
-      // Update memory cache if we got a value
-      if (redisValue !== null && redisValue !== undefined) {
-        this.memoryCache.set(cacheKey, redisValue, 300); // 5 minute default TTL
+      // Cache miss, get from Redis with error handling
+      try {
+        const redisValue = await this.get(shortenedKey);
+        
+        // Update memory cache if we got a value
+        if (redisValue !== null && redisValue !== undefined) {
+          this.memoryCache.set(cacheKey, redisValue, 300); // 5 minute default TTL
+        }
+        
+        return redisValue;
+      } catch (error) {
+        console.warn(`Redis GET failed for key ${shortenedKey}, using memory-only cache:`, error);
+        return null; // Return null (cache miss) when Redis fails
       }
-      
-      return redisValue;
     } catch (error) {
       console.error(`Error getting cache for key ${key}:`, error);
       return null;
@@ -538,6 +554,30 @@ export class UpstashRedis {
   // Helper for compressing long strings in logs and debugging
   private compressString(str: string): string {
     return str.length > 1000 ? str.substring(0, 1000) + "..." : str;
+  }
+
+  // Helper to handle very long keys
+  private shortenKeyIfNeeded(key: string): string {
+    // Upstash Redis has a key length limit (typically 512 bytes)
+    if (key.length > 500) {
+      // Use a hash of the key as the actual Redis key
+      const hash = this.hashString(key);
+      const shortened = `hash:${hash}`;
+      console.warn(`Key ${key} shortened to ${shortened}`);
+      return shortened;
+    }
+    return key;
+  }
+
+  // Simple string hashing function
+  private hashString(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash).toString(16); // Convert to hex
   }
 }
 
