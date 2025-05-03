@@ -34,11 +34,11 @@ async function logWorkerIssue(
   }
 }
 
-// IMPROVED: Helper function to ensure message deletion with retries
+// IMPROVED: Helper function to ensure message deletion with better numeric ID handling
 async function ensureMessageDeleted(
   supabase: any,
   queueName: string,
-  messageId: string,
+  messageId: string | number,
   maxRetries: number = 3
 ): Promise<boolean> {
   console.log(`Attempting to delete message ${messageId} from queue ${queueName} with up to ${maxRetries} retries`);
@@ -74,41 +74,40 @@ async function ensureMessageDeleted(
       } else {
         console.warn(`Delete attempt ${attempts} failed for message ${messageId}: ${JSON.stringify(deleteResult)}`);
         
-        // Try alternate approach if previous attempt failed
-        if (attempts === 1) {
+        // If messageId is numeric, try direct SQL approach if first attempt failed
+        if (attempts === 1 && !isNaN(Number(messageId))) {
           try {
-            // Try direct pgmq.delete
+            // Try direct SQL delete on the pgmq table with a raw SQL query
+            const { data, error } = await supabase.rpc('raw_sql_query', {
+              sql_query: `DELETE FROM pgmq_${queueName} WHERE msg_id = ${messageId} RETURNING true`
+            });
+            
+            if (!error && data && data.length > 0) {
+              console.log(`Successfully deleted numeric message ${messageId} using raw SQL`);
+              deleted = true;
+              continue;
+            }
+          } catch (sqlError) {
+            console.error(`Raw SQL delete failed for message ${messageId}:`, sqlError);
+          }
+        }
+        
+        // Try another alternate approach with pgmq.delete directly
+        if (attempts === 2) {
+          try {
+            // Try direct pgmq.delete (this probably won't work for numeric IDs but worth a try)
             const { data, error } = await supabase.rpc('pgmq.delete', {
               queue_name: queueName,
               msg_id: messageId
             });
             
-            if (!error) {
+            if (!error && data) {
               console.log(`Successfully deleted message ${messageId} using direct pgmq.delete`);
               deleted = true;
               continue;
             }
           } catch (pgmqError) {
             console.error(`pgmq.delete failed for message ${messageId}:`, pgmqError);
-          }
-        }
-        
-        // Try another alternate approach
-        if (attempts === 2) {
-          try {
-            // Try pg_delete_message RPC
-            const { error } = await supabase.rpc('pg_delete_message', {
-              queue_name: queueName,
-              message_id: messageId
-            });
-            
-            if (!error) {
-              console.log(`Successfully deleted message ${messageId} using pg_delete_message RPC`);
-              deleted = true;
-              continue;
-            }
-          } catch (rpcError) {
-            console.error(`pg_delete_message RPC failed for message ${messageId}:`, rpcError);
           }
         }
         
@@ -119,18 +118,34 @@ async function ensureMessageDeleted(
         }
       }
       
-      // Verify deletion if still not confirmed
+      // Verify deletion on final attempt if still not confirmed
       if (!deleted && attempts === maxRetries - 1) {
         try {
-          // Check if the message is actually gone
-          const { data: verifyData, error: verifyError } = await supabase.rpc('confirm_message_deletion', {
-            queue_name: queueName,
-            message_id: messageId
-          });
-          
-          if (!verifyError && verifyData === true) {
-            console.log(`Message ${messageId} verified as deleted despite error responses`);
-            deleted = true;
+          // For numeric IDs, use direct SQL check
+          if (!isNaN(Number(messageId))) {
+            try {
+              const { data, error } = await supabase.rpc('raw_sql_query', {
+                sql_query: `SELECT NOT EXISTS(SELECT 1 FROM pgmq_${queueName} WHERE msg_id = ${messageId}) AS deleted`
+              });
+              
+              if (!error && data && data.length > 0 && data[0].deleted) {
+                console.log(`Numeric message ${messageId} verified as deleted via SQL check`);
+                deleted = true;
+              }
+            } catch (verifyError) {
+              console.error(`Error verifying numeric message deletion:`, verifyError);
+            }
+          } else {
+            // For UUID IDs, use the confirm_message_deletion function
+            const { data: verifyData, error: verifyError } = await supabase.rpc('confirm_message_deletion', {
+              queue_name: queueName,
+              message_id: messageId
+            });
+            
+            if (!verifyError && verifyData === true) {
+              console.log(`Message ${messageId} verified as deleted despite error responses`);
+              deleted = true;
+            }
           }
         } catch (verifyError) {
           console.error(`Error verifying message deletion:`, verifyError);
