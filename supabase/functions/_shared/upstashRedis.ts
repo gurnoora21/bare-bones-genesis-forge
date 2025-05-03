@@ -6,6 +6,11 @@
 
 import { MemoryCache } from "./memoryCache.ts";
 
+// Size limits for Redis storage
+const MAX_REDIS_KEY_LENGTH = 500;
+const MAX_REDIS_VALUE_SIZE = 5 * 1024 * 1024; // 5MB limit
+const CHUNKING_THRESHOLD = 1 * 1024 * 1024; // 1MB
+
 export class UpstashRedis {
   private url: string;
   private token: string;
@@ -33,7 +38,7 @@ export class UpstashRedis {
   
   /**
    * Make an authenticated request to the Upstash Redis REST API
-   * FIXED: Ensure ALL command elements are properly formatted for Upstash REST API
+   * with proper command formatting for the REST API
    */
   private async request(commands: string[][]): Promise<any> {
     try {
@@ -41,7 +46,7 @@ export class UpstashRedis {
         throw new Error("Invalid Redis commands: commands must be a non-empty array");
       }
       
-      // FIXED: Properly format commands for Upstash REST API compatibility
+      // IMPORTANT: Properly format commands for Upstash REST API compatibility
       const formattedCommands = commands.map(cmd => {
         if (!Array.isArray(cmd) || cmd.length === 0) {
           throw new Error("Invalid Redis command format: each command must be a non-empty array");
@@ -426,16 +431,16 @@ export class UpstashRedis {
     }
   }
   
-  // Result caching - optimized with memory cache and improved error handling
+  // Enhanced result caching with large value support
   
   async cacheSet(key: string, value: any, ttlSeconds: number): Promise<string> {
     try {
       const cacheKey = `cache:${key}`;
       
-      // Set in memory cache
+      // Set in memory cache first (always works)
       this.memoryCache.set(cacheKey, value, ttlSeconds);
       
-      // Set in Redis, but use a safer approach for large values
+      // Serialize the value
       let stringValue: string;
       try {
         stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
@@ -449,21 +454,37 @@ export class UpstashRedis {
         });
       }
       
-      // For very large values, store a truncated version to avoid Redis errors
-      if (stringValue.length > 5000000) { // 5MB limit
-        console.warn(`Cache value for ${key} exceeds 5MB, truncating`);
-        stringValue = JSON.stringify({
-          error: "Value exceeded 5MB limit",
+      // For very large values, store a truncated version or use chunking
+      if (stringValue.length > MAX_REDIS_VALUE_SIZE) {
+        console.warn(`Cache value for ${key} exceeds ${MAX_REDIS_VALUE_SIZE} bytes, truncating`);
+        
+        // Create a simplified summary to store instead
+        const summary = {
+          error: "Value exceeded size limit",
           originalType: typeof value,
-          timestamp: Date.now()
-        });
+          sizeBytes: stringValue.length,
+          timestamp: Date.now(),
+          memoryOnlyCached: true
+        };
+        
+        // Store the summary in Redis
+        const shortenedKey = this.shortenKeyIfNeeded(cacheKey);
+        await this.safeCommand("SET", shortenedKey, JSON.stringify(summary), "EX", String(ttlSeconds));
+        
+        return "OK"; // We still have the full value in memory cache
       }
       
-      // Check if key is too long
-      const shortenedKey = this.shortenKeyIfNeeded(cacheKey);
+      // For large but manageable values, use chunking
+      if (stringValue.length > CHUNKING_THRESHOLD) {
+        const shortenedKey = this.shortenKeyIfNeeded(cacheKey);
+        const success = await this.setLargeValue(shortenedKey, stringValue, ttlSeconds);
+        return success ? "OK" : "CHUNKING_ERROR";
+      }
       
+      // For normal sized values, use standard SET
+      const shortenedKey = this.shortenKeyIfNeeded(cacheKey);
       try {
-        return this.set(shortenedKey, stringValue, ttlSeconds);
+        return await this.safeCommand("SET", shortenedKey, stringValue, "EX", String(ttlSeconds));
       } catch (error) {
         console.error(`Redis SET failed for key ${shortenedKey}:`, error);
         return "OK"; // Return OK despite Redis failure - we still have memory cache
@@ -484,21 +505,54 @@ export class UpstashRedis {
         return cachedValue;
       }
       
-      // Shorten key if needed
+      // Cache miss, try retrieving from Redis
       const shortenedKey = this.shortenKeyIfNeeded(cacheKey);
       
-      // Cache miss, get from Redis with error handling
       try {
-        const redisValue = await this.get(shortenedKey);
+        // First try normal GET
+        const normalValue = await this.safeCommand("GET", shortenedKey);
         
-        // Update memory cache if we got a value
-        if (redisValue !== null && redisValue !== undefined) {
-          this.memoryCache.set(cacheKey, redisValue, 300); // 5 minute default TTL
+        if (normalValue !== null) {
+          // Check if this is just a size limit message
+          try {
+            const parsed = JSON.parse(normalValue);
+            if (parsed && parsed.error === "Value exceeded size limit") {
+              console.log(`Found size-limited placeholder for ${key}, returning cache miss`);
+              return null;
+            }
+          } catch (e) {
+            // Not JSON or not our size limit message, continue
+          }
+          
+          // Try to parse as JSON
+          try {
+            const parsedValue = JSON.parse(normalValue);
+            this.memoryCache.set(cacheKey, parsedValue, 300); // 5 min default TTL
+            return parsedValue;
+          } catch (e) {
+            // Not valid JSON, return as string
+            this.memoryCache.set(cacheKey, normalValue, 300);
+            return normalValue;
+          }
         }
         
-        return redisValue;
+        // If nothing found, try chunked retrieval
+        const chunkedValue = await this.getLargeValue(shortenedKey);
+        if (chunkedValue) {
+          try {
+            const parsedValue = JSON.parse(chunkedValue);
+            this.memoryCache.set(cacheKey, parsedValue, 300);
+            return parsedValue;
+          } catch (e) {
+            this.memoryCache.set(cacheKey, chunkedValue, 300);
+            return chunkedValue;
+          }
+        }
+        
+        // Nothing found in either normal or chunked storage
+        return null;
       } catch (error) {
-        console.warn(`Redis GET failed for key ${shortenedKey}, using memory-only cache:`, error);
+        console.warn(`Redis GET failed for key ${shortenedKey}:`, error);
         return null; // Return null (cache miss) when Redis fails
       }
     } catch (error) {
@@ -559,7 +613,7 @@ export class UpstashRedis {
   // Helper to handle very long keys
   private shortenKeyIfNeeded(key: string): string {
     // Upstash Redis has a key length limit (typically 512 bytes)
-    if (key.length > 500) {
+    if (key.length > MAX_REDIS_KEY_LENGTH) {
       // Use a hash of the key as the actual Redis key
       const hash = this.hashString(key);
       const shortened = `hash:${hash}`;
@@ -615,5 +669,109 @@ export class MemoryOnlyCache {
   
   async delete(key: string): Promise<number> {
     return this.cache.delete(key) ? 1 : 0;
+  }
+}
+
+// Helper method to store a large value by chunking if necessary
+private async setLargeValue(key: string, value: string, expireSeconds?: number): Promise<boolean> {
+  try {
+    // For small values, use a simple SET
+    if (value.length < CHUNKING_THRESHOLD) {
+      await this.safeCommand("SET", key, value, expireSeconds ? "EX" : "", expireSeconds ? String(expireSeconds) : "");
+      return true;
+    }
+    
+    // For large values, use chunking
+    console.log(`Chunking large value for key ${key} (size: ${value.length} bytes)`);
+    
+    // Split into chunks of ~512KB
+    const chunkSize = 512 * 1024;
+    const chunks = [];
+    for (let i = 0; i < value.length; i += chunkSize) {
+      chunks.push(value.substring(i, i + chunkSize));
+    }
+    
+    // Store metadata about chunks
+    const metaKey = `${key}:meta`;
+    const metadata = {
+      chunks: chunks.length,
+      totalSize: value.length,
+      timestamp: Date.now()
+    };
+    
+    // Create a pipeline to store all chunks
+    const pipeline = [];
+    
+    // Delete any existing keys first
+    pipeline.push(["DEL", key]);
+    pipeline.push(["DEL", metaKey]);
+    
+    // Store metadata
+    pipeline.push(["SET", metaKey, JSON.stringify(metadata)]);
+    if (expireSeconds) {
+      pipeline.push(["EXPIRE", metaKey, String(expireSeconds)]);
+    }
+    
+    // Store each chunk
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkKey = `${key}:chunk:${i}`;
+      pipeline.push(["SET", chunkKey, chunks[i]]);
+      if (expireSeconds) {
+        pipeline.push(["EXPIRE", chunkKey, String(expireSeconds)]);
+      }
+    }
+    
+    // Execute pipeline
+    await this.pipelineExec(pipeline);
+    return true;
+  } catch (error) {
+    console.error(`Failed to store large value for key ${key}:`, error);
+    return false;
+  }
+}
+
+// Helper method to retrieve a value that was stored with chunking
+private async getLargeValue(key: string): Promise<string | null> {
+  try {
+    // First try to get the value directly (might not be chunked)
+    const directValue = await this.safeCommand("GET", key);
+    if (directValue) {
+      return directValue;
+    }
+    
+    // Check for chunked metadata
+    const metaKey = `${key}:meta`;
+    const metaValue = await this.safeCommand("GET", metaKey);
+    
+    if (!metaValue) {
+      return null; // No metadata, key doesn't exist
+    }
+    
+    // Parse metadata
+    const metadata = JSON.parse(metaValue);
+    if (!metadata || !metadata.chunks) {
+      return null; // Invalid metadata
+    }
+    
+    // Fetch all chunks in parallel
+    const chunkPromises = [];
+    for (let i = 0; i < metadata.chunks; i++) {
+      const chunkKey = `${key}:chunk:${i}`;
+      chunkPromises.push(this.safeCommand("GET", chunkKey));
+    }
+    
+    const chunks = await Promise.all(chunkPromises);
+    
+    // Validate that we got all chunks
+    if (chunks.some(chunk => chunk === null)) {
+      console.error(`Missing chunks for key ${key}`);
+      return null;
+    }
+    
+    // Combine all chunks
+    return chunks.join("");
+  } catch (error) {
+    console.error(`Failed to retrieve large value for key ${key}:`, error);
+    return null;
   }
 }
