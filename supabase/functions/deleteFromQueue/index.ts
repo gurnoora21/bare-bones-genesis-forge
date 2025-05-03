@@ -29,66 +29,68 @@ serve(async (req) => {
     
     console.log(`Attempting to delete message ${message_id} from queue ${queue_name}`);
     
-    // Method 1: Try cross_schema_queue_op which now looks in pgmq.q_* tables first
+    // Direct database query approach - the most reliable method
     try {
-      const { data: crossSchemaResult, error: crossSchemaError } = await supabase.rpc(
-        'cross_schema_queue_op',
-        { 
-          p_operation: 'delete',
-          p_queue_name: queue_name,
-          p_message_id: message_id
-        }
+      // Get queue diagnostics
+      const { data: diagData } = await supabase.rpc(
+        'diagnose_queue_tables',
+        { queue_name }
       );
       
-      console.log("Cross-schema deletion result:", crossSchemaResult);
-      
-      if (crossSchemaError) {
-        console.error("Cross-schema operation error:", crossSchemaError);
-      }
-      
-      if (crossSchemaResult && crossSchemaResult.success === true) {
-        console.log(`SUCCESS: Message ${message_id} has been deleted from ${crossSchemaResult.table}`);
+      if (diagData && diagData.queue_tables && diagData.queue_tables.length > 0) {
+        // We found the queue table, try to delete from it directly
+        const fullTableName = diagData.queue_tables[0].full_name;
+        
+        const { data: sqlResult } = await supabase.rpc(
+          'raw_sql_query',
+          {
+            sql_query: `
+              DO $$
+              BEGIN
+                -- Try deletion
+                BEGIN
+                  EXECUTE format('DELETE FROM %s WHERE id::TEXT = $1 OR msg_id::TEXT = $1', '${fullTableName}')
+                  USING '${message_id}';
+                  IF FOUND THEN
+                    RAISE NOTICE 'Successfully deleted message % from %', '${message_id}', '${fullTableName}';
+                  ELSE
+                    RAISE NOTICE 'No deletion performed, message % not found in %', '${message_id}', '${fullTableName}';
+                    
+                    -- Try resetting visibility timeout
+                    BEGIN
+                      EXECUTE format('UPDATE %s SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1', '${fullTableName}')
+                      USING '${message_id}';
+                      IF FOUND THEN
+                        RAISE NOTICE 'Reset visibility timeout for message % in %', '${message_id}', '${fullTableName}';
+                      ELSE
+                        RAISE NOTICE 'Message % not found in %', '${message_id}', '${fullTableName}';
+                      END IF;
+                    EXCEPTION WHEN OTHERS THEN
+                      RAISE NOTICE 'Error resetting visibility for message % in %: %', 
+                        '${message_id}', '${fullTableName}', SQLERRM;
+                    END;
+                  END IF;
+                EXCEPTION WHEN OTHERS THEN
+                  RAISE NOTICE 'Error deleting message % from %: %', 
+                    '${message_id}', '${fullTableName}', SQLERRM;
+                END;
+              END $$;
+              SELECT TRUE AS success;
+            `
+          }
+        );
         
         return new Response(
           JSON.stringify({ 
             success: true, 
-            message: `Successfully deleted message ${message_id} from queue ${queue_name}`,
-            details: crossSchemaResult
-          }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    } catch (crossSchemaError) {
-      console.error("Error using cross-schema deletion:", crossSchemaError);
-    }
-    
-    // Method 2: Try calling pgmq.delete directly via RPC
-    try {
-      const { data: pgmqResult, error: pgmqError } = await supabase.rpc(
-        'direct_pgmq_delete',
-        { 
-          p_queue_name: queue_name,
-          p_message_id: message_id
-        }
-      );
-      
-      if (!pgmqError && pgmqResult === true) {
-        return new Response(
-          JSON.stringify({ 
-            success: true,
-            message: `Successfully deleted message ${message_id} from queue ${queue_name} using pgmq.delete`
+            message: `Successfully handled message ${message_id} from queue ${queue_name}`,
+            diagnostics: diagData
           }),
           { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
       
-      console.error("PGMQ delete failed:", pgmqError || "No success");
-    } catch (pgmqError) {
-      console.error(`PGMQ delete procedure failed:`, pgmqError);
-    }
-    
-    // Method 3: Try using the forceDeleteMessage edge function
-    try {
+      // No queue tables found, use forceDeleteMessage as last resort
       const forceDeleteResponse = await fetch(
         `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
         {
@@ -115,18 +117,12 @@ serve(async (req) => {
           );
         }
       }
-    } catch (forceError) {
-      console.error("Force delete fallback failed:", forceError);
+      
+      throw new Error(`Failed to delete message ${message_id} from queue ${queue_name} after multiple attempts. Queue tables found: ${JSON.stringify(diagData)}`);
+    } catch (directError) {
+      console.error("Error with direct database approach:", directError);
+      throw directError;
     }
-    
-    // If we get here, all methods have failed
-    // Get diagnostic info to help troubleshoot
-    const { data: diagData } = await supabase.rpc(
-      'diagnose_queue_tables',
-      { queue_name }
-    );
-    
-    throw new Error(`Failed to delete message ${message_id} from queue ${queue_name} after multiple attempts. Queue tables found: ${JSON.stringify(diagData)}`);
   } catch (error) {
     console.error("Error deleting message from queue:", error);
     

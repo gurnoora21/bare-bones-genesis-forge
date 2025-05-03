@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -55,7 +56,7 @@ async function ensureMessageDeleted(
     try {
       // First try our enhanced deletion edge function
       const deleteResponse = await fetch(
-        `https://wshetxovyxtfqohhbvpg.supabase.co/functions/v1/deleteFromQueue`,
+        `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
         {
           method: "POST",
           headers: {
@@ -64,7 +65,8 @@ async function ensureMessageDeleted(
           },
           body: JSON.stringify({ 
             queue_name: queueName, 
-            message_id: messageId 
+            message_id: messageId,
+            bypass_checks: true // Use aggressive deletion mode
           })
         }
       );
@@ -74,28 +76,28 @@ async function ensureMessageDeleted(
       if (deleteResponse.ok && (deleteResult.success || deleteResult.reset)) {
         console.log(`Successfully handled message ${messageId} from ${queueName} (attempt ${attempts})`);
         deleted = true;
+        break;
       } else {
         console.warn(`Delete attempt ${attempts} failed for message ${messageId}: ${JSON.stringify(deleteResult)}`);
         
-        // Try the enhanced RPC function directly
+        // Try RPC function directly
         if (attempts === 2) {
           try {
-            const { data: rpcData, error: rpcError } = await supabase.rpc(
-              'enhanced_delete_message',
+            const { data: rpcData } = await supabase.rpc(
+              'direct_pgmq_delete',
               { 
                 p_queue_name: queueName,
-                p_message_id: messageId.toString(),
-                p_is_numeric: isNumeric
+                p_message_id: messageId.toString()
               }
             );
             
-            if (!rpcError && rpcData === true) {
-              console.log(`Successfully deleted message using enhanced RPC function`);
+            if (rpcData === true) {
+              console.log(`Successfully deleted message using direct RPC function`);
               deleted = true;
               break;
             }
           } catch (rpcError) {
-            console.error(`Error with enhanced delete RPC:`, rpcError);
+            console.error(`Error with direct delete RPC:`, rpcError);
           }
         }
         
@@ -121,45 +123,21 @@ async function ensureMessageDeleted(
   // Final verification
   if (!deleted && attempts === maxRetries) {
     try {
-      const { data: verifyData } = await supabase.rpc(
-        'raw_sql_query',
-        {
-          sql_query: `
-            SELECT NOT EXISTS(
-              SELECT 1 FROM pgmq_${queueName}
-              WHERE (msg_id::TEXT = $1 OR id::TEXT = $1)
-            ) AS deleted
-          `,
-          params: [messageId.toString()]
-        }
+      // Get diagnostic info about queue tables
+      const { data: diagData } = await supabase.rpc(
+        'diagnose_queue_tables',
+        { queue_name: queueName }
       );
       
-      if (verifyData && verifyData.length > 0 && verifyData[0].deleted === true) {
-        console.log(`Final verification confirms message ${messageId} is not in the queue`);
-        deleted = true;
-      } else {
-        // Last resort - try to reset visibility timeout
-        try {
-          const { data: resetData } = await supabase.rpc(
-            'emergency_reset_message',
-            { 
-              p_queue_name: queueName,
-              p_message_id: messageId.toString(),
-              p_is_numeric: isNumeric
-            }
-          );
-          
-          if (resetData === true) {
-            console.log(`Could not delete message ${messageId}, but successfully reset visibility timeout`);
-            // Consider this a success since we've released the message back to the queue
-            deleted = true;
-          }
-        } catch (resetError) {
-          console.error(`Emergency reset failed:`, resetError);
-        }
-      }
-    } catch (verifyError) {
-      console.error(`Error during final verification:`, verifyError);
+      await logWorkerIssue(
+        supabase,
+        "artistDiscovery", 
+        "queue_delete_failure", 
+        `Failed to delete message ${messageId} after processing`, 
+        { messageId, diagnostics: diagData }
+      );
+    } catch (diagError) {
+      console.error(`Error getting queue diagnostics:`, diagError);
     }
   }
   
@@ -207,7 +185,7 @@ serve(async (req) => {
     // Parse the JSONB result from pg_dequeue
     let messages = [];
     try {
-      console.log("Raw queue data received:", typeof queueData, queueData ? JSON.stringify(queueData) : "null");
+      console.log("Raw queue data received:", typeof queueData, queueData ? JSON.stringify(queueData).substring(0, 300) + "..." : "null");
       
       // Handle either string or object formats
       if (typeof queueData === 'string') {
@@ -245,10 +223,9 @@ serve(async (req) => {
     // Process messages in background to avoid CPU timeout
     EdgeRuntime.waitUntil((async () => {
       try {
-        // Initialize the Spotify client
-        // IMPORTANT FIX: Use try/catch for Spotify client initialization
-        // to prevent it from failing due to Redis connection issues
-        let spotifyClient;
+        let spotifyClient = null;
+        
+        // Try to initialize Spotify client, but don't fail if it doesn't work
         try {
           spotifyClient = new SpotifyClient();
         } catch (spotifyError) {
@@ -260,7 +237,6 @@ serve(async (req) => {
             `Failed to initialize Spotify client: ${spotifyError.message}`, 
             { error: spotifyError }
           );
-          return; // Exit early if we can't initialize Spotify client
         }
         
         let successCount = 0;
@@ -286,49 +262,26 @@ serve(async (req) => {
             console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
             
             try {
-              let processed = false;
+              // Use direct database approach for processing
+              await processArtistWithoutCache(supabase, spotifyClient, msg);
+              console.log(`Successfully processed artist with fallback method`);
               
-              // IMPROVED ERROR HANDLING: Try direct processing first, then fall back to cache-less method
-              try {
-                // Try processing with caching first
-                await processArtist(supabase, spotifyClient, msg);
-                processed = true;
-                console.log(`Successfully processed artist with normal method`);
-              } catch (processingError) {
-                // If the error is related to Redis formatting, try the fallback method
-                if (processingError.message && (
-                  processingError.message.includes("Redis") || 
-                  processingError.message.includes("unsupported arg type")
-                )) {
-                  console.log("Falling back to processing without Redis cache due to:", processingError.message);
-                  await processArtistWithoutCache(supabase, spotifyClient, msg);
-                  processed = true;
-                  console.log(`Successfully processed artist with fallback method`);
-                } else {
-                  // If it's not Redis-related, rethrow
-                  throw processingError;
-                }
-              }
+              // Ensure message is deleted using enhanced deletion
+              const deleteSuccess = await ensureMessageDeleted(supabase, "artist_discovery", messageId);
               
-              // Only delete the message if processing was successful
-              if (processed) {
-                // IMPROVED: Use the ensureMessageDeleted helper for reliable deletion
-                const deleteSuccess = await ensureMessageDeleted(supabase, "artist_discovery", messageId);
-                
-                if (deleteSuccess) {
-                  console.log(`Successfully processed and deleted message ${messageId}`);
-                  successCount++;
-                } else {
-                  console.error(`Failed to delete message ${messageId} after multiple attempts`);
-                  await logWorkerIssue(
-                    supabase,
-                    "artistDiscovery", 
-                    "queue_delete_failure", 
-                    `Failed to delete message ${messageId} after processing`, 
-                    { messageId }
-                  );
-                  errorCount++;
-                }
+              if (deleteSuccess) {
+                console.log(`Successfully processed and deleted message ${messageId}`);
+                successCount++;
+              } else {
+                console.error(`Failed to delete message ${messageId} after multiple attempts`);
+                await logWorkerIssue(
+                  supabase,
+                  "artistDiscovery", 
+                  "queue_delete_failure", 
+                  `Failed to delete message ${messageId} after processing`, 
+                  { messageId }
+                );
+                errorCount++;
               }
             } catch (processError) {
               console.error(`Error processing artist message:`, processError);
@@ -385,13 +338,13 @@ serve(async (req) => {
   }
 });
 
-// The original processArtist function
-async function processArtist(
+// Updated fallback implementation to use direct API methods without Redis caching
+async function processArtistWithoutCache(
   supabase: any, 
   spotifyClient: any, 
   msg: ArtistDiscoveryMsg
 ) {
-  console.log("Processing artist:", msg);
+  console.log("Processing artist without Redis cache:", msg);
   const { artistId, artistName } = msg;
   
   if (!artistId && !artistName) {
@@ -402,12 +355,41 @@ async function processArtist(
   let artistData;
   
   if (artistId) {
-    // Get artist by Spotify ID
-    artistData = await spotifyClient.getArtistById(artistId);
+    // Direct API call without caching
+    const response = await fetch(
+      `https://api.spotify.com/v1/artists/${artistId}`,
+      {
+        headers: {
+          "Authorization": `Bearer ${await getSpotifyToken()}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+    
+    if (!response.ok) {
+      throw new Error(`Spotify API error: ${response.status} ${await response.text()}`);
+    }
+    
+    artistData = await response.json();
   } else if (artistName) {
-    // Search for artist by name
-    console.log(`Searching for artist by name: ${artistName}`);
-    const searchResponse = await spotifyClient.getArtistByName(artistName);
+    console.log(`Searching for artist by name (no cache): ${artistName}`);
+    
+    // Search for artist by name - direct API call
+    const response = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`,
+      {
+        headers: {
+          "Authorization": `Bearer ${await getSpotifyToken()}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+    
+    if (!response.ok) {
+      throw new Error(`Spotify API error: ${response.status} ${await response.text()}`);
+    }
+    
+    const searchResponse = await response.json();
     
     if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items.length) {
       throw new Error(`Artist not found: ${artistName}`);
@@ -464,81 +446,28 @@ async function processArtist(
   return artist;
 }
 
-// Updated fallback implementation to use direct API methods without Redis caching
-async function processArtistWithoutCache(
-  supabase: any, 
-  spotifyClient: any, 
-  msg: ArtistDiscoveryMsg
-) {
-  console.log("Processing artist without Redis cache:", msg);
-  const { artistId, artistName } = msg;
+// Helper function to get a Spotify token
+async function getSpotifyToken(): Promise<string> {
+  const clientId = Deno.env.get("SPOTIFY_CLIENT_ID") || "";
+  const clientSecret = Deno.env.get("SPOTIFY_CLIENT_SECRET") || "";
   
-  if (!artistId && !artistName) {
-    throw new Error("Either artistId or artistName must be provided");
-  }
-
-  // Get the Spotify artist ID and details
-  let artistData;
-  
-  if (artistId) {
-    // Get artist by Spotify ID - direct call without cache
-    artistData = await spotifyClient.getArtistByIdDirect(artistId);
-  } else if (artistName) {
-    // Search for artist by name - direct call without cache
-    console.log(`Searching for artist by name (no cache): ${artistName}`);
-    const searchResponse = await spotifyClient.searchArtistDirect(artistName);
-    
-    if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items.length) {
-      throw new Error(`Artist not found: ${artistName}`);
-    }
-    
-    // Use the first artist result
-    artistData = searchResponse.artists.items[0];
-    console.log(`Found artist: ${artistData.name} (${artistData.id})`);
+  if (!clientId || !clientSecret) {
+    throw new Error("Spotify client ID and client secret must be provided as environment variables");
   }
   
-  if (!artistData) {
-    throw new Error("Failed to fetch artist data");
-  }
-
-  // Store in database with explicit conflict handling
-  const { data: artist, error } = await supabase
-    .from('artists')
-    .upsert({
-      spotify_id: artistData.id,
-      name: artistData.name,
-      followers: artistData.followers?.total || 0,
-      popularity: artistData.popularity,
-      image_url: artistData.images?.[0]?.url,
-      metadata: artistData
-    }, {
-      onConflict: 'spotify_id',
-      ignoreDuplicates: false
-    })
-    .select('id')
-    .single();
-
-  if (error) {
-    console.error("Error storing artist:", error);
-    throw new Error(`Error storing artist: ${error.message}`);
-  }
-
-  console.log(`Stored artist in database with ID: ${artist.id}`);
-
-  // Enqueue album discovery
-  const { data: enqueueData, error: queueError } = await supabase.rpc('pg_enqueue', {
-    queue_name: 'album_discovery',
-    message_body: JSON.stringify({ 
-      artistId: artist.id, 
-      offset: 0 
-    })
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": `Basic ${btoa(`${clientId}:${clientSecret}`)}`
+    },
+    body: "grant_type=client_credentials"
   });
-
-  if (queueError) {
-    console.error("Error enqueueing album discovery:", queueError);
-    throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
+  
+  if (!response.ok) {
+    throw new Error(`Failed to get Spotify access token: ${response.statusText}`);
   }
-
-  console.log(`Processed artist ${artistData.name}, enqueued album discovery for artist ID ${artist.id}`);
-  return artist;
+  
+  const data = await response.json();
+  return data.access_token;
 }

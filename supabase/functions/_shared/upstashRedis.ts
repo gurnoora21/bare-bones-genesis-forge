@@ -1,4 +1,3 @@
-
 /**
  * Upstash Redis HTTP client for Deno/Edge Functions
  * Implements key Redis operations needed for rate limiting and caching
@@ -34,7 +33,7 @@ export class UpstashRedis {
   
   /**
    * Make an authenticated request to the Upstash Redis REST API
-   * FIXED: Ensure ALL command elements are properly formatted as strings for Upstash REST API
+   * FIXED: Ensure ALL command elements are properly formatted for Upstash REST API
    */
   private async request(commands: string[][]): Promise<any> {
     try {
@@ -42,30 +41,31 @@ export class UpstashRedis {
         throw new Error("Invalid Redis commands: commands must be a non-empty array");
       }
       
-      // Ensure each command is correctly formatted as an array of strings
-      // This is critical for Upstash REST API compatibility
+      // Format commands for Upstash REST API compatibility
       const formattedCommands = commands.map(cmd => {
         if (!Array.isArray(cmd) || cmd.length === 0) {
           throw new Error("Invalid Redis command format: each command must be a non-empty array");
         }
         
+        // Ensure all command elements are strings
         return cmd.map(item => {
           if (item === null || item === undefined) {
             return "";
-          } else if (typeof item === 'number') {
-            return String(item);
-          } else if (typeof item === 'boolean') {
-            return item ? "1" : "0";
           } else if (typeof item === 'object') {
-            return JSON.stringify(item);
+            try {
+              return JSON.stringify(item);
+            } catch (e) {
+              console.error("Failed to stringify object:", e);
+              return "";
+            }
           } else {
-            return String(item); // Ensure everything is a string
+            return String(item);
           }
         });
       });
       
-      // Log the formatted commands for debugging
-      console.debug("Sending Redis commands:", JSON.stringify(formattedCommands));
+      // Log commands for debugging
+      console.debug("Sending Redis commands:", JSON.stringify(formattedCommands).substring(0, 500) + "...");
       
       const response = await fetch(this.url, {
         method: "POST",
@@ -107,34 +107,31 @@ export class UpstashRedis {
   }
   
   /**
-   * Execute a pipeline of commands in a single request
+   * Execute a safe version of a command with fallbacks for error conditions
    */
-  async pipelineExec(commands: string[][]): Promise<any[]> {
+  private async safeCommand(command: string, ...args: any[]): Promise<any> {
     try {
-      return await this.request(commands);
+      return await this.request([[command, ...args.map(String)]]);
     } catch (error) {
-      console.error("Redis pipeline execution failed:", error);
-      throw error;
+      console.warn(`Redis ${command} command failed:`, error);
+      return null;
     }
   }
   
-  // Basic Redis operations - all optimized to use memory cache when appropriate
+  /**
+   * Basic Redis operations - all using new safe command approach
+   */
   
   async get(key: string): Promise<any> {
-    // Validate key to ensure it's a string
-    if (typeof key !== 'string') {
-      throw new Error(`Redis key must be a string, got ${typeof key}`);
-    }
-    
-    // Try memory cache first
-    const cachedValue = this.memoryCache.get(key);
-    if (cachedValue !== null && cachedValue !== undefined) {
-      return cachedValue;
-    }
-    
     try {
-      // Cache miss, get from Redis with proper string formatting
-      const result = await this.request([["GET", String(key)]]);
+      // Try memory cache first
+      const cachedValue = this.memoryCache.get(key);
+      if (cachedValue !== null && cachedValue !== undefined) {
+        return cachedValue;
+      }
+      
+      // Cache miss, get from Redis
+      const result = await this.safeCommand("GET", key);
       
       if (result) {
         try {
@@ -163,21 +160,24 @@ export class UpstashRedis {
       // Update memory cache
       this.memoryCache.set(key, value, expireSeconds);
       
-      // Format the command based on expiration
-      // FIXED: Ensure proper string formatting for ALL values
-      const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
-      
-      let command: string[][];
-      if (expireSeconds !== undefined) {
-        command = [["SET", String(key), stringValue, "EX", String(expireSeconds)]];
-      } else {
-        command = [["SET", String(key), stringValue]];
+      // Format the value properly
+      let stringValue: string;
+      try {
+        stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+      } catch (e) {
+        console.error(`Error stringifying value for key ${key}:`, e);
+        stringValue = String(value);
       }
       
-      return await this.request(command);
+      // Use simplified command to avoid type issues
+      if (expireSeconds !== undefined) {
+        return await this.safeCommand("SET", key, stringValue, "EX", String(expireSeconds));
+      } else {
+        return await this.safeCommand("SET", key, stringValue);
+      }
     } catch (error) {
       console.error(`Error setting key ${key} in Redis:`, error);
-      throw error;
+      return "ERROR";
     }
   }
   
@@ -280,7 +280,7 @@ export class UpstashRedis {
       const [bucketData] = await this.pipelineExec(pipeline);
       
       let tokens = bucketData[0] ? parseInt(bucketData[0]) : tokensPerInterval;
-      let lastRefill = bucketData[1] ? parseInt(bucketData[1]) : now;
+      let lastRefill = bucketData[1] ? parseInt(bucketData[1] : now;
       
       // Refill tokens based on time elapsed
       const elapsed = now - lastRefill;
@@ -452,14 +452,52 @@ export class UpstashRedis {
   async forceFlushStats(): Promise<void> {
     return this.flushStats();
   }
+
+  // Add a new method to check if Redis is available
+  async ping(): Promise<boolean> {
+    try {
+      const result = await this.safeCommand("PING");
+      return result === "PONG";
+    } catch (error) {
+      console.error("Redis PING failed:", error);
+      return false;
+    }
+  }
 }
 
-// Export a singleton instance
+// Export a singleton instance with error handling
 let redisInstance: UpstashRedis | null = null;
 
-export function getRedis(): UpstashRedis {
+export function getRedis(): UpstashRedis | null {
   if (!redisInstance) {
-    redisInstance = new UpstashRedis();
+    try {
+      redisInstance = new UpstashRedis();
+    } catch (error) {
+      console.error("Failed to initialize Redis client:", error);
+      return null;
+    }
   }
   return redisInstance;
+}
+
+// Export a memory-only fallback for when Redis is unavailable
+export class MemoryOnlyCache {
+  private cache: Map<string, any>;
+  
+  constructor() {
+    this.cache = new Map();
+  }
+  
+  async get(key: string): Promise<any> {
+    return this.cache.get(key) || null;
+  }
+  
+  async set(key: string, value: any): Promise<string> {
+    this.cache.set(key, value);
+    return "OK";
+  }
+  
+  async delete(key: string): Promise<number> {
+    return this.cache.delete(key) ? 1 : 0;
+  }
 }

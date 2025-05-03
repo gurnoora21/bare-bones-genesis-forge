@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 
@@ -46,16 +47,26 @@ serve(async (req) => {
     // Check each queue for stuck messages
     for (const queueName of QUEUE_NAMES) {
       try {
-        // Get the correct queue table name
-        const { data: tableInfo } = await supabase.rpc(
-          'get_queue_table_name_safe',
-          { p_queue_name: queueName }
+        // Get diagnostic info for this queue
+        const { data: queueDiag } = await supabase.rpc(
+          'diagnose_queue_tables',
+          { queue_name: queueName }
         );
         
-        const queueTableName = tableInfo || `pgmq.q_${queueName}`;
-        console.log(`Checking for stuck messages in ${queueTableName}`);
+        if (!queueDiag || !queueDiag.queue_tables || queueDiag.queue_tables.length === 0) {
+          results[queueName] = { 
+            stuck: 0, 
+            message: "No queue tables found for this queue name",
+            diagnostics: queueDiag
+          };
+          continue;
+        }
         
-        // Run direct SQL query to find stuck messages in the correct schema
+        // Get the table name to use
+        const fullTableName = queueDiag.queue_tables[0].full_name;
+        console.log(`Checking for stuck messages in ${fullTableName}`);
+        
+        // Run direct SQL query to find stuck messages
         const { data: stuckMessages } = await supabase.rpc(
           'raw_sql_query',
           {
@@ -63,11 +74,11 @@ serve(async (req) => {
               SELECT 
                 id::TEXT, 
                 msg_id::TEXT, 
-                message::JSONB AS message, 
+                message::TEXT AS message_text,
                 vt AS locked_since, 
                 read_ct AS read_count,
                 EXTRACT(EPOCH FROM (NOW() - vt))/60 AS minutes_locked
-              FROM ${queueTableName}
+              FROM ${fullTableName}
               WHERE 
                 vt IS NOT NULL 
                 AND vt < NOW() - INTERVAL '${threshold_minutes} minutes'
@@ -85,7 +96,7 @@ serve(async (req) => {
         
         results[queueName] = {
           stuck: stuckMessages.length,
-          table_name: queueTableName,
+          table_name: fullTableName,
           messages: stuckMessages.map((m: any) => ({
             id: m.id || m.msg_id,
             minutes_locked: m.minutes_locked,
@@ -99,64 +110,30 @@ serve(async (req) => {
             const messageId = message.id || message.msg_id;
             
             try {
-              // Use cross_schema_queue_op which now checks both schema patterns
-              const { data: crossSchemaResult, error: crossSchemaError } = await supabase.rpc(
-                'cross_schema_queue_op',
-                { 
-                  p_operation: 'delete',
-                  p_queue_name: queueName,
-                  p_message_id: messageId
+              // Use forceDeleteMessage which handles both schemas
+              const forceResponse = await fetch(
+                `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+                  },
+                  body: JSON.stringify({
+                    queue_name: queueName,
+                    message_id: messageId,
+                    bypass_checks: true // Enable aggressive deletion for problematic messages
+                  })
                 }
               );
               
-              if (!crossSchemaError && crossSchemaResult && crossSchemaResult.success === true) {
-                console.log(`Successfully deleted stuck message ${messageId} from ${queueName} using cross-schema op`);
+              const forceResult = await forceResponse.json();
+              
+              if (forceResponse.ok && (forceResult.success || forceResult.reset)) {
+                console.log(`Successfully force-handled message ${messageId} in ${queueName}`);
                 fixedCount++;
-                continue;
-              }
-              
-              // If direct delete failed but message is very old or has high read count, try force delete
-              if (message.minutes_locked > 30 || message.read_count > 5) {
-                const forceResponse = await fetch(
-                  `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
-                  {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                      "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-                    },
-                    body: JSON.stringify({
-                      queue_name: queueName,
-                      message_id: messageId,
-                      bypass_checks: true // Enable aggressive deletion for problematic messages
-                    })
-                  }
-                );
-                
-                const forceResult = await forceResponse.json();
-                
-                if (forceResponse.ok && (forceResult.success || forceResult.reset)) {
-                  console.log(`Successfully force-handled message ${messageId} in ${queueName}`);
-                  fixedCount++;
-                  continue;
-                }
-              }
-              
-              // Otherwise try the standard reset function
-              const { data: resetResult, error: resetError } = await supabase.rpc(
-                'cross_schema_queue_op',
-                { 
-                  p_operation: 'reset',
-                  p_queue_name: queueName,
-                  p_message_id: messageId
-                }
-              );
-              
-              if (!resetError && resetResult && resetResult.success === true) {
-                console.log(`Reset stuck message ${messageId} in ${queueName}`);
-                fixedCount++;
-              } else if (resetError) {
-                console.error(`Error resetting stuck message in ${queueName}:`, resetError);
+              } else {
+                console.error(`Failed to handle message ${messageId}:`, forceResult);
               }
             } catch (fixError) {
               console.error(`Error fixing stuck message ${messageId} in ${queueName}:`, fixError);
