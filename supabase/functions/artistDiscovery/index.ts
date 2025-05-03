@@ -55,7 +55,7 @@ async function ensureMessageDeleted(
     try {
       // First try our enhanced deletion edge function
       const deleteResponse = await fetch(
-        `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
+        `https://wshetxovyxtfqohhbvpg.supabase.co/functions/v1/deleteFromQueue`,
         {
           method: "POST",
           headers: {
@@ -121,7 +121,7 @@ async function ensureMessageDeleted(
   // Final verification
   if (!deleted && attempts === maxRetries) {
     try {
-      const { data: verifyData, error: verifyError } = await supabase.rpc(
+      const { data: verifyData } = await supabase.rpc(
         'raw_sql_query',
         {
           sql_query: `
@@ -134,13 +134,13 @@ async function ensureMessageDeleted(
         }
       );
       
-      if (!verifyError && verifyData && verifyData.length > 0 && verifyData[0].deleted === true) {
+      if (verifyData && verifyData.length > 0 && verifyData[0].deleted === true) {
         console.log(`Final verification confirms message ${messageId} is not in the queue`);
         deleted = true;
       } else {
         // Last resort - try to reset visibility timeout
         try {
-          const { data: resetData, error: resetError } = await supabase.rpc(
+          const { data: resetData } = await supabase.rpc(
             'emergency_reset_message',
             { 
               p_queue_name: queueName,
@@ -149,7 +149,7 @@ async function ensureMessageDeleted(
             }
           );
           
-          if (!resetError && resetData === true) {
+          if (resetData === true) {
             console.log(`Could not delete message ${messageId}, but successfully reset visibility timeout`);
             // Consider this a success since we've released the message back to the queue
             deleted = true;

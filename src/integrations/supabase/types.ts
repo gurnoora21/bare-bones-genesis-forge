@@ -397,6 +397,22 @@ export type Database = {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
       }
+      emergency_reset_message: {
+        Args: {
+          p_queue_name: string
+          p_message_id: string
+          p_is_numeric?: boolean
+        }
+        Returns: boolean
+      }
+      enhanced_delete_message: {
+        Args: {
+          p_queue_name: string
+          p_message_id: string
+          p_is_numeric?: boolean
+        }
+        Returns: boolean
+      }
       get_producer_collaborations: {
         Args: { producer_id: string }
         Returns: {

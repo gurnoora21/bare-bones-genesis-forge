@@ -36,8 +36,8 @@ serve(async (req) => {
     // For numeric IDs, especially in artist_discovery queue
     if (isNumeric) {
       try {
-        // Direct SQL approach for numeric IDs
-        const { data: directData, error: directError } = await supabase.rpc(
+        // Use enhanced_delete_message RPC for numeric IDs
+        const { data: enhancedData, error: enhancedError } = await supabase.rpc(
           'enhanced_delete_message',
           { 
             p_queue_name: queue_name,
@@ -46,7 +46,7 @@ serve(async (req) => {
           }
         );
         
-        if (!directError && directData === true) {
+        if (!enhancedError && enhancedData === true) {
           return new Response(
             JSON.stringify({ 
               success: true,
@@ -55,8 +55,8 @@ serve(async (req) => {
             { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
-      } catch (directError) {
-        console.error(`Enhanced delete procedure failed:`, directError);
+      } catch (enhancedError) {
+        console.error(`Enhanced delete procedure failed:`, enhancedError);
         // Continue to fallback methods
       }
     }
@@ -77,47 +77,47 @@ serve(async (req) => {
           await new Promise(resolve => setTimeout(resolve, delayMs));
         }
         
-        // METHOD 1: Try using enhanced_delete_message RPC
+        // METHOD 1: Try pgmq.delete with the appropriate ID format
         try {
-          const { data: enhancedData, error: enhancedError } = await supabase.rpc(
-            'enhanced_delete_message',
-            { 
-              p_queue_name: queue_name,
-              p_message_id: message_id.toString(),
-              p_is_numeric: isNumeric
+          const { data: pgmqData, error: pgmqError } = await supabase.rpc(
+            'pgmq.delete',
+            {
+              queue_name,
+              msg_id: messageIdFormatted
             }
           );
           
-          if (!enhancedError && enhancedData === true) {
+          if (!pgmqError && pgmqData === true) {
             success = true;
             break;
           }
-        } catch (enhancedError) {
-          console.error(`Enhanced delete RPC error (attempt ${attempts}):`, enhancedError);
+        } catch (pgmqError) {
+          console.error(`pgmq.delete error (attempt ${attempts}):`, pgmqError);
         }
         
-        // METHOD 2: Try using pgmq.delete RPC
+        // METHOD 2: Try our enhanced delete function
         if (!success) {
           try {
-            const { data: pgmqData, error: pgmqError } = await supabase.rpc(
-              'pgmq.delete',
-              {
-                queue_name,
-                msg_id: messageIdFormatted
+            const { data: enhancedData, error: enhancedError } = await supabase.rpc(
+              'enhanced_delete_message',
+              { 
+                p_queue_name: queue_name,
+                p_message_id: message_id.toString(),
+                p_is_numeric: isNumeric
               }
             );
             
-            if (!pgmqError && pgmqData === true) {
+            if (!enhancedError && enhancedData === true) {
               success = true;
               break;
             }
-          } catch (pgmqError) {
-            console.error(`pgmq.delete error (attempt ${attempts}):`, pgmqError);
+          } catch (enhancedError) {
+            console.error(`Enhanced delete error (attempt ${attempts}):`, enhancedError);
           }
         }
         
-        // METHOD 3: Try with raw SQL direct approach
-        if (!success) {
+        // METHOD 3: Try with raw SQL direct approach as last resort
+        if (!success && attempts === maxAttempts - 1) {
           // Get actual queue table name
           let queueTable = '';
           try {
@@ -129,14 +129,12 @@ serve(async (req) => {
               }
             );
             
-            if (!tableError && tableData && tableData.length > 0 && tableData[0].table_name) {
+            if (!tableError && tableData && tableData.length > 0) {
               queueTable = tableData[0].table_name;
             } else {
-              // Fallback to default naming convention
               queueTable = `pgmq_${queue_name}`;
             }
           } catch (tableError) {
-            // Fallback to default naming convention on error
             queueTable = `pgmq_${queue_name}`;
           }
           
@@ -151,22 +149,14 @@ serve(async (req) => {
             );
             
             if (!rawError) {
-              // Verify deletion with a follow-up check
+              // Verify deletion
+              const verifyQuery = isNumeric
+                ? `SELECT NOT EXISTS(SELECT 1 FROM ${queueTable} WHERE msg_id = ${Number(message_id)} OR id = ${Number(message_id)}) AS deleted`
+                : `SELECT NOT EXISTS(SELECT 1 FROM ${queueTable} WHERE id = '${message_id}'::UUID) AS deleted`;
+              
               const { data: verifyData, error: verifyError } = await supabase.rpc(
                 'raw_sql_query',
-                {
-                  sql_query: `
-                    SELECT NOT EXISTS(
-                      SELECT 1 FROM ${queueTable}
-                      WHERE ${
-                        isNumeric 
-                          ? `msg_id = ${Number(message_id)} OR id = ${Number(message_id)}`
-                          : `id = '${message_id}'::UUID`
-                      }
-                    ) AS deleted
-                  `,
-                  params: []
-                }
+                { sql_query: verifyQuery, params: [] }
               );
               
               if (!verifyError && verifyData && verifyData.length > 0 && verifyData[0].deleted === true) {
@@ -178,33 +168,6 @@ serve(async (req) => {
             console.error(`Raw SQL deletion error (attempt ${attempts}):`, rawError);
           }
         }
-        
-        // METHOD 4: Final resort - use text comparison
-        if (!success && attempts === maxAttempts - 1) {
-          try {
-            // Get queue table name if not already done
-            let queueTable = `pgmq_${queue_name}`;
-            
-            const { data: textData, error: textError } = await supabase.rpc(
-              'raw_sql_query',
-              {
-                sql_query: `
-                  DELETE FROM ${queueTable} 
-                  WHERE msg_id::TEXT = '${message_id}' OR id::TEXT = '${message_id}';
-                  SELECT TRUE AS deleted;
-                `,
-                params: []
-              }
-            );
-            
-            if (!textError && textData && textData.length > 0 && textData[0].deleted === true) {
-              success = true;
-              break;
-            }
-          } catch (textError) {
-            console.error(`Text comparison deletion error:`, textError);
-          }
-        }
       } catch (attemptError) {
         console.error(`General error during deletion attempt ${attempts}:`, attemptError);
       }
@@ -214,48 +177,39 @@ serve(async (req) => {
     if (!success) {
       try {
         // Get queue table name
-        let queueTable = `pgmq_${queue_name}`;
-        
-        const { data: existsData, error: existsError } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              SELECT NOT EXISTS(
-                SELECT 1 FROM ${queueTable}
-                WHERE msg_id::TEXT = '${message_id}' OR id::TEXT = '${message_id}'
-              ) AS deleted
-            `,
-            params: []
+        let queueTable = '';
+        try {
+          const { data: tableData, error: tableError } = await supabase.rpc(
+            'raw_sql_query',
+            { 
+              sql_query: `SELECT pgmq.get_queue_table_name($1) as table_name`,
+              params: [queue_name]
+            }
+          );
+          
+          if (!tableError && tableData && tableData.length > 0) {
+            queueTable = tableData[0].table_name;
+          } else {
+            queueTable = `pgmq_${queue_name}`;
           }
+        } catch (tableError) {
+          queueTable = `pgmq_${queue_name}`;
+        }
+        
+        const verifyQuery = `
+          SELECT NOT EXISTS(
+            SELECT 1 FROM ${queueTable}
+            WHERE msg_id::TEXT = '${message_id}' OR id::TEXT = '${message_id}'
+          ) AS deleted
+        `;
+        
+        const { data: verifyData, error: verifyError } = await supabase.rpc(
+          'raw_sql_query',
+          { sql_query: verifyQuery, params: [] }
         );
         
-        if (!existsError && existsData && existsData.length > 0 && existsData[0].deleted === true) {
+        if (!verifyError && verifyData && verifyData.length > 0 && verifyData[0].deleted === true) {
           success = true;
-        } else {
-          // Last resort - try to reset visibility timeout
-          try {
-            const { data: resetData, error: resetError } = await supabase.rpc(
-              'emergency_reset_message',
-              { 
-                p_queue_name: queue_name,
-                p_message_id: message_id.toString(),
-                p_is_numeric: isNumeric
-              }
-            );
-            
-            if (!resetError && resetData === true) {
-              return new Response(
-                JSON.stringify({ 
-                  success: false,
-                  reset: true,
-                  message: `Could not delete message ${message_id}, but successfully reset visibility timeout`
-                }),
-                { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-              );
-            }
-          } catch (resetError) {
-            console.error(`Emergency reset failed:`, resetError);
-          }
         }
       } catch (verifyError) {
         console.error(`Final verification error:`, verifyError);
@@ -271,6 +225,31 @@ serve(async (req) => {
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     } else {
+      // If all deletion methods fail, try to reset visibility timeout
+      try {
+        const { data: resetData, error: resetError } = await supabase.rpc(
+          'emergency_reset_message',
+          { 
+            p_queue_name: queue_name,
+            p_message_id: message_id.toString(),
+            p_is_numeric: isNumeric
+          }
+        );
+        
+        if (!resetError && resetData === true) {
+          return new Response(
+            JSON.stringify({ 
+              success: false,
+              reset: true,
+              message: `Could not delete message ${message_id}, but successfully reset visibility timeout`
+            }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+      } catch (resetError) {
+        console.error(`Emergency reset failed:`, resetError);
+      }
+      
       throw new Error(`Failed to delete message ${message_id} from queue ${queue_name} after ${maxAttempts} attempts`);
     }
     
