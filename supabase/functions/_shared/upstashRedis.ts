@@ -633,6 +633,110 @@ export class UpstashRedis {
     }
     return Math.abs(hash).toString(16); // Convert to hex
   }
+
+  // Helper method to store a large value by chunking if necessary
+  private async setLargeValue(key: string, value: string, expireSeconds?: number): Promise<boolean> {
+    try {
+      // For small values, use a simple SET
+      if (value.length < CHUNKING_THRESHOLD) {
+        await this.safeCommand("SET", key, value, expireSeconds ? "EX" : "", expireSeconds ? String(expireSeconds) : "");
+        return true;
+      }
+      
+      // For large values, use chunking
+      console.log(`Chunking large value for key ${key} (size: ${value.length} bytes)`);
+      
+      // Split into chunks of ~512KB
+      const chunkSize = 512 * 1024;
+      const chunks = [];
+      for (let i = 0; i < value.length; i += chunkSize) {
+        chunks.push(value.substring(i, i + chunkSize));
+      }
+      
+      // Store metadata about chunks
+      const metaKey = `${key}:meta`;
+      const metadata = {
+        chunks: chunks.length,
+        totalSize: value.length,
+        timestamp: Date.now()
+      };
+      
+      // Create a pipeline to store all chunks
+      const pipeline = [];
+      
+      // Delete any existing keys first
+      pipeline.push(["DEL", key]);
+      pipeline.push(["DEL", metaKey]);
+      
+      // Store metadata
+      pipeline.push(["SET", metaKey, JSON.stringify(metadata)]);
+      if (expireSeconds) {
+        pipeline.push(["EXPIRE", metaKey, String(expireSeconds)]);
+      }
+      
+      // Store each chunk
+      for (let i = 0; i < chunks.length; i++) {
+        const chunkKey = `${key}:chunk:${i}`;
+        pipeline.push(["SET", chunkKey, chunks[i]]);
+        if (expireSeconds) {
+          pipeline.push(["EXPIRE", chunkKey, String(expireSeconds)]);
+        }
+      }
+      
+      // Execute pipeline
+      await this.pipelineExec(pipeline);
+      return true;
+    } catch (error) {
+      console.error(`Failed to store large value for key ${key}:`, error);
+      return false;
+    }
+  }
+
+  // Helper method to retrieve a value that was stored with chunking
+  private async getLargeValue(key: string): Promise<string | null> {
+    try {
+      // First try to get the value directly (might not be chunked)
+      const directValue = await this.safeCommand("GET", key);
+      if (directValue) {
+        return directValue;
+      }
+      
+      // Check for chunked metadata
+      const metaKey = `${key}:meta`;
+      const metaValue = await this.safeCommand("GET", metaKey);
+      
+      if (!metaValue) {
+        return null; // No metadata, key doesn't exist
+      }
+      
+      // Parse metadata
+      const metadata = JSON.parse(metaValue);
+      if (!metadata || !metadata.chunks) {
+        return null; // Invalid metadata
+      }
+      
+      // Fetch all chunks in parallel
+      const chunkPromises = [];
+      for (let i = 0; i < metadata.chunks; i++) {
+        const chunkKey = `${key}:chunk:${i}`;
+        chunkPromises.push(this.safeCommand("GET", chunkKey));
+      }
+      
+      const chunks = await Promise.all(chunkPromises);
+      
+      // Validate that we got all chunks
+      if (chunks.some(chunk => chunk === null)) {
+        console.error(`Missing chunks for key ${key}`);
+        return null;
+      }
+      
+      // Combine all chunks
+      return chunks.join("");
+    } catch (error) {
+      console.error(`Failed to retrieve large value for key ${key}:`, error);
+      return null;
+    }
+  }
 }
 
 // Export a singleton instance with error handling
@@ -669,109 +773,5 @@ export class MemoryOnlyCache {
   
   async delete(key: string): Promise<number> {
     return this.cache.delete(key) ? 1 : 0;
-  }
-}
-
-// Helper method to store a large value by chunking if necessary
-private async setLargeValue(key: string, value: string, expireSeconds?: number): Promise<boolean> {
-  try {
-    // For small values, use a simple SET
-    if (value.length < CHUNKING_THRESHOLD) {
-      await this.safeCommand("SET", key, value, expireSeconds ? "EX" : "", expireSeconds ? String(expireSeconds) : "");
-      return true;
-    }
-    
-    // For large values, use chunking
-    console.log(`Chunking large value for key ${key} (size: ${value.length} bytes)`);
-    
-    // Split into chunks of ~512KB
-    const chunkSize = 512 * 1024;
-    const chunks = [];
-    for (let i = 0; i < value.length; i += chunkSize) {
-      chunks.push(value.substring(i, i + chunkSize));
-    }
-    
-    // Store metadata about chunks
-    const metaKey = `${key}:meta`;
-    const metadata = {
-      chunks: chunks.length,
-      totalSize: value.length,
-      timestamp: Date.now()
-    };
-    
-    // Create a pipeline to store all chunks
-    const pipeline = [];
-    
-    // Delete any existing keys first
-    pipeline.push(["DEL", key]);
-    pipeline.push(["DEL", metaKey]);
-    
-    // Store metadata
-    pipeline.push(["SET", metaKey, JSON.stringify(metadata)]);
-    if (expireSeconds) {
-      pipeline.push(["EXPIRE", metaKey, String(expireSeconds)]);
-    }
-    
-    // Store each chunk
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkKey = `${key}:chunk:${i}`;
-      pipeline.push(["SET", chunkKey, chunks[i]]);
-      if (expireSeconds) {
-        pipeline.push(["EXPIRE", chunkKey, String(expireSeconds)]);
-      }
-    }
-    
-    // Execute pipeline
-    await this.pipelineExec(pipeline);
-    return true;
-  } catch (error) {
-    console.error(`Failed to store large value for key ${key}:`, error);
-    return false;
-  }
-}
-
-// Helper method to retrieve a value that was stored with chunking
-private async getLargeValue(key: string): Promise<string | null> {
-  try {
-    // First try to get the value directly (might not be chunked)
-    const directValue = await this.safeCommand("GET", key);
-    if (directValue) {
-      return directValue;
-    }
-    
-    // Check for chunked metadata
-    const metaKey = `${key}:meta`;
-    const metaValue = await this.safeCommand("GET", metaKey);
-    
-    if (!metaValue) {
-      return null; // No metadata, key doesn't exist
-    }
-    
-    // Parse metadata
-    const metadata = JSON.parse(metaValue);
-    if (!metadata || !metadata.chunks) {
-      return null; // Invalid metadata
-    }
-    
-    // Fetch all chunks in parallel
-    const chunkPromises = [];
-    for (let i = 0; i < metadata.chunks; i++) {
-      const chunkKey = `${key}:chunk:${i}`;
-      chunkPromises.push(this.safeCommand("GET", chunkKey));
-    }
-    
-    const chunks = await Promise.all(chunkPromises);
-    
-    // Validate that we got all chunks
-    if (chunks.some(chunk => chunk === null)) {
-      console.error(`Missing chunks for key ${key}`);
-      return null;
-    }
-    
-    // Combine all chunks
-    return chunks.join("");
-  } catch (error) {
-    console.error(`Failed to retrieve large value for key ${key}:`, error);
-    return null;
   }
 }
