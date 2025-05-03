@@ -29,40 +29,130 @@ serve(async (req) => {
     
     console.log(`Deleting message ${message_id} from queue ${queue_name}`);
     
-    // FIXED: Use a direct SQL query with proper queue table name and parameters
-    // This is more reliable than the pgmq.delete function which had issues
-    const tableName = `pgmq_${queue_name}`;
-    const { data, error } = await supabase.rpc('pg_delete_message', {
-      queue_name,
-      message_id
-    });
+    // Properly format the queue name to match what pgmq actually uses
+    // The format is typically "pgmq_{queue_name}" but we need to handle this correctly
+    let success = false;
+    let error = null;
     
-    if (error) {
-      console.error(`Error deleting message ${message_id}:`, error);
+    // Try more reliable direct SQL approach first
+    try {
+      // Instead of relying on a specific table naming convention,
+      // use pgmq.get_queue_table_name() to get the correct table name
+      const { data: tableName, error: tableNameError } = await supabase.rpc(
+        'pgmq.get_queue_table_name', 
+        { queue_name }
+      );
       
-      // Fallback method: Try direct SQL delete as a backup
-      const { error: fallbackError } = await supabase.from(tableName)
-        .delete()
-        .eq('id', message_id);
-      
-      if (fallbackError) {
-        console.error(`Fallback also failed for message ${message_id}:`, fallbackError);
-        throw fallbackError;
-      } else {
-        console.log(`Message ${message_id} deleted using fallback method`);
-        return new Response(
-          JSON.stringify({ success: true, method: 'fallback' }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      if (tableNameError) {
+        console.error(`Error getting queue table name for ${queue_name}:`, tableNameError);
+        // Will try fallback methods
+      } else if (tableName) {
+        // If we got a valid table name, use direct SQL to delete the message
+        const { error: deleteError } = await supabase.rpc(
+          'pgmq.delete',
+          { 
+            queue_name,
+            msg_id: message_id 
+          }
         );
+        
+        if (!deleteError) {
+          success = true;
+          console.log(`Successfully deleted message ${message_id} using pgmq.delete directly`);
+        } else {
+          console.error(`Direct pgmq.delete failed for ${message_id}:`, deleteError);
+          // Will try fallback methods
+        }
+      }
+    } catch (directError) {
+      console.error(`Direct delete approach failed for ${message_id}:`, directError);
+      // Will continue to fallback methods
+    }
+    
+    // If the direct approach failed, try using the pg_delete_message function
+    if (!success) {
+      try {
+        console.log(`Trying pg_delete_message for message ${message_id}`);
+        const { data, error: rpcError } = await supabase.rpc('pg_delete_message', {
+          queue_name,
+          message_id
+        });
+        
+        if (!rpcError && data === true) {
+          success = true;
+          console.log(`Successfully deleted message ${message_id} using pg_delete_message`);
+        } else {
+          error = rpcError;
+          console.error(`pg_delete_message failed for ${message_id}:`, rpcError || "Function returned false");
+        }
+      } catch (rpcError) {
+        console.error(`Error calling pg_delete_message for ${message_id}:`, rpcError);
+        error = rpcError;
       }
     }
     
-    console.log(`Successfully deleted message ${message_id} from queue ${queue_name}`);
+    // Last resort: try a direct SQL delete using any potential table naming convention
+    if (!success) {
+      try {
+        const possibleTableNames = [
+          `pgmq_${queue_name}`, // Standard format
+          `pgmq.${queue_name}`, // Schema qualified
+          `public.pgmq_${queue_name}`, // Public schema qualified
+          queue_name, // Just the queue name
+          `public.${queue_name}` // Public schema with queue name
+        ];
+        
+        for (const tableName of possibleTableNames) {
+          console.log(`Trying direct delete from table ${tableName} for message ${message_id}`);
+          
+          try {
+            // Safe SQL using parameterized queries
+            const { error: deleteError } = await supabase.from(tableName)
+              .delete()
+              .eq('id', message_id);
+            
+            if (!deleteError) {
+              success = true;
+              console.log(`Successfully deleted message ${message_id} from ${tableName}`);
+              break; // Exit the loop if successful
+            }
+          } catch (tableError) {
+            console.log(`Table ${tableName} delete attempt failed:`, tableError.message);
+            // Continue to next table name
+          }
+        }
+      } catch (fallbackError) {
+        console.error(`All fallback delete attempts failed for message ${message_id}:`, fallbackError);
+        error = error || fallbackError;
+      }
+    }
     
-    return new Response(
-      JSON.stringify({ success: true }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    // Verify if the message is actually gone
+    if (!success) {
+      try {
+        console.log(`Checking if message ${message_id} was deleted despite errors`);
+        const { data: verifyResult, error: verifyError } = await supabase.rpc('confirm_message_deletion', {
+          queue_name,
+          message_id
+        });
+        
+        if (!verifyError && verifyResult === true) {
+          success = true;
+          console.log(`Message ${message_id} verified as deleted despite earlier errors`);
+        }
+      } catch (verifyError) {
+        console.error(`Error verifying message deletion:`, verifyError);
+      }
+    }
+    
+    if (success) {
+      return new Response(
+        JSON.stringify({ success: true }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    } else {
+      throw new Error(error?.message || `Failed to delete message ${message_id} from queue ${queue_name}`);
+    }
     
   } catch (error) {
     console.error("Error deleting message from queue:", error);

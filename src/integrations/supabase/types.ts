@@ -393,6 +393,10 @@ export type Database = {
           next_run: string
         }[]
       }
+      confirm_message_deletion: {
+        Args: { queue_name: string; message_id: string }
+        Returns: boolean
+      }
       get_producer_collaborations: {
         Args: { producer_id: string }
         Returns: {
@@ -406,9 +410,7 @@ export type Database = {
         Returns: Json
       }
       pg_delete_message: {
-        Args:
-          | { message_id: string; queue_name: string }
-          | { queue_name: string; message_id: string }
+        Args: { queue_name: string; message_id: string }
         Returns: boolean
       }
       pg_dequeue: {
@@ -448,7 +450,7 @@ export type Database = {
       }
       start_artist_discovery: {
         Args: { artist_name: string }
-        Returns: string
+        Returns: number
       }
       start_bulk_artist_discovery: {
         Args: { genre?: string; min_popularity?: number; limit_count?: number }

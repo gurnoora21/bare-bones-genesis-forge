@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -75,19 +74,41 @@ async function ensureMessageDeleted(
       } else {
         console.warn(`Delete attempt ${attempts} failed for message ${messageId}: ${JSON.stringify(deleteResult)}`);
         
-        // Fallback: try using RPC
-        if (attempts === maxRetries - 1) {
-          console.log(`Trying RPC fallback for message ${messageId}`);
-          const { error } = await supabase.rpc('pg_delete_message', {
-            queue_name: queueName,
-            message_id: messageId
-          });
-          
-          if (!error) {
-            console.log(`Successfully deleted message ${messageId} using RPC fallback`);
-            deleted = true;
-          } else {
-            console.error(`RPC fallback failed for message ${messageId}: ${error.message}`);
+        // Try alternate approach if previous attempt failed
+        if (attempts === 1) {
+          try {
+            // Try direct pgmq.delete
+            const { data, error } = await supabase.rpc('pgmq.delete', {
+              queue_name: queueName,
+              msg_id: messageId
+            });
+            
+            if (!error) {
+              console.log(`Successfully deleted message ${messageId} using direct pgmq.delete`);
+              deleted = true;
+              continue;
+            }
+          } catch (pgmqError) {
+            console.error(`pgmq.delete failed for message ${messageId}:`, pgmqError);
+          }
+        }
+        
+        // Try another alternate approach
+        if (attempts === 2) {
+          try {
+            // Try pg_delete_message RPC
+            const { error } = await supabase.rpc('pg_delete_message', {
+              queue_name: queueName,
+              message_id: messageId
+            });
+            
+            if (!error) {
+              console.log(`Successfully deleted message ${messageId} using pg_delete_message RPC`);
+              deleted = true;
+              continue;
+            }
+          } catch (rpcError) {
+            console.error(`pg_delete_message RPC failed for message ${messageId}:`, rpcError);
           }
         }
         
@@ -100,15 +121,19 @@ async function ensureMessageDeleted(
       
       // Verify deletion if still not confirmed
       if (!deleted && attempts === maxRetries - 1) {
-        // Check if the message is actually gone
-        const { data: verifyData, error: verifyError } = await supabase.rpc('confirm_message_deletion', {
-          queue_name: queueName,
-          message_id: messageId
-        });
-        
-        if (!verifyError && verifyData === true) {
-          console.log(`Message ${messageId} verified as deleted despite error responses`);
-          deleted = true;
+        try {
+          // Check if the message is actually gone
+          const { data: verifyData, error: verifyError } = await supabase.rpc('confirm_message_deletion', {
+            queue_name: queueName,
+            message_id: messageId
+          });
+          
+          if (!verifyError && verifyData === true) {
+            console.log(`Message ${messageId} verified as deleted despite error responses`);
+            deleted = true;
+          }
+        } catch (verifyError) {
+          console.error(`Error verifying message deletion:`, verifyError);
         }
       }
     } catch (e) {
