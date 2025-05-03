@@ -29,99 +29,62 @@ serve(async (req) => {
     
     console.log(`Attempting to delete message ${message_id} from queue ${queue_name}`);
     
-    // Direct database query approach - the most reliable method
-    try {
-      // Get queue diagnostics
-      const { data: diagData } = await supabase.rpc(
-        'diagnose_queue_tables',
-        { queue_name }
+    // Try standard deletion first
+    const { data: deleteResult, error: deleteError } = await supabase.rpc(
+      'pg_delete_message',
+      { 
+        queue_name, 
+        message_id: message_id.toString()  // Ensure it's a string to handle various formats
+      }
+    );
+    
+    if (deleteError) {
+      console.error("Error using pg_delete_message:", deleteError);
+      
+      // If standard deletion fails, try resetting the visibility timeout as a fallback
+      const { data: resetResult, error: resetError } = await supabase.rpc(
+        'reset_stuck_message',
+        { 
+          queue_name, 
+          message_id: message_id.toString()
+        }
       );
       
-      if (diagData && diagData.queue_tables && diagData.queue_tables.length > 0) {
-        // We found the queue table, try to delete from it directly
-        const fullTableName = diagData.queue_tables[0].full_name;
-        
-        const { data: sqlResult } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              DO $$
-              BEGIN
-                -- Try deletion
-                BEGIN
-                  EXECUTE format('DELETE FROM %s WHERE id::TEXT = $1 OR msg_id::TEXT = $1', '${fullTableName}')
-                  USING '${message_id}';
-                  IF FOUND THEN
-                    RAISE NOTICE 'Successfully deleted message % from %', '${message_id}', '${fullTableName}';
-                  ELSE
-                    RAISE NOTICE 'No deletion performed, message % not found in %', '${message_id}', '${fullTableName}';
-                    
-                    -- Try resetting visibility timeout
-                    BEGIN
-                      EXECUTE format('UPDATE %s SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1', '${fullTableName}')
-                      USING '${message_id}';
-                      IF FOUND THEN
-                        RAISE NOTICE 'Reset visibility timeout for message % in %', '${message_id}', '${fullTableName}';
-                      ELSE
-                        RAISE NOTICE 'Message % not found in %', '${message_id}', '${fullTableName}';
-                      END IF;
-                    EXCEPTION WHEN OTHERS THEN
-                      RAISE NOTICE 'Error resetting visibility for message % in %: %', 
-                        '${message_id}', '${fullTableName}', SQLERRM;
-                    END;
-                  END IF;
-                EXCEPTION WHEN OTHERS THEN
-                  RAISE NOTICE 'Error deleting message % from %: %', 
-                    '${message_id}', '${fullTableName}', SQLERRM;
-                END;
-              END $$;
-              SELECT TRUE AS success;
-            `
-          }
-        );
-        
+      if (resetError) {
+        console.error("Error resetting visibility timeout:", resetError);
+        throw new Error(`Failed to delete or reset message ${message_id}: ${deleteError.message}, reset error: ${resetError.message}`);
+      }
+      
+      if (resetResult) {
         return new Response(
           JSON.stringify({ 
-            success: true, 
-            message: `Successfully handled message ${message_id} from queue ${queue_name}`,
-            diagnostics: diagData
+            success: false, 
+            reset: true,
+            message: `Reset visibility timeout for message ${message_id} in queue ${queue_name}` 
           }),
           { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
+      } else {
+        throw new Error(`Failed to delete or reset message ${message_id} in queue ${queue_name}`);
       }
-      
-      // No queue tables found, use forceDeleteMessage as last resort
-      const forceDeleteResponse = await fetch(
-        `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-          },
-          body: JSON.stringify({
-            queue_name: queue_name,
-            message_id: message_id,
-            bypass_checks: true // Enable aggressive deletion
-          })
-        }
+    }
+    
+    if (deleteResult) {
+      return new Response(
+        JSON.stringify({ 
+          success: true, 
+          message: `Successfully deleted message ${message_id} from queue ${queue_name}` 
+        }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
-      
-      if (forceDeleteResponse.ok) {
-        const forceResult = await forceDeleteResponse.json();
-        
-        if (forceResult.success || forceResult.reset) {
-          return new Response(
-            JSON.stringify(forceResult),
-            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      }
-      
-      throw new Error(`Failed to delete message ${message_id} from queue ${queue_name} after multiple attempts. Queue tables found: ${JSON.stringify(diagData)}`);
-    } catch (directError) {
-      console.error("Error with direct database approach:", directError);
-      throw directError;
+    } else {
+      return new Response(
+        JSON.stringify({ 
+          success: false, 
+          message: `Message ${message_id} not found in queue ${queue_name} or could not be deleted` 
+        }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
     }
   } catch (error) {
     console.error("Error deleting message from queue:", error);

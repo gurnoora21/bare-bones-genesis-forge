@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -35,11 +34,11 @@ async function logWorkerIssue(
   }
 }
 
-// IMPROVED: Helper function to ensure message deletion with better numeric ID handling
-async function ensureMessageDeleted(
+// Helper function to delete messages with retries
+async function deleteMessageWithRetries(
   supabase: any,
   queueName: string,
-  messageId: string | number,
+  messageId: string,
   maxRetries: number = 3
 ): Promise<boolean> {
   console.log(`Attempting to delete message ${messageId} from queue ${queueName} with up to ${maxRetries} retries`);
@@ -47,67 +46,64 @@ async function ensureMessageDeleted(
   let deleted = false;
   let attempts = 0;
   
-  // Determine if ID is numeric
-  const isNumeric = !isNaN(Number(messageId)) && messageId.toString().trim() !== '';
-  
   while (!deleted && attempts < maxRetries) {
     attempts++;
     
     try {
-      // First try our enhanced deletion edge function
-      const deleteResponse = await fetch(
-        `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-          },
-          body: JSON.stringify({ 
-            queue_name: queueName, 
-            message_id: messageId,
-            bypass_checks: true // Use aggressive deletion mode
-          })
+      // Try using the database function first
+      const { data, error } = await supabase.rpc(
+        'pg_delete_message',
+        { 
+          queue_name: queueName, 
+          message_id: messageId.toString()
         }
       );
       
-      const deleteResult = await deleteResponse.json();
-      
-      if (deleteResponse.ok && (deleteResult.success || deleteResult.reset)) {
-        console.log(`Successfully handled message ${messageId} from ${queueName} (attempt ${attempts})`);
+      if (error) {
+        console.error(`Delete attempt ${attempts} failed with RPC error:`, error);
+      } else if (data === true) {
+        console.log(`Successfully deleted message ${messageId} from ${queueName} (attempt ${attempts})`);
         deleted = true;
         break;
       } else {
-        console.warn(`Delete attempt ${attempts} failed for message ${messageId}: ${JSON.stringify(deleteResult)}`);
+        console.warn(`Delete attempt ${attempts} returned false for message ${messageId}`);
+      }
+
+      // If the first method failed and this isn't the last attempt, try the Edge Function approach
+      if (!deleted && attempts < maxRetries) {
+        const deleteResponse = await fetch(
+          `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+            },
+            body: JSON.stringify({ queue_name: queueName, message_id: messageId })
+          }
+        );
         
-        // Try RPC function directly
-        if (attempts === 2) {
-          try {
-            const { data: rpcData } = await supabase.rpc(
-              'direct_pgmq_delete',
-              { 
-                p_queue_name: queueName,
-                p_message_id: messageId.toString()
-              }
-            );
-            
-            if (rpcData === true) {
-              console.log(`Successfully deleted message using direct RPC function`);
-              deleted = true;
-              break;
-            }
-          } catch (rpcError) {
-            console.error(`Error with direct delete RPC:`, rpcError);
+        if (deleteResponse.ok) {
+          const result = await deleteResponse.json();
+          if (result.success) {
+            console.log(`Successfully deleted message ${messageId} via Edge Function (attempt ${attempts})`);
+            deleted = true;
+            break;
+          } else if (result.reset) {
+            console.log(`Reset visibility timeout for message ${messageId} (attempt ${attempts})`);
+            // We'll consider this a success in terms of handling the message
+            deleted = true;
+            break;
           }
         }
-        
-        // Wait before retrying (exponential backoff with jitter)
-        if (!deleted && attempts < maxRetries) {
-          const baseDelay = Math.pow(2, attempts) * 100;
-          const jitter = Math.floor(Math.random() * 100);
-          const delayMs = baseDelay + jitter;
-          await new Promise(resolve => setTimeout(resolve, delayMs));
-        }
+      }
+      
+      // Wait before retrying (exponential backoff with jitter)
+      if (!deleted && attempts < maxRetries) {
+        const baseDelay = Math.pow(2, attempts) * 100;
+        const jitter = Math.floor(Math.random() * 100);
+        const delayMs = baseDelay + jitter;
+        await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     } catch (e) {
       console.error(`Error during deletion attempt ${attempts} for message ${messageId}:`, e);
@@ -120,25 +116,8 @@ async function ensureMessageDeleted(
     }
   }
   
-  // Final verification
-  if (!deleted && attempts === maxRetries) {
-    try {
-      // Get diagnostic info about queue tables
-      const { data: diagData } = await supabase.rpc(
-        'diagnose_queue_tables',
-        { queue_name: queueName }
-      );
-      
-      await logWorkerIssue(
-        supabase,
-        "artistDiscovery", 
-        "queue_delete_failure", 
-        `Failed to delete message ${messageId} after processing`, 
-        { messageId, diagnostics: diagData }
-      );
-    } catch (diagError) {
-      console.error(`Error getting queue diagnostics:`, diagError);
-    }
+  if (!deleted) {
+    console.error(`Failed to delete message ${messageId} after ${maxRetries} attempts`);
   }
   
   return deleted;
@@ -262,12 +241,15 @@ serve(async (req) => {
             console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
             
             try {
-              // Use direct database approach for processing
               await processArtistWithoutCache(supabase, spotifyClient, msg);
               console.log(`Successfully processed artist with fallback method`);
               
-              // Ensure message is deleted using enhanced deletion
-              const deleteSuccess = await ensureMessageDeleted(supabase, "artist_discovery", messageId);
+              // Delete message using our improved function
+              const deleteSuccess = await deleteMessageWithRetries(
+                supabase, 
+                "artist_discovery", 
+                messageId.toString()
+              );
               
               if (deleteSuccess) {
                 console.log(`Successfully processed and deleted message ${messageId}`);

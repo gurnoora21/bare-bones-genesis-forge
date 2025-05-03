@@ -7,21 +7,12 @@ CREATE OR REPLACE FUNCTION public.ensure_message_deleted(
 ) RETURNS BOOLEAN AS $$
 DECLARE
   queue_table TEXT;
-  is_numeric BOOLEAN;
   attempt_count INT := 0;
   msg_deleted BOOLEAN := FALSE;
 BEGIN
-  -- Determine if the ID is numeric
-  BEGIN
-    PERFORM message_id::NUMERIC;
-    is_numeric := TRUE;
-  EXCEPTION WHEN OTHERS THEN
-    is_numeric := FALSE;
-  END;
-  
   -- Get the actual queue table name
   BEGIN
-    SELECT pgmq.get_queue_table_name(queue_name) INTO STRICT queue_table;
+    SELECT get_queue_table_name_safe(queue_name) INTO STRICT queue_table;
   EXCEPTION WHEN OTHERS THEN
     queue_table := 'pgmq_' || queue_name;
   END;
@@ -30,61 +21,28 @@ BEGIN
   WHILE attempt_count < max_attempts AND NOT msg_deleted LOOP
     attempt_count := attempt_count + 1;
     
-    -- Method 1: Try standard pgmq.delete
+    -- Try using standard pgmq.delete first
     BEGIN
-      SELECT pgmq.delete(queue_name, 
-        CASE WHEN is_numeric 
-          THEN message_id::NUMERIC 
-          ELSE message_id::UUID 
-        END
-      ) INTO msg_deleted;
-      
-      IF msg_deleted THEN
-        RETURN TRUE;
-      END IF;
+      BEGIN
+        -- Try UUID conversion
+        SELECT pgmq.delete(queue_name, message_id::UUID) INTO msg_deleted;
+        IF msg_deleted THEN RETURN TRUE; END IF;
+      EXCEPTION WHEN OTHERS THEN
+        -- Try numeric conversion
+        BEGIN
+          SELECT pgmq.delete(queue_name, message_id::BIGINT) INTO msg_deleted;
+          IF msg_deleted THEN RETURN TRUE; END IF;
+        EXCEPTION WHEN OTHERS THEN
+          -- Continue to direct deletion
+        END;
+      END;
     EXCEPTION WHEN OTHERS THEN
       -- Just continue to next method
     END;
     
-    -- Method 2: Try direct table deletion with the appropriate type
-    IF is_numeric THEN
-      BEGIN
-        EXECUTE format('DELETE FROM %I WHERE msg_id = $1::BIGINT RETURNING TRUE', queue_table)
-          USING message_id::BIGINT INTO msg_deleted;
-          
-        IF msg_deleted THEN
-          RETURN TRUE;
-        END IF;
-      EXCEPTION WHEN OTHERS THEN
-        -- Continue to next method
-      END;
-      
-      BEGIN
-        EXECUTE format('DELETE FROM %I WHERE id = $1::BIGINT RETURNING TRUE', queue_table)
-          USING message_id::BIGINT INTO msg_deleted;
-          
-        IF msg_deleted THEN
-          RETURN TRUE;
-        END IF;
-      EXCEPTION WHEN OTHERS THEN
-        -- Continue to next method
-      END;
-    ELSE -- UUID or string ID
-      BEGIN
-        EXECUTE format('DELETE FROM %I WHERE id = $1::UUID RETURNING TRUE', queue_table)
-          USING message_id INTO msg_deleted;
-          
-        IF msg_deleted THEN
-          RETURN TRUE;
-        END IF;
-      EXCEPTION WHEN OTHERS THEN
-        -- Continue to next method
-      END;
-    END IF;
-    
-    -- Method 3: Most flexible but slowest - text comparison
+    -- Direct deletion with text comparison
     BEGIN
-      EXECUTE format('DELETE FROM %I WHERE id::TEXT = $1 OR msg_id::TEXT = $1 RETURNING TRUE', queue_table)
+      EXECUTE format('DELETE FROM %I WHERE msg_id::TEXT = $1 OR id::TEXT = $1 RETURNING TRUE', queue_table)
         USING message_id INTO msg_deleted;
         
       IF msg_deleted THEN
@@ -129,7 +87,7 @@ DECLARE
 BEGIN
   -- Get the actual queue table name
   BEGIN
-    SELECT pgmq.get_queue_table_name(queue_name) INTO STRICT queue_table;
+    SELECT get_queue_table_name_safe(queue_name) INTO STRICT queue_table;
   EXCEPTION WHEN OTHERS THEN
     queue_table := 'pgmq_' || queue_name;
   END;
@@ -163,7 +121,7 @@ DECLARE
 BEGIN
   -- Get the actual queue table name
   BEGIN
-    SELECT pgmq.get_queue_table_name(queue_name) INTO STRICT queue_table;
+    SELECT get_queue_table_name_safe(queue_name) INTO STRICT queue_table;
   EXCEPTION WHEN OTHERS THEN
     queue_table := 'pgmq_' || queue_name;
   END;

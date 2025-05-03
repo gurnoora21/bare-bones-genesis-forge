@@ -43,32 +43,74 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- IMPROVED: Function to delete a message from a queue
--- Added explicit error handling and better logging
-DROP FUNCTION IF EXISTS pg_delete_message;
-
+-- Improved message deletion function with multiple approaches
 CREATE OR REPLACE FUNCTION pg_delete_message(
   queue_name TEXT,
-  message_id UUID
+  message_id TEXT -- Accept string to handle various ID formats
 ) RETURNS BOOLEAN AS $$
 DECLARE
-  success BOOLEAN;
   queue_table TEXT;
+  success BOOLEAN := FALSE;
+  numeric_id BIGINT;
+  uuid_id UUID;
 BEGIN
   -- Get the actual queue table name
-  SELECT pgmq.get_queue_table_name(queue_name) INTO queue_table;
+  BEGIN
+    SELECT pgmq.get_queue_table_name(queue_name) INTO STRICT queue_table;
+  EXCEPTION WHEN OTHERS THEN
+    queue_table := 'pgmq_' || queue_name;
+  END;
   
-  -- First try using pgmq.delete
-  SELECT pgmq.delete(queue_name, message_id) INTO success;
+  -- Try standard pgmq.delete first if message_id can be converted to UUID
+  BEGIN
+    uuid_id := message_id::UUID;
+    SELECT pgmq.delete(queue_name, uuid_id) INTO success;
+    IF success THEN
+      RETURN TRUE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    -- Not a UUID, continue to other methods
+  END;
   
-  -- If that fails, try a direct DELETE
-  IF NOT success THEN
-    EXECUTE format('DELETE FROM %I WHERE id = %L', queue_table, message_id);
+  -- Try with numeric ID if possible
+  BEGIN
+    numeric_id := message_id::BIGINT;
+    
+    -- Try deleting with numeric msg_id
+    EXECUTE format('DELETE FROM %I WHERE msg_id = $1', queue_table)
+    USING numeric_id;
     GET DIAGNOSTICS success = ROW_COUNT;
-    success := success > 0;
-  END IF;
+    
+    IF success > 0 THEN
+      RETURN TRUE;
+    END IF;
+    
+    -- Try deleting with numeric id
+    EXECUTE format('DELETE FROM %I WHERE id = $1', queue_table)
+    USING numeric_id;
+    GET DIAGNOSTICS success = ROW_COUNT;
+    
+    IF success > 0 THEN
+      RETURN TRUE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    -- Not a numeric ID or other failure, continue to text comparison
+  END;
   
-  RETURN success;
+  -- Final attempt with text comparison - most flexible but potentially slower
+  BEGIN
+    EXECUTE format('DELETE FROM %I WHERE msg_id::TEXT = $1 OR id::TEXT = $1', queue_table)
+    USING message_id;
+    GET DIAGNOSTICS success = ROW_COUNT;
+    
+    IF success > 0 THEN
+      RETURN TRUE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'All deletion attempts for message % in queue % failed', message_id, queue_name;
+  END;
+  
+  RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
@@ -149,23 +191,35 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- ADDED: Helper function to confirm message deletion
-CREATE OR REPLACE FUNCTION confirm_message_deletion(
+-- Function to reset visibility timeout for stuck messages
+CREATE OR REPLACE FUNCTION reset_stuck_message(
   queue_name TEXT,
-  message_id UUID
+  message_id TEXT
 ) RETURNS BOOLEAN AS $$
 DECLARE
-  exists_check BOOLEAN;
   queue_table TEXT;
+  success BOOLEAN := FALSE;
 BEGIN
   -- Get the actual queue table name
-  SELECT pgmq.get_queue_table_name(queue_name) INTO queue_table;
+  BEGIN
+    SELECT pgmq.get_queue_table_name(queue_name) INTO STRICT queue_table;
+  EXCEPTION WHEN OTHERS THEN
+    queue_table := 'pgmq_' || queue_name;
+  END;
   
-  -- Check if the message still exists
-  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE id = %L)', queue_table, message_id)
-  INTO exists_check;
+  -- Try with text comparison for maximum flexibility
+  BEGIN
+    EXECUTE format('UPDATE %I SET vt = NULL WHERE msg_id::TEXT = $1 OR id::TEXT = $1', queue_table)
+    USING message_id;
+    GET DIAGNOSTICS success = ROW_COUNT;
+    
+    IF success > 0 THEN
+      RETURN TRUE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'Failed to reset visibility timeout for message % in queue %', message_id, queue_name;
+  END;
   
-  -- Return TRUE if the message is confirmed deleted (doesn't exist)
-  RETURN NOT exists_check;
+  RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
