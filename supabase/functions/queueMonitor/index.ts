@@ -112,35 +112,17 @@ async function getQueueDiagnostics(supabase, queueName = null) {
 
 async function getStuckMessages(supabase, queueName, thresholdMinutes) {
   try {
-    const queryParams = {
-      p_queue_name: queueName,
-      p_limit: 100,
-      p_include_processed: true
-    };
-    
-    const { data, error } = await supabase.rpc('inspect_queue_messages', queryParams);
+    const { data, error } = await supabase.rpc('list_stuck_messages', { 
+      queue_name: queueName,
+      min_minutes_locked: thresholdMinutes
+    });
     
     if (error) {
       console.error(`Error inspecting queue ${queueName}:`, error);
       return [];
     }
     
-    if (!data || data.length === 0) {
-      return [];
-    }
-    
-    // Filter for stuck messages (visibility timeout set but expired)
-    const now = new Date();
-    const thresholdMs = thresholdMinutes * 60 * 1000;
-    
-    return data.filter(msg => {
-      if (!msg.visibility_timeout) return false;
-      
-      const vtDate = new Date(msg.visibility_timeout);
-      const diffMs = now.getTime() - vtDate.getTime();
-      
-      return diffMs > thresholdMs;
-    });
+    return data || [];
   } catch (error) {
     console.error(`Error getting stuck messages for queue ${queueName}:`, error);
     return [];

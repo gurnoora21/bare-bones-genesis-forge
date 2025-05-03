@@ -421,6 +421,10 @@ export type Database = {
           track_count: number
         }[]
       }
+      get_queue_table_name_safe: {
+        Args: { p_queue_name: string }
+        Returns: string
+      }
       manual_trigger_worker: {
         Args: { worker_name: string }
         Returns: Json
@@ -452,6 +456,10 @@ export type Database = {
       pg_send_text: {
         Args: { queue_name: string; msg_text: string }
         Returns: number[]
+      }
+      reset_stuck_message: {
+        Args: { queue_name: string; message_id: string }
+        Returns: boolean
       }
       search_producers: {
         Args: { search_term: string }

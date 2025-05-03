@@ -14,78 +14,71 @@ serve(async (req) => {
   }
 
   try {
-    const requestBody = await req.json();
-    const { queue_name, message_id } = requestBody;
+    const { queue_name, message_id } = await req.json();
     
     if (!queue_name || !message_id) {
-      console.error("Missing required parameters:", { queue_name, message_id });
       throw new Error("queue_name and message_id are required");
     }
+    
+    console.log(`Attempting to delete message ${message_id} from queue ${queue_name}`);
     
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
-    console.log(`Attempting to delete message ${message_id} from queue ${queue_name}`);
-    
-    // Try standard deletion first
-    const { data: deleteResult, error: deleteError } = await supabase.rpc(
+    // First try using the improved pg_delete_message function
+    const { data, error } = await supabase.rpc(
       'pg_delete_message',
       { 
-        queue_name, 
-        message_id: message_id.toString()  // Ensure it's a string to handle various formats
+        queue_name,
+        message_id: message_id.toString() // Ensure message_id is a string
       }
     );
     
-    if (deleteError) {
-      console.error("Error using pg_delete_message:", deleteError);
-      
-      // If standard deletion fails, try resetting the visibility timeout as a fallback
-      const { data: resetResult, error: resetError } = await supabase.rpc(
-        'reset_stuck_message',
-        { 
-          queue_name, 
-          message_id: message_id.toString()
-        }
-      );
-      
-      if (resetError) {
-        console.error("Error resetting visibility timeout:", resetError);
-        throw new Error(`Failed to delete or reset message ${message_id}: ${deleteError.message}, reset error: ${resetError.message}`);
-      }
-      
-      if (resetResult) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            reset: true,
-            message: `Reset visibility timeout for message ${message_id} in queue ${queue_name}` 
-          }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      } else {
-        throw new Error(`Failed to delete or reset message ${message_id} in queue ${queue_name}`);
-      }
+    if (error) {
+      console.error("Error using pg_delete_message:", error);
+      throw error;
     }
     
-    if (deleteResult) {
+    if (data === true) {
+      console.log(`Successfully deleted message ${message_id} from queue ${queue_name}`);
       return new Response(
-        JSON.stringify({ 
-          success: true, 
-          message: `Successfully deleted message ${message_id} from queue ${queue_name}` 
-        }),
+        JSON.stringify({ success: true, message: `Deleted message ${message_id} from queue ${queue_name}` }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
-    } else {
+    }
+    
+    // If direct deletion failed, try to reset visibility timeout as a fallback
+    console.log(`Direct deletion failed, trying to reset visibility timeout for message ${message_id}`);
+    const { data: resetData, error: resetError } = await supabase.rpc(
+      'reset_stuck_message',
+      { 
+        queue_name,
+        message_id: message_id.toString()
+      }
+    );
+    
+    if (resetError) {
+      console.error("Error resetting message visibility:", resetError);
+      throw resetError;
+    }
+    
+    if (resetData === true) {
+      console.log(`Reset visibility timeout for message ${message_id}`);
       return new Response(
         JSON.stringify({ 
           success: false, 
-          message: `Message ${message_id} not found in queue ${queue_name} or could not be deleted` 
+          reset: true,
+          message: `Reset visibility timeout for message ${message_id} in queue ${queue_name}` 
         }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
+    
+    // If all attempts failed
+    throw new Error(`Failed to delete or reset message ${message_id} in queue ${queue_name}`);
+    
   } catch (error) {
     console.error("Error deleting message from queue:", error);
     
