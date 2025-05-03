@@ -74,81 +74,148 @@ async function ensureMessageDeleted(
       } else {
         console.warn(`Delete attempt ${attempts} failed for message ${messageId}: ${JSON.stringify(deleteResult)}`);
         
-        // If messageId is numeric, try direct SQL approach if first attempt failed
-        if (attempts === 1 && !isNaN(Number(messageId))) {
+        // Only try direct SQL approach if the first attempt failed
+        if (attempts === 1) {
           try {
-            // Try direct SQL delete on the pgmq table with a raw SQL query
+            // For both numeric and UUID IDs, try the raw SQL approach as fallback
+            // Use a more reliable PL/pgSQL block for deletion
             const { data, error } = await supabase.rpc('raw_sql_query', {
-              sql_query: `DELETE FROM pgmq_${queueName} WHERE msg_id = ${messageId} RETURNING true`
+              sql_query: `
+                DO $$
+                DECLARE
+                  success boolean := false;
+                  queue_table text;
+                  msg_val text := $1;
+                  num_val numeric;
+                BEGIN
+                  -- Try converting to numeric if possible
+                  BEGIN
+                    num_val := msg_val::numeric;
+                  EXCEPTION WHEN OTHERS THEN
+                    num_val := NULL;
+                  END;
+
+                  -- Try multiple possible table name formats
+                  FOR queue_table IN 
+                    SELECT unnest(ARRAY['pgmq_' || $2, $2])
+                  LOOP
+                    BEGIN
+                      -- Try with text value for UUID
+                      IF num_val IS NULL THEN
+                        EXECUTE 'DELETE FROM ' || quote_ident(queue_table) || ' WHERE msg_id::text = $1 OR id::text = $1' 
+                        USING msg_val;
+                      -- Try with numeric value
+                      ELSE
+                        EXECUTE 'DELETE FROM ' || quote_ident(queue_table) || ' WHERE msg_id = $1 OR id = $1' 
+                        USING num_val;
+                      END IF;
+                      
+                      GET DIAGNOSTICS success = ROW_COUNT;
+                      IF success THEN 
+                        RAISE NOTICE 'Deleted message % from table %', msg_val, queue_table;
+                        EXIT; 
+                      END IF;
+                    EXCEPTION WHEN OTHERS THEN
+                      -- Just continue to the next iteration
+                      RAISE NOTICE 'Failed to delete from %: %', queue_table, SQLERRM;
+                    END;
+                  END LOOP;
+                END $$;
+                SELECT true as deleted;
+              `,
+              params: [messageId.toString(), queueName]
             });
             
-            if (!error && data && data.length > 0) {
-              console.log(`Successfully deleted numeric message ${messageId} using raw SQL`);
+            if (!error) {
+              console.log(`Successfully deleted message ${messageId} using raw SQL direct approach`);
               deleted = true;
-              continue;
+              break;
             }
           } catch (sqlError) {
             console.error(`Raw SQL delete failed for message ${messageId}:`, sqlError);
           }
         }
         
-        // Try another alternate approach with pgmq.delete directly
-        if (attempts === 2) {
-          try {
-            // Try direct pgmq.delete (this probably won't work for numeric IDs but worth a try)
-            const { data, error } = await supabase.rpc('pgmq.delete', {
-              queue_name: queueName,
-              msg_id: messageId
-            });
-            
-            if (!error && data) {
-              console.log(`Successfully deleted message ${messageId} using direct pgmq.delete`);
-              deleted = true;
-              continue;
-            }
-          } catch (pgmqError) {
-            console.error(`pgmq.delete failed for message ${messageId}:`, pgmqError);
-          }
-        }
-        
-        // Wait before retrying (exponential backoff)
+        // Wait before retrying (exponential backoff with jitter)
         if (!deleted && attempts < maxRetries) {
-          const delayMs = Math.pow(2, attempts) * 100;
+          const baseDelay = Math.pow(2, attempts) * 100;
+          const jitter = Math.floor(Math.random() * 100);
+          const delayMs = baseDelay + jitter;
           await new Promise(resolve => setTimeout(resolve, delayMs));
         }
       }
       
       // Verify deletion on final attempt if still not confirmed
       if (!deleted && attempts === maxRetries - 1) {
-        try {
-          // For numeric IDs, use direct SQL check
-          if (!isNaN(Number(messageId))) {
-            try {
-              const { data, error } = await supabase.rpc('raw_sql_query', {
-                sql_query: `SELECT NOT EXISTS(SELECT 1 FROM pgmq_${queueName} WHERE msg_id = ${messageId}) AS deleted`
-              });
+        // Final verification to check if the message actually exists
+        const { data: verifyData, error: verifyError } = await supabase.rpc('raw_sql_query', {
+          sql_query: `
+            DO $$ 
+            DECLARE 
+              table_name text;
+              exists_check boolean;
+              msg_val text := $1;
+              num_val numeric;
+              found_msg boolean := false;
+            BEGIN
+              -- Try converting to numeric if possible
+              BEGIN
+                num_val := msg_val::numeric;
+              EXCEPTION WHEN OTHERS THEN
+                num_val := NULL;
+              END;
               
-              if (!error && data && data.length > 0 && data[0].deleted) {
-                console.log(`Numeric message ${messageId} verified as deleted via SQL check`);
-                deleted = true;
-              }
-            } catch (verifyError) {
-              console.error(`Error verifying numeric message deletion:`, verifyError);
-            }
-          } else {
-            // For UUID IDs, use the confirm_message_deletion function
-            const { data: verifyData, error: verifyError } = await supabase.rpc('confirm_message_deletion', {
-              queue_name: queueName,
-              message_id: messageId
+              -- Get the actual queue table name
+              BEGIN
+                SELECT pgmq.get_queue_table_name($2) INTO STRICT table_name;
+              
+                -- Check if message exists using the appropriate type
+                IF num_val IS NULL THEN
+                  EXECUTE 'SELECT EXISTS(SELECT 1 FROM ' || quote_ident(table_name) || ' WHERE id::text = $1 OR msg_id::text = $1)' 
+                  INTO exists_check
+                  USING msg_val;
+                ELSE
+                  EXECUTE 'SELECT EXISTS(SELECT 1 FROM ' || quote_ident(table_name) || ' WHERE id = $1 OR msg_id = $1)' 
+                  INTO exists_check
+                  USING num_val;
+                END IF;
+                
+                IF NOT exists_check THEN
+                  found_msg := false;
+                  RAISE NOTICE 'Message % is not in table %', msg_val, table_name;
+                ELSE
+                  found_msg := true;
+                  RAISE NOTICE 'Message % exists in table %', msg_val, table_name;
+                END IF;
+              EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Error checking message existence: %', SQLERRM;
+              END;
+            END $$;
+            SELECT true as checked;
+          `,
+          params: [messageId.toString(), queueName]
+        });
+        
+        // Also check using the confirm_message_deletion function if possible
+        if (!isNaN(Number(messageId))) {
+          try {
+            // For numeric IDs, check directly in the table
+            const { data, error } = await supabase.rpc('raw_sql_query', {
+              sql_query: `
+                SELECT NOT EXISTS(
+                  SELECT 1 FROM pgmq_${queueName} 
+                  WHERE msg_id = ${Number(messageId)} OR id = ${Number(messageId)}
+                ) AS deleted
+              `
             });
             
-            if (!verifyError && verifyData === true) {
-              console.log(`Message ${messageId} verified as deleted despite error responses`);
+            if (!error && data && data.length > 0 && data[0].deleted) {
+              console.log(`Numeric message ${messageId} verified as deleted via SQL check`);
               deleted = true;
             }
+          } catch (verifyError) {
+            console.error(`Error verifying numeric message deletion:`, verifyError);
           }
-        } catch (verifyError) {
-          console.error(`Error verifying message deletion:`, verifyError);
         }
       }
     } catch (e) {

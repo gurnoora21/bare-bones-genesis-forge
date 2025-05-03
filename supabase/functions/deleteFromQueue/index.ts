@@ -35,199 +35,211 @@ serve(async (req) => {
     // Initialize tracking variables
     let success = false;
     let error = null;
+    let attempts = 0;
+    const maxAttempts = 3;
     
-    // For numeric message IDs, try a different approach since PGMQ uses UUID
+    // Try direct database deletion first - this is the most reliable method for numeric IDs
     if (isNumeric) {
       try {
-        console.log(`Message ID is numeric: ${message_id}, using direct SQL approach`);
-        const tableName = `pgmq_${queue_name}`;
+        console.log(`Message ID is numeric: ${message_id}, trying direct SQL deletion first`);
         
-        // Try different table format possibilities (schema.table combinations)
-        const tablePossibilities = [
-          tableName,
-          `public.${tableName}`,
-          queue_name,
-          `public.${queue_name}`
-        ];
-        
-        for (const table of tablePossibilities) {
-          try {
-            console.log(`Trying to delete from table ${table} where msg_id = ${message_id}`);
-            const { data, error: deleteError } = await supabase.rpc(
-              'raw_sql_query',
-              { 
-                sql_query: `DELETE FROM ${table} WHERE msg_id = ${message_id} RETURNING TRUE AS deleted`
-              }
-            );
-            
-            if (!deleteError && data && data.length > 0) {
-              console.log(`Successfully deleted message ${message_id} from ${table}`);
-              success = true;
-              break;
-            }
-          } catch (tableError) {
-            console.log(`Table ${table} delete attempt failed:`, tableError.message);
-            // Continue to next table
+        // Create parametrized SQL query - this is safer and more reliable than dynamic SQL
+        const { data: directResult, error: directError } = await supabase.rpc(
+          'raw_sql_query',
+          { 
+            sql_query: `
+              DO $$
+              DECLARE
+                success boolean := false;
+                queue_table text;
+              BEGIN
+                -- Try multiple possible table name formats
+                FOR queue_table IN 
+                  SELECT unnest(ARRAY['pgmq_' || $1, $1])
+                LOOP
+                  BEGIN
+                    -- Try different ID column formats
+                    EXECUTE 'DELETE FROM ' || quote_ident(queue_table) || ' WHERE msg_id = $1 OR id = $1' 
+                    USING $2::numeric;
+                    
+                    GET DIAGNOSTICS success = ROW_COUNT;
+                    IF success THEN 
+                      EXIT; 
+                    END IF;
+                  EXCEPTION WHEN OTHERS THEN
+                    -- Just continue to the next iteration
+                  END;
+                END LOOP;
+              END $$;
+              SELECT true as deleted;
+            `,
+            params: [queue_name, Number(message_id)]
           }
-        }
+        );
         
-        if (!success) {
-          // Try more combinations with different column names
-          for (const table of tablePossibilities) {
-            try {
-              console.log(`Trying to delete from table ${table} where id = ${message_id}`);
-              const { data, error: deleteError } = await supabase.rpc(
-                'raw_sql_query',
-                { 
-                  sql_query: `DELETE FROM ${table} WHERE id = ${message_id} RETURNING TRUE AS deleted`
-                }
-              );
-              
-              if (!deleteError && data && data.length > 0) {
-                console.log(`Successfully deleted message ${message_id} from ${table} using id column`);
-                success = true;
-                break;
-              }
-            } catch (tableError) {
-              console.log(`Table ${table} delete attempt (id column) failed:`, tableError.message);
-            }
-          }
-        }
-      } catch (directError) {
-        console.error(`Direct numeric ID delete approach failed for ${message_id}:`, directError);
-        error = directError;
-      }
-    } else {
-      // Standard approach for UUID message IDs
-      // Try direct pgmq.delete approach first
-      try {
-        const { data, error: deleteError } = await supabase.rpc('pgmq.delete', {
-          queue_name,
-          msg_id: message_id
-        });
-        
-        if (!deleteError) {
+        if (!directError) {
+          console.log(`Successfully deleted numeric message ${message_id} using direct SQL`);
           success = true;
-          console.log(`Successfully deleted message ${message_id} using pgmq.delete directly`);
-        } else {
-          console.error(`Direct pgmq.delete failed for ${message_id}:`, deleteError);
-          error = deleteError;
-          // Will try fallback methods
         }
-      } catch (pgmqError) {
-        console.error(`pgmq.delete attempt failed for ${message_id}:`, pgmqError);
-        error = pgmqError;
-      }
-      
-      // If the direct approach failed, try using the pg_delete_message function
-      if (!success) {
-        try {
-          console.log(`Trying pg_delete_message for message ${message_id}`);
-          const { data, error: rpcError } = await supabase.rpc('pg_delete_message', {
-            queue_name,
-            message_id
-          });
-          
-          if (!rpcError && data === true) {
-            success = true;
-            console.log(`Successfully deleted message ${message_id} using pg_delete_message`);
-          } else {
-            error = rpcError;
-            console.error(`pg_delete_message failed for ${message_id}:`, rpcError || "Function returned false");
-          }
-        } catch (rpcError) {
-          console.error(`Error calling pg_delete_message for ${message_id}:`, rpcError);
-          error = error || rpcError;
-        }
-      }
-      
-      // Last resort: try a direct SQL delete using any potential table naming convention
-      if (!success) {
-        try {
-          const possibleTableNames = [
-            `pgmq_${queue_name}`, // Standard format
-            `pgmq.${queue_name}`, // Schema qualified
-            `public.pgmq_${queue_name}`, // Public schema qualified
-            queue_name, // Just the queue name
-            `public.${queue_name}` // Public schema with queue name
-          ];
-          
-          for (const tableName of possibleTableNames) {
-            console.log(`Trying direct delete from table ${tableName} for message ${message_id}`);
-            
-            try {
-              // Safe SQL using parameterized queries
-              const { error: deleteError } = await supabase
-                .from(tableName)
-                .delete()
-                .eq('id', message_id);
-              
-              if (!deleteError) {
-                success = true;
-                console.log(`Successfully deleted message ${message_id} from ${tableName}`);
-                break; // Exit the loop if successful
-              }
-            } catch (tableError) {
-              console.log(`Table ${tableName} delete attempt failed:`, tableError.message);
-              // Continue to next table name
-            }
-          }
-        } catch (fallbackError) {
-          console.error(`All fallback delete attempts failed for message ${message_id}:`, fallbackError);
-          error = error || fallbackError;
-        }
+      } catch (sqlError) {
+        console.error(`Direct SQL deletion failed for message ${message_id}:`, sqlError);
+        error = sqlError;
       }
     }
     
-    // Verify if the message is actually gone (check in all possible tables)
-    if (!success) {
+    // If direct SQL delete didn't work, try using standard PGMQ methods
+    while (!success && attempts < maxAttempts) {
+      attempts++;
       try {
-        console.log(`Checking if message ${message_id} was deleted despite errors`);
+        console.log(`Attempt ${attempts} to delete message ${message_id}`);
         
-        // Add a helper function to check if message exists in a table
-        const checkMessageExistsInTable = async (tableName, columnName) => {
-          try {
-            const { data, error } = await supabase.rpc(
-              'raw_sql_query',
-              { 
-                sql_query: `SELECT EXISTS(SELECT 1 FROM ${tableName} WHERE ${columnName} = ${isNumeric ? message_id : `'${message_id}'`}) AS exists`
-              }
-            );
-            
-            if (!error && data && data.length > 0) {
-              return data[0].exists;
-            }
-            return true; // Assume it exists if there's an error
-          } catch (e) {
-            console.log(`Error checking in ${tableName}:`, e.message);
-            return true; // Assume it exists if there's an error
+        let currentMethod = '';
+        
+        // Try different deletion methods in sequence
+        if (attempts === 1) {
+          // First try using the deleteFromQueue edge function (for UUID message IDs)
+          currentMethod = 'pgmq.delete';
+          const { data: pgmqData, error: pgmqError } = await supabase.rpc('pgmq.delete', {
+            queue_name,
+            msg_id: message_id
+          });
+          
+          if (!pgmqError && pgmqData) {
+            success = true;
+            console.log(`Successfully deleted message ${message_id} using pgmq.delete`);
+            break;
           }
-        };
-        
-        // Check all possible table combinations
-        const tablesToCheck = [
-          { table: `pgmq_${queue_name}`, column: 'msg_id' },
-          { table: `pgmq_${queue_name}`, column: 'id' },
-          { table: `pgmq.${queue_name}`, column: 'msg_id' },
-          { table: `pgmq.${queue_name}`, column: 'id' },
-          { table: queue_name, column: 'msg_id' },
-          { table: queue_name, column: 'id' }
-        ];
-        
-        let exists = false;
-        for (const { table, column } of tablesToCheck) {
-          exists = await checkMessageExistsInTable(table, column);
-          if (exists) {
+        } else if (attempts === 2) {
+          // Next try using the pg_delete_message function
+          currentMethod = 'pg_delete_message';
+          // For UUID format
+          if (!isNumeric) {
+            const { data: pgDeleteData, error: pgDeleteError } = await supabase.rpc('pg_delete_message', {
+              queue_name,
+              message_id
+            });
+            
+            if (!pgDeleteError && pgDeleteData === true) {
+              success = true;
+              console.log(`Successfully deleted message ${message_id} using pg_delete_message`);
+              break;
+            }
+          }
+          
+          // Try raw SQL for additional fallback
+          const { data: rawSqlData, error: rawSqlError } = await supabase.rpc(
+            'raw_sql_query',
+            { 
+              sql_query: `SELECT pg_delete_message($1, $2::text)`,
+              params: [queue_name, message_id]
+            }
+          );
+          
+          if (!rawSqlError && rawSqlData && rawSqlData.length > 0) {
+            success = true;
+            console.log(`Successfully deleted message ${message_id} using SQL call to pg_delete_message`);
+            break;
+          }
+        } else {
+          // Last resort: Try more aggressive direct SQL methods
+          currentMethod = 'direct SQL deletion';
+          
+          // Attempt to get the correct table name
+          const { data: tableData } = await supabase.rpc(
+            'raw_sql_query',
+            { 
+              sql_query: `SELECT pgmq.get_queue_table_name($1) as table_name`,
+              params: [queue_name]
+            }
+          );
+          
+          let tableName = '';
+          if (tableData && tableData.length > 0 && tableData[0].table_name) {
+            tableName = tableData[0].table_name;
+          } else {
+            tableName = `pgmq_${queue_name}`;
+          }
+          
+          // Try explicit deletion with both column names
+          const { data: lastData, error: lastError } = await supabase.rpc(
+            'raw_sql_query',
+            { 
+              sql_query: `
+                WITH deletion AS (
+                  DELETE FROM ${tableName} WHERE msg_id = $1 OR id = $1 RETURNING true as deleted
+                )
+                SELECT coalesce((SELECT deleted FROM deletion LIMIT 1), false) as deleted
+              `,
+              params: [isNumeric ? Number(message_id) : message_id]
+            }
+          );
+          
+          if (!lastError && lastData && lastData.length > 0 && lastData[0].deleted) {
+            success = true;
+            console.log(`Successfully deleted message ${message_id} using direct table deletion`);
             break;
           }
         }
         
-        if (!exists) {
+        console.warn(`${currentMethod} deletion failed for message ${message_id}, attempt ${attempts}/${maxAttempts}`);
+        
+        // Wait a bit before retrying (exponential backoff)
+        if (attempts < maxAttempts) {
+          const delayMs = Math.pow(2, attempts) * 100;
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      } catch (attemptError) {
+        console.error(`Error during deletion attempt ${attempts} for message ${message_id}:`, attemptError);
+        error = attemptError;
+        
+        // Wait before retrying with exponential backoff
+        if (attempts < maxAttempts) {
+          const delayMs = Math.pow(2, attempts) * 100;
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+    
+    // Final verification - verify the message no longer exists
+    if (!success) {
+      try {
+        console.log(`Performing final verification for message ${message_id}`);
+        
+        // Get correct table name
+        const { data: tableNameData } = await supabase.rpc(
+          'raw_sql_query',
+          { 
+            sql_query: `SELECT pgmq.get_queue_table_name($1) as table_name`,
+            params: [queue_name]
+          }
+        );
+        
+        let tableName = '';
+        if (tableNameData && tableNameData.length > 0 && tableNameData[0].table_name) {
+          tableName = tableNameData[0].table_name;
+        } else {
+          tableName = `pgmq_${queue_name}`;
+        }
+        
+        // Check if message still exists
+        const { data: existsData, error: existsError } = await supabase.rpc(
+          'raw_sql_query',
+          { 
+            sql_query: `SELECT EXISTS(
+              SELECT 1 FROM ${tableName} 
+              WHERE msg_id = $1 OR id = $1
+            ) as exists`,
+            params: [isNumeric ? Number(message_id) : message_id]
+          }
+        );
+        
+        // If it doesn't exist, consider it a success
+        if (!existsError && existsData && existsData.length > 0 && existsData[0].exists === false) {
+          console.log(`Message ${message_id} verified as not present in the queue, marking as deleted`);
           success = true;
-          console.log(`Message ${message_id} verified as not found in any tables, considering it deleted`);
         }
       } catch (verifyError) {
-        console.error(`Error verifying message deletion:`, verifyError);
+        console.error(`Error during final verification for message ${message_id}:`, verifyError);
       }
     }
     
@@ -237,7 +249,7 @@ serve(async (req) => {
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     } else {
-      throw new Error(error?.message || `Failed to delete message ${message_id} from queue ${queue_name}`);
+      throw new Error(`Failed to delete message ${message_id} from queue ${queue_name} after ${maxAttempts} attempts`);
     }
     
   } catch (error) {
