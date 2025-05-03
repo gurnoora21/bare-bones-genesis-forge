@@ -28,6 +28,17 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
+    // Get diagnostic info about all queue tables
+    const { data: diagData, error: diagError } = await supabase.rpc(
+      'diagnose_queue_tables'
+    );
+    
+    if (diagError) {
+      console.error("Error getting queue table diagnostics:", diagError);
+    } else {
+      console.log("Queue table diagnostics:", diagData);
+    }
+    
     const results: any = {};
     let totalStuck = 0;
     let fixedCount = 0;
@@ -70,49 +81,66 @@ serve(async (req) => {
           const messageId = message.id || message.msg_id;
           
           try {
-            // Try force-delete first for messages that have been stuck for too long
-            // or have been read too many times
+            // Try our new cross-schema operation for messages that have been stuck for too long
             if (message.minutes_locked > 30 || message.read_count > 5) {
-              // Use the forceDeleteMessage function
-              const forceResponse = await fetch(
-                `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
-                {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-                  },
-                  body: JSON.stringify({
-                    queue_name: queueName,
-                    message_id: messageId,
-                    bypass_checks: message.minutes_locked > 60 // Use aggressive deletion for very old messages
-                  })
+              const { data: crossSchemaResult, error: crossSchemaError } = await supabase.rpc(
+                'cross_schema_queue_op',
+                { 
+                  p_operation: 'delete',
+                  p_queue_name: queueName,
+                  p_message_id: messageId
                 }
               );
               
-              const forceResult = await forceResponse.json();
-              
-              if (forceResponse.ok && (forceResult.success || forceResult.reset)) {
-                console.log(`Successfully force-handled message ${messageId} in ${queueName}`);
+              if (!crossSchemaError && crossSchemaResult && crossSchemaResult.success === true) {
+                console.log(`Successfully deleted stuck message ${messageId} from ${queueName} using cross-schema op`);
                 fixedCount++;
                 continue;
+              }
+              
+              // If direct delete failed but message is very old, try force delete
+              if (message.minutes_locked > 60) {
+                const forceResponse = await fetch(
+                  `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
+                  {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+                    },
+                    body: JSON.stringify({
+                      queue_name: queueName,
+                      message_id: messageId,
+                      bypass_checks: true // Enable aggressive deletion for very old messages
+                    })
+                  }
+                );
+                
+                const forceResult = await forceResponse.json();
+                
+                if (forceResponse.ok && (forceResult.success || forceResult.reset)) {
+                  console.log(`Successfully force-handled message ${messageId} in ${queueName}`);
+                  fixedCount++;
+                  continue;
+                }
               }
             }
             
             // Otherwise try the standard reset function
             const { data: resetResult, error: resetError } = await supabase.rpc(
-              'reset_stuck_messages',
+              'cross_schema_queue_op',
               { 
-                queue_name: queueName, 
-                min_minutes_locked: threshold_minutes 
+                p_operation: 'reset',
+                p_queue_name: queueName,
+                p_message_id: messageId
               }
             );
             
-            if (!resetError && resetResult > 0) {
-              console.log(`Reset ${resetResult} stuck messages in ${queueName}`);
-              fixedCount += resetResult;
+            if (!resetError && resetResult && resetResult.success === true) {
+              console.log(`Reset stuck message ${messageId} in ${queueName}`);
+              fixedCount++;
             } else if (resetError) {
-              console.error(`Error resetting stuck messages in ${queueName}:`, resetError);
+              console.error(`Error resetting stuck message in ${queueName}:`, resetError);
             }
           } catch (fixError) {
             console.error(`Error fixing stuck message ${messageId} in ${queueName}:`, fixError);
@@ -128,6 +156,7 @@ serve(async (req) => {
       threshold_minutes: threshold_minutes,
       auto_fix_enabled: auto_fix,
       messages_fixed: fixedCount,
+      queue_table_diagnostics: diagData,
       details: results,
       timestamp: new Date().toISOString()
     };
