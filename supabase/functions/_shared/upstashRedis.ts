@@ -1,4 +1,3 @@
-
 /**
  * Upstash Redis HTTP client for Deno/Edge Functions
  * Implements key Redis operations needed for rate limiting and caching
@@ -65,8 +64,9 @@ export class UpstashRedis {
         });
       });
       
-      // Log commands for debugging
-      console.debug("Sending Redis commands:", JSON.stringify(formattedCommands).substring(0, 500) + "...");
+      // Log commands for debugging (but keep them short)
+      const debugCommands = JSON.stringify(formattedCommands).substring(0, 500) + "...";
+      console.debug("Sending Redis commands:", debugCommands);
       
       const response = await fetch(this.url, {
         method: "POST",
@@ -112,7 +112,21 @@ export class UpstashRedis {
    */
   private async safeCommand(command: string, ...args: any[]): Promise<any> {
     try {
-      return await this.request([[command, ...args.map(String)]]);
+      const stringArgs = args.map(arg => {
+        if (arg === null || arg === undefined) {
+          return "";
+        } else if (typeof arg === 'object') {
+          try {
+            return JSON.stringify(arg);
+          } catch (e) {
+            return String(arg);
+          }
+        } else {
+          return String(arg);
+        }
+      });
+      
+      return await this.request([[command, ...stringArgs]]);
     } catch (error) {
       console.warn(`Redis ${command} command failed:`, error);
       return null;
@@ -170,7 +184,7 @@ export class UpstashRedis {
         stringValue = String(value);
       }
       
-      // Use simplified command to avoid type issues
+      // Use simplified command with proper string formatting
       if (expireSeconds !== undefined) {
         return await this.safeCommand("SET", key, stringValue, "EX", String(expireSeconds));
       } else {
@@ -187,7 +201,7 @@ export class UpstashRedis {
       // Remove from memory cache
       this.memoryCache.delete(key);
       
-      return await this.request([["DEL", String(key)]]);
+      return await this.safeCommand("DEL", key);
     } catch (error) {
       console.error(`Error deleting key ${key} from Redis:`, error);
       return 0;
@@ -197,7 +211,7 @@ export class UpstashRedis {
   async incr(key: string): Promise<number> {
     try {
       // Can't effectively cache this operation
-      return await this.request([["INCR", String(key)]]);
+      return await this.safeCommand("INCR", key);
     } catch (error) {
       console.error(`Error incrementing key ${key} in Redis:`, error);
       return 0;
@@ -207,7 +221,7 @@ export class UpstashRedis {
   async decr(key: string): Promise<number> {
     try {
       // Can't effectively cache this operation
-      return await this.request([["DECR", String(key)]]);
+      return await this.safeCommand("DECR", key);
     } catch (error) {
       console.error(`Error decrementing key ${key} in Redis:`, error);
       return 0;
@@ -216,7 +230,7 @@ export class UpstashRedis {
   
   async expire(key: string, seconds: number): Promise<number> {
     try {
-      return await this.request([["EXPIRE", String(key), String(seconds)]]);
+      return await this.safeCommand("EXPIRE", key, seconds);
     } catch (error) {
       console.error(`Error setting expiry for key ${key} in Redis:`, error);
       return 0;
@@ -273,15 +287,14 @@ export class UpstashRedis {
       }
       
       // Cache miss, get from Redis using pipeline
-      const pipeline = [
-        ["HMGET", String(key), "tokens", "last_refill"],
-        ["EXPIRE", String(key), String(interval * 2)]
-      ];
+      const results = await this.pipelineExec([
+        ["HMGET", key, "tokens", "last_refill"],
+        ["EXPIRE", key, String(interval * 2)]
+      ]);
       
-      const [bucketData] = await this.pipelineExec(pipeline);
-      
-      let tokens = bucketData[0] ? parseInt(bucketData[0]) : tokensPerInterval;
-      let lastRefill = bucketData[1] ? parseInt(bucketData[1]) : now;
+      const bucketData = results[0];
+      let tokens = bucketData && bucketData[0] ? parseInt(bucketData[0]) : tokensPerInterval;
+      let lastRefill = bucketData && bucketData[1] ? parseInt(bucketData[1]) : now;
       
       // Refill tokens based on time elapsed
       const elapsed = now - lastRefill;
@@ -302,10 +315,9 @@ export class UpstashRedis {
         const newTokens = tokens - tokensToConsume;
         this.memoryCache.set(cacheKey, { tokens: newTokens, lastRefill }, interval * 2);
         
-        // FIXED: Ensure proper string formatting for tokens and lastRefill
         await this.pipelineExec([
-          ["HMSET", String(key), "tokens", String(newTokens), "last_refill", String(lastRefill)],
-          ["EXPIRE", String(key), String(interval * 2)]
+          ["HMSET", key, "tokens", String(newTokens), "last_refill", String(lastRefill)],
+          ["EXPIRE", key, String(interval * 2)]
         ]);
         
         return true;
@@ -328,10 +340,9 @@ export class UpstashRedis {
     expireSeconds: number
   ): Promise<void> {
     try {
-      // FIXED: Ensure proper string formatting for all values
       await this.pipelineExec([
-        ["HMSET", String(key), "tokens", String(tokens), "last_refill", String(lastRefill)],
-        ["EXPIRE", String(key), String(expireSeconds)]
+        ["HMSET", key, "tokens", String(tokens), "last_refill", String(lastRefill)],
+        ["EXPIRE", key, String(expireSeconds)]
       ]);
     } catch (error) {
       console.error("Failed to update token bucket in Redis:", error);
@@ -384,20 +395,21 @@ export class UpstashRedis {
       // Process each API's stats
       for (const [api, endpoints] of this.statsBuffer.entries()) {
         for (const [key, count] of endpoints.entries()) {
-          const [type, day, ...rest] = key.split(':');
+          const parts = key.split(':');
+          const redisKey = parts[0] === 'error' 
+            ? `errors:${api}:${parts[1]}`
+            : parts.length === 2
+              ? `stats:${api}:${parts[0]}`
+              : `stats:${api}:${parts[0]}:${parts[1]}`;
+              
+          const field = parts[0] === 'error'
+            ? parts.slice(2).join(':')
+            : parts.length === 2
+              ? parts[1]
+              : parts[2];
           
-          if (type === 'error') {
-            pipeline.push(["HINCRBY", `errors:${api}:${day}`, rest.join(':'), String(count)]);
-            pipeline.push(["EXPIRE", `errors:${api}:${day}`, String(60 * 60 * 24 * 30)]);
-          } else if (key.split(':').length === 2) {
-            // Daily stats
-            pipeline.push(["HINCRBY", `stats:${api}:${day}`, rest[0], String(count)]);
-            pipeline.push(["EXPIRE", `stats:${api}:${day}`, String(60 * 60 * 24 * 30)]);
-          } else {
-            // Hourly stats
-            pipeline.push(["HINCRBY", `stats:${api}:${day}:${rest[0]}`, rest[1], String(count)]);
-            pipeline.push(["EXPIRE", `stats:${api}:${day}:${rest[0]}`, String(60 * 60 * 24 * 30)]);
-          }
+          pipeline.push(["HINCRBY", redisKey, field, String(count)]);
+          pipeline.push(["EXPIRE", redisKey, String(60 * 60 * 24 * 30)]);
         }
       }
       
@@ -423,8 +435,31 @@ export class UpstashRedis {
       // Set in memory cache
       this.memoryCache.set(cacheKey, value, ttlSeconds);
       
-      // Set in Redis
-      return this.set(cacheKey, value, ttlSeconds);
+      // Set in Redis, but use a safer approach for large values
+      let stringValue: string;
+      try {
+        stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+      } catch (e) {
+        console.error(`Error stringifying cache value for ${key}:`, e);
+        // Store a simplified version if full serialization fails
+        stringValue = JSON.stringify({
+          error: "Failed to serialize full value",
+          type: typeof value,
+          timestamp: Date.now()
+        });
+      }
+      
+      // For very large values, store a truncated version to avoid Redis errors
+      if (stringValue.length > 5000000) { // 5MB limit
+        console.warn(`Cache value for ${key} exceeds 5MB, truncating`);
+        stringValue = JSON.stringify({
+          error: "Value exceeded 5MB limit",
+          originalType: typeof value,
+          timestamp: Date.now()
+        });
+      }
+      
+      return this.set(cacheKey, stringValue, ttlSeconds);
     } catch (error) {
       console.error(`Error setting cache for key ${key}:`, error);
       return "";
@@ -442,7 +477,14 @@ export class UpstashRedis {
       }
       
       // Cache miss, get from Redis
-      return this.get(cacheKey);
+      const redisValue = await this.get(cacheKey);
+      
+      // Update memory cache if we got a value
+      if (redisValue !== null && redisValue !== undefined) {
+        this.memoryCache.set(cacheKey, redisValue, 300); // 5 minute default TTL
+      }
+      
+      return redisValue;
     } catch (error) {
       console.error(`Error getting cache for key ${key}:`, error);
       return null;
@@ -468,12 +510,34 @@ export class UpstashRedis {
   // Add pipeline execution helper that was missing
   async pipelineExec(pipeline: string[][]): Promise<any[]> {
     try {
-      return await this.request(pipeline);
+      // Format the pipeline commands to ensure all values are strings
+      const formattedPipeline = pipeline.map(cmd => {
+        return cmd.map(arg => {
+          if (arg === null || arg === undefined) {
+            return "";
+          } else if (typeof arg === 'object') {
+            try {
+              return JSON.stringify(arg);
+            } catch (e) {
+              return String(arg);
+            }
+          } else {
+            return String(arg);
+          }
+        });
+      });
+      
+      return await this.request(formattedPipeline);
     } catch (error) {
       console.error("Redis pipeline execution failed:", error);
       // Return empty results on error to avoid breaking the application
       return Array(pipeline.length).fill(null);
     }
+  }
+  
+  // Helper for compressing long strings in logs and debugging
+  private compressString(str: string): string {
+    return str.length > 1000 ? str.substring(0, 1000) + "..." : str;
   }
 }
 
