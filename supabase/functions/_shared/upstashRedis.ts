@@ -1,3 +1,4 @@
+
 /**
  * Upstash Redis HTTP client for Deno/Edge Functions
  * Implements key Redis operations needed for rate limiting and caching
@@ -280,7 +281,7 @@ export class UpstashRedis {
       const [bucketData] = await this.pipelineExec(pipeline);
       
       let tokens = bucketData[0] ? parseInt(bucketData[0]) : tokensPerInterval;
-      let lastRefill = bucketData[1] ? parseInt(bucketData[1] : now;
+      let lastRefill = bucketData[1] ? parseInt(bucketData[1]) : now;
       
       // Refill tokens based on time elapsed
       const elapsed = now - lastRefill;
@@ -461,6 +462,17 @@ export class UpstashRedis {
     } catch (error) {
       console.error("Redis PING failed:", error);
       return false;
+    }
+  }
+  
+  // Add pipeline execution helper that was missing
+  async pipelineExec(pipeline: string[][]): Promise<any[]> {
+    try {
+      return await this.request(pipeline);
+    } catch (error) {
+      console.error("Redis pipeline execution failed:", error);
+      // Return empty results on error to avoid breaking the application
+      return Array(pipeline.length).fill(null);
     }
   }
 }
