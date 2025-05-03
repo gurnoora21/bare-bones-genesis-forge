@@ -7,17 +7,17 @@ DECLARE
   result JSONB;
   success BOOLEAN := FALSE;
 BEGIN
-  -- First, check if we can find the queue table in pgmq schema
+  -- First, check if we can find the correct queue table in pgmq schema
   SELECT EXISTS (
     SELECT 1 
     FROM information_schema.tables 
     WHERE table_schema = 'pgmq' AND table_name = 'q_artist_discovery'
   ) INTO table_exists;
   
-  -- Try pgmq schema first
+  -- Try pgmq schema with correct table pattern first
   IF table_exists THEN
     schema_table_name := 'pgmq.q_artist_discovery';
-    RAISE NOTICE 'Found pgmq queue table: %', schema_table_name;
+    RAISE NOTICE 'Found correct PGMQ queue table: %', schema_table_name;
     
     BEGIN
       -- First try direct deletion
@@ -42,7 +42,7 @@ BEGIN
     END;
   END IF;
   
-  -- Next, check the public schema
+  -- Next, check the public schema as fallback
   SELECT EXISTS (
     SELECT 1 
     FROM information_schema.tables 
@@ -52,7 +52,7 @@ BEGIN
   -- Try public schema if not already fixed
   IF table_exists AND NOT success THEN
     schema_table_name := 'public.pgmq_artist_discovery';
-    RAISE NOTICE 'Found public queue table: %', schema_table_name;
+    RAISE NOTICE 'Found fallback queue table: %', schema_table_name;
     
     BEGIN
       -- Try direct deletion

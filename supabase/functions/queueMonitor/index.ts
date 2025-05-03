@@ -45,44 +45,61 @@ serve(async (req) => {
     
     // Check each queue for stuck messages
     for (const queueName of QUEUE_NAMES) {
-      const { data: stuckMessages, error } = await supabase.rpc(
-        'list_stuck_messages',
-        { 
-          queue_name: queueName, 
-          min_minutes_locked: threshold_minutes 
+      try {
+        // Get the correct queue table name
+        const { data: tableInfo } = await supabase.rpc(
+          'get_queue_table_name_safe',
+          { p_queue_name: queueName }
+        );
+        
+        const queueTableName = tableInfo || `pgmq.q_${queueName}`;
+        console.log(`Checking for stuck messages in ${queueTableName}`);
+        
+        // Run direct SQL query to find stuck messages in the correct schema
+        const { data: stuckMessages } = await supabase.rpc(
+          'raw_sql_query',
+          {
+            sql_query: `
+              SELECT 
+                id::TEXT, 
+                msg_id::TEXT, 
+                message::JSONB AS message, 
+                vt AS locked_since, 
+                read_ct AS read_count,
+                EXTRACT(EPOCH FROM (NOW() - vt))/60 AS minutes_locked
+              FROM ${queueTableName}
+              WHERE 
+                vt IS NOT NULL 
+                AND vt < NOW() - INTERVAL '${threshold_minutes} minutes'
+              ORDER BY vt ASC
+            `
+          }
+        );
+        
+        if (!stuckMessages || stuckMessages.length === 0) {
+          results[queueName] = { stuck: 0, message: "No stuck messages" };
+          continue;
         }
-      );
-      
-      if (error) {
-        console.error(`Error checking queue ${queueName}:`, error);
-        results[queueName] = { error: error.message };
-        continue;
-      }
-      
-      if (!stuckMessages || stuckMessages.length === 0) {
-        results[queueName] = { stuck: 0, message: "No stuck messages" };
-        continue;
-      }
-      
-      totalStuck += stuckMessages.length;
-      
-      results[queueName] = {
-        stuck: stuckMessages.length,
-        messages: stuckMessages.map((m: any) => ({
-          id: m.id || m.msg_id,
-          minutes_locked: m.minutes_locked,
-          read_count: m.read_count
-        }))
-      };
-      
-      // Auto fix stuck messages if requested
-      if (auto_fix) {
-        for (const message of stuckMessages) {
-          const messageId = message.id || message.msg_id;
-          
-          try {
-            // Try our new cross-schema operation for messages that have been stuck for too long
-            if (message.minutes_locked > 30 || message.read_count > 5) {
+        
+        totalStuck += stuckMessages.length;
+        
+        results[queueName] = {
+          stuck: stuckMessages.length,
+          table_name: queueTableName,
+          messages: stuckMessages.map((m: any) => ({
+            id: m.id || m.msg_id,
+            minutes_locked: m.minutes_locked,
+            read_count: m.read_count
+          }))
+        };
+        
+        // Auto fix stuck messages if requested
+        if (auto_fix) {
+          for (const message of stuckMessages) {
+            const messageId = message.id || message.msg_id;
+            
+            try {
+              // Use cross_schema_queue_op which now checks both schema patterns
               const { data: crossSchemaResult, error: crossSchemaError } = await supabase.rpc(
                 'cross_schema_queue_op',
                 { 
@@ -98,8 +115,8 @@ serve(async (req) => {
                 continue;
               }
               
-              // If direct delete failed but message is very old, try force delete
-              if (message.minutes_locked > 60) {
+              // If direct delete failed but message is very old or has high read count, try force delete
+              if (message.minutes_locked > 30 || message.read_count > 5) {
                 const forceResponse = await fetch(
                   `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
                   {
@@ -111,7 +128,7 @@ serve(async (req) => {
                     body: JSON.stringify({
                       queue_name: queueName,
                       message_id: messageId,
-                      bypass_checks: true // Enable aggressive deletion for very old messages
+                      bypass_checks: true // Enable aggressive deletion for problematic messages
                     })
                   }
                 );
@@ -124,28 +141,31 @@ serve(async (req) => {
                   continue;
                 }
               }
-            }
-            
-            // Otherwise try the standard reset function
-            const { data: resetResult, error: resetError } = await supabase.rpc(
-              'cross_schema_queue_op',
-              { 
-                p_operation: 'reset',
-                p_queue_name: queueName,
-                p_message_id: messageId
+              
+              // Otherwise try the standard reset function
+              const { data: resetResult, error: resetError } = await supabase.rpc(
+                'cross_schema_queue_op',
+                { 
+                  p_operation: 'reset',
+                  p_queue_name: queueName,
+                  p_message_id: messageId
+                }
+              );
+              
+              if (!resetError && resetResult && resetResult.success === true) {
+                console.log(`Reset stuck message ${messageId} in ${queueName}`);
+                fixedCount++;
+              } else if (resetError) {
+                console.error(`Error resetting stuck message in ${queueName}:`, resetError);
               }
-            );
-            
-            if (!resetError && resetResult && resetResult.success === true) {
-              console.log(`Reset stuck message ${messageId} in ${queueName}`);
-              fixedCount++;
-            } else if (resetError) {
-              console.error(`Error resetting stuck message in ${queueName}:`, resetError);
+            } catch (fixError) {
+              console.error(`Error fixing stuck message ${messageId} in ${queueName}:`, fixError);
             }
-          } catch (fixError) {
-            console.error(`Error fixing stuck message ${messageId} in ${queueName}:`, fixError);
           }
         }
+      } catch (queueError) {
+        console.error(`Error processing queue ${queueName}:`, queueError);
+        results[queueName] = { error: queueError.message };
       }
     }
     

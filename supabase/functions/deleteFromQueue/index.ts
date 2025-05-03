@@ -29,10 +29,7 @@ serve(async (req) => {
     
     console.log(`Attempting to delete message ${message_id} from queue ${queue_name}`);
     
-    // Determine message ID type and format
-    const isNumeric = !isNaN(Number(message_id)) && message_id.toString().trim() !== '';
-    
-    // Method 1: Try our new cross-schema approach first
+    // Method 1: Try cross_schema_queue_op which now looks in pgmq.q_* tables first
     try {
       const { data: crossSchemaResult, error: crossSchemaError } = await supabase.rpc(
         'cross_schema_queue_op',
@@ -65,61 +62,32 @@ serve(async (req) => {
       console.error("Error using cross-schema deletion:", crossSchemaError);
     }
     
-    // Method 2: Try enhanced delete function with improved schema handling
+    // Method 2: Try calling pgmq.delete directly via RPC
     try {
-      const { data: enhancedData, error: enhancedError } = await supabase.rpc(
-        'enhanced_delete_message',
+      const { data: pgmqResult, error: pgmqError } = await supabase.rpc(
+        'direct_pgmq_delete',
         { 
-          p_queue_name: queue_name,
-          p_message_id: message_id.toString(),
-          p_is_numeric: isNumeric
-        }
-      );
-      
-      if (!enhancedError && enhancedData === true) {
-        return new Response(
-          JSON.stringify({ 
-            success: true,
-            message: `Successfully deleted message ${message_id} from queue ${queue_name} using enhanced method`
-          }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      
-      console.error("Enhanced delete failed:", enhancedError || "No success");
-    } catch (enhancedError) {
-      console.error(`Enhanced delete procedure failed:`, enhancedError);
-    }
-    
-    // Method 3: Last resort - try to reset visibility timeout
-    try {
-      const { data: resetResult, error: resetError } = await supabase.rpc(
-        'cross_schema_queue_op',
-        { 
-          p_operation: 'reset',
           p_queue_name: queue_name,
           p_message_id: message_id
         }
       );
       
-      if (!resetError && resetResult && resetResult.success === true) {
+      if (!pgmqError && pgmqResult === true) {
         return new Response(
           JSON.stringify({ 
-            success: false,
-            reset: true,
-            message: `Could not delete message ${message_id}, but successfully reset visibility timeout`,
-            details: resetResult
+            success: true,
+            message: `Successfully deleted message ${message_id} from queue ${queue_name} using pgmq.delete`
           }),
           { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
       
-      console.error("Reset failed:", resetError || "No success", resetResult);
-    } catch (resetError) {
-      console.error(`Reset procedure failed:`, resetError);
+      console.error("PGMQ delete failed:", pgmqError || "No success");
+    } catch (pgmqError) {
+      console.error(`PGMQ delete procedure failed:`, pgmqError);
     }
     
-    // If everything else failed, try invoking the forceDeleteMessage edge function
+    // Method 3: Try using the forceDeleteMessage edge function
     try {
       const forceDeleteResponse = await fetch(
         `${Deno.env.get("SUPABASE_URL")}/functions/v1/forceDeleteMessage`,
