@@ -27,208 +27,147 @@ serve(async (req) => {
 
     console.log(`FORCE DELETE: Attempting to delete message ${message_id} from queue ${queue_name}`);
     
-    // Get queue table diagnostic info
-    const { data: diagData } = await supabase.rpc(
-      'diagnose_queue_tables',
-      { queue_name: queue_name }
+    // Use the cross_schema_queue_op function for reliable operation across schemas
+    const { data: deleteResult, error: deleteError } = await supabase.rpc(
+      'cross_schema_queue_op',
+      { 
+        p_queue_name: queue_name, 
+        p_message_id: message_id.toString(),
+        p_operation: 'delete'
+      }
     );
     
-    // Try to create direct_pgmq_delete function if it doesn't exist (might be a new deploy)
-    try {
-      await supabase.rpc(
-        'raw_sql_query',
-        {
-          sql_query: `
-            CREATE OR REPLACE FUNCTION public.direct_pgmq_delete(
-              p_queue_name TEXT,
-              p_message_id TEXT
-            ) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
-            DECLARE
-              queue_table TEXT;
-              success BOOLEAN := FALSE;
-            BEGIN
-              -- Get the correct table
-              SELECT get_queue_table_name_safe(p_queue_name) INTO queue_table;
-              
-              -- Execute direct delete on this table
-              BEGIN
-                EXECUTE format('DELETE FROM %s WHERE id::TEXT = $1 OR msg_id::TEXT = $1', queue_table)
-                USING p_message_id;
-                GET DIAGNOSTICS success = ROW_COUNT;
-                RETURN success > 0;
-              EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'Direct delete failed on table %: %', queue_table, SQLERRM;
-                RETURN FALSE;
-              END;
-            END;
-            $$;
-          `
-        }
-      );
-      console.log("Created direct_pgmq_delete function:", diagData);
-    } catch (funcError) {
-      console.error("Error creating function:", funcError);
+    if (deleteError) {
+      console.error("Error with cross schema operation:", deleteError);
     }
     
-    // 1. Try raw SQL deletion first
-    const rawSqlResult = await supabase.rpc(
-      'raw_sql_query',
-      {
-        sql_query: `
-          DO $$
-          DECLARE
-            tables TEXT[] := ARRAY[
-              'pgmq.q_${queue_name}',
-              'public.pgmq_${queue_name}'
-            ];
-            t TEXT;
-            success BOOLEAN := FALSE;
-          BEGIN
-            FOREACH t IN ARRAY tables
-            LOOP
-              BEGIN
-                EXECUTE format('DELETE FROM %s WHERE id::TEXT = $1 OR msg_id::TEXT = $1', t)
+    // Direct SQL approach as backup
+    const { data: directResult, error: directError } = await supabase.rpc('raw_sql_query', {
+      sql_query: `
+        DO $$
+        DECLARE
+          pgmq_exists BOOLEAN;
+          public_exists BOOLEAN;
+          success_count INT := 0;
+        BEGIN
+          -- Check for tables in both schemas
+          SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = 'pgmq' AND table_name = 'q_${queue_name}'
+          ) INTO pgmq_exists;
+          
+          SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = 'public' AND table_name = 'pgmq_${queue_name}'
+          ) INTO public_exists;
+          
+          -- Try in pgmq schema
+          IF pgmq_exists THEN
+            BEGIN
+              EXECUTE 'DELETE FROM pgmq.q_${queue_name} WHERE msg_id::TEXT = $1 OR id::TEXT = $1'
                 USING '${message_id}';
-                GET DIAGNOSTICS success = ROW_COUNT;
-                
-                IF success THEN
-                  RAISE NOTICE 'Successfully deleted message % from table %', '${message_id}', t;
-                  EXIT;
-                END IF;
-              EXCEPTION WHEN OTHERS THEN
-                RAISE NOTICE 'Error deleting from %: %', t, SQLERRM;
-              END;
-            END LOOP;
-          END $$;
-          SELECT TRUE AS success;
-        `
+              GET DIAGNOSTICS success_count = ROW_COUNT;
+              
+              IF success_count > 0 THEN
+                RAISE NOTICE 'Successfully deleted message from pgmq schema';
+              END IF;
+            EXCEPTION WHEN OTHERS THEN
+              RAISE NOTICE 'Error with pgmq delete: %', SQLERRM;
+            END;
+          END IF;
+          
+          -- Try in public schema if not already successful
+          IF public_exists AND success_count = 0 THEN
+            BEGIN
+              EXECUTE 'DELETE FROM public.pgmq_${queue_name} WHERE msg_id::TEXT = $1 OR id::TEXT = $1'
+                USING '${message_id}';
+              GET DIAGNOSTICS success_count = ROW_COUNT;
+              
+              IF success_count > 0 THEN
+                RAISE NOTICE 'Successfully deleted message from public schema';
+              END IF;
+            EXCEPTION WHEN OTHERS THEN
+              RAISE NOTICE 'Error with public delete: %', SQLERRM;
+            END;
+          END IF;
+          
+          -- Super aggressive mode for stubborn messages
+          IF success_count = 0 AND ${bypass_checks ? 'TRUE' : 'FALSE'} THEN
+            BEGIN
+              -- Try to delete by any means necessary in both schemas
+              IF pgmq_exists THEN
+                EXECUTE 'DELETE FROM pgmq.q_${queue_name} WHERE 
+                  msg_id = ${message_id} OR 
+                  id = ${message_id} OR 
+                  msg_id::TEXT = ''${message_id}'' OR 
+                  id::TEXT = ''${message_id}''';
+              END IF;
+              
+              IF public_exists THEN
+                EXECUTE 'DELETE FROM public.pgmq_${queue_name} WHERE 
+                  msg_id = ${message_id} OR 
+                  id = ${message_id} OR 
+                  msg_id::TEXT = ''${message_id}'' OR 
+                  id::TEXT = ''${message_id}''';
+              END IF;
+            EXCEPTION WHEN OTHERS THEN
+              RAISE NOTICE 'Error with aggressive deletion: %', SQLERRM;
+            END;
+          END IF;
+        END $$;
+        SELECT TRUE AS success;
+      `
+    });
+    
+    if (directError) {
+      console.error("Error with direct SQL deletion:", directError);
+    }
+    
+    // Try visibility timeout reset if deletion didn't work
+    const { data: resetResult, error: resetError } = await supabase.rpc(
+      'cross_schema_queue_op',
+      { 
+        p_queue_name: queue_name, 
+        p_message_id: message_id.toString(),
+        p_operation: 'reset'
       }
     );
-    console.log("Raw SQL deletion result:", rawSqlResult);
     
-    // 2. Try cross-schema operations
-    let crossSchemaResult;
-    try {
-      const { data, error } = await supabase.rpc(
-        'diagnose_queue_tables',
-        { queue_name }
-      );
-      console.log("Cross-schema deletion result:", data);
-      crossSchemaResult = data;
-      
-      if (error) {
-        console.error("Cross-schema operation error:", error);
-      }
-    } catch (crossSchemaError) {
-      console.error("Cross-schema operation error:", crossSchemaError);
+    if (resetError) {
+      console.error("Error with visibility reset:", resetError);
     }
     
-    // 3. Try direct reset if deletion didn't work
-    let crossSchemaReset;
+    // Final check to see if the message still exists
+    let messageExists = true;
     try {
-      const { data, error } = await supabase.rpc(
-        'raw_sql_query',
-        {
-          sql_query: `
-            DO $$
-            DECLARE
-              tables TEXT[] := ARRAY[
-                'pgmq.q_${queue_name}',
-                'public.pgmq_${queue_name}'
-              ];
-              t TEXT;
-              success BOOLEAN := FALSE;
-            BEGIN
-              FOREACH t IN ARRAY tables
-              LOOP
-                BEGIN
-                  EXECUTE format('UPDATE %s SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1', t)
-                  USING '${message_id}';
-                  GET DIAGNOSTICS success = ROW_COUNT;
-                  
-                  IF success THEN
-                    RAISE NOTICE 'Successfully reset message % visibility in table %', '${message_id}', t;
-                    EXIT;
-                  END IF;
-                EXCEPTION WHEN OTHERS THEN
-                  RAISE NOTICE 'Error resetting visibility in %: %', t, SQLERRM;
-                END;
-              END LOOP;
-            END $$;
-            SELECT TRUE AS success;
-          `
-        }
-      );
-      console.log("Cross-schema reset result:", data);
-      crossSchemaReset = data;
+      const { data: checkResult, error: checkError } = await supabase.rpc('raw_sql_query', {
+        sql_query: `
+          SELECT EXISTS (
+            SELECT 1 
+            FROM pgmq.q_${queue_name}
+            WHERE msg_id::TEXT = '${message_id}' OR id::TEXT = '${message_id}'
+          ) OR EXISTS (
+            SELECT 1 
+            FROM public.pgmq_${queue_name}
+            WHERE msg_id::TEXT = '${message_id}' OR id::TEXT = '${message_id}'
+          ) AS still_exists;
+        `
+      });
       
-      if (error) {
-        console.error("Cross-schema reset error:", error);
+      if (!checkError && checkResult) {
+        messageExists = checkResult.still_exists;
       }
-    } catch (resetError) {
-      console.error("Cross-schema reset error:", resetError);
-    }
-    
-    // 4. If bypass_checks is true, try aggressive approach
-    let aggressiveFix = null;
-    if (bypass_checks) {
-      try {
-        const { data } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              DO $$
-              DECLARE
-                tables RECORD;
-              BEGIN
-                FOR tables IN 
-                  SELECT schemaname, tablename 
-                  FROM pg_tables 
-                  WHERE 
-                    (schemaname = 'pgmq' AND tablename LIKE 'q\\_%') OR
-                    (schemaname = 'public' AND tablename LIKE 'pgmq\\_%')
-                LOOP
-                  BEGIN
-                    EXECUTE format(
-                      'DELETE FROM %I.%I WHERE id::TEXT = $1 OR msg_id::TEXT = $1 OR id = $2 OR msg_id = $2', 
-                      tables.schemaname, 
-                      tables.tablename
-                    ) USING '${message_id}', '${message_id}'::BIGINT;
-                  EXCEPTION WHEN OTHERS THEN
-                    NULL; -- ignore errors, keep trying
-                  END;
-                  
-                  BEGIN
-                    EXECUTE format(
-                      'UPDATE %I.%I SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1', 
-                      tables.schemaname, 
-                      tables.tablename
-                    ) USING '${message_id}';
-                  EXCEPTION WHEN OTHERS THEN
-                    NULL; -- ignore errors, keep trying
-                  END;
-                END LOOP;
-              END $$;
-              SELECT TRUE AS success;
-            `
-          }
-        );
-        console.log("Aggressive fix result:", data);
-        aggressiveFix = data;
-      } catch (aggError) {
-        console.error("Aggressive fix error:", aggError);
-      }
+    } catch (checkError) {
+      console.error("Error checking if message still exists:", checkError);
     }
     
     return new Response(
       JSON.stringify({
-        success: true,
-        message: `Attempted all possible deletion methods for message ${message_id} from queue ${queue_name}`,
-        raw_sql: rawSqlResult,
-        cross_schema: crossSchemaResult,
-        reset: crossSchemaReset,
-        aggressive: aggressiveFix,
-        diagnostics: diagData
+        success: deleteResult || directResult?.success,
+        message: `Attempted deletion of message ${message_id} from queue ${queue_name}`,
+        reset: resetResult,
+        message_still_exists: messageExists,
+        direct_result: directResult
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
