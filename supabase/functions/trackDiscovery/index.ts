@@ -9,7 +9,7 @@ import {
   processQueueMessageSafely,
   acquireProcessingLock
 } from "../_shared/queueHelper.ts";
-import { Redis } from '@upstash/redis';
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
 // Initialize Redis client for distributed locking and idempotency
 const redis = new Redis({
