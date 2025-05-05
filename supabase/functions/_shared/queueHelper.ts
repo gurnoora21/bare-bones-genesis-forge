@@ -17,7 +17,25 @@ export async function deleteMessageWithRetries(
     attempts++;
     
     try {
-      // Try using the improved database function first
+      // First attempt: Try using direct RPC with explicit number conversion
+      const numericalId = parseInt(messageId, 10);
+      if (!isNaN(numericalId)) {
+        const { data, error } = await supabase.rpc(
+          'pg_delete_message',
+          { 
+            queue_name: queueName, 
+            message_id: numericalId.toString() 
+          }
+        );
+        
+        if (!error && data === true) {
+          console.log(`Successfully deleted message ${messageId} from ${queueName} using numerical ID`);
+          deleted = true;
+          break;
+        }
+      }
+      
+      // Second attempt: Try with string ID format
       const { data, error } = await supabase.rpc(
         'pg_delete_message',
         { 
@@ -36,32 +54,31 @@ export async function deleteMessageWithRetries(
         console.warn(`Delete attempt ${attempts} returned false for message ${messageId}`);
       }
 
-      // If the first method failed and this isn't the last attempt, try the Edge Function approach
-      if (!deleted && attempts < maxRetries) {
-        const deleteResponse = await fetch(
-          `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-            },
-            body: JSON.stringify({ queue_name: queueName, message_id: messageId })
+      // Third attempt: Try direct deletion with Edge Function
+      if (!deleted) {
+        try {
+          const deleteResponse = await fetch(
+            `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+              },
+              body: JSON.stringify({ queue_name: queueName, message_id: messageId })
+            }
+          );
+          
+          if (deleteResponse.ok) {
+            const result = await deleteResponse.json();
+            if (result.success) {
+              console.log(`Successfully deleted message ${messageId} via Edge Function (attempt ${attempts})`);
+              deleted = true;
+              break;
+            }
           }
-        );
-        
-        if (deleteResponse.ok) {
-          const result = await deleteResponse.json();
-          if (result.success) {
-            console.log(`Successfully deleted message ${messageId} via Edge Function (attempt ${attempts})`);
-            deleted = true;
-            break;
-          } else if (result.reset) {
-            console.log(`Reset visibility timeout for message ${messageId} (attempt ${attempts})`);
-            // We'll consider this a success in terms of handling the message
-            deleted = true;
-            break;
-          }
+        } catch (fetchError) {
+          console.error(`Fetch error during deletion attempt ${attempts}:`, fetchError);
         }
       }
       
@@ -109,5 +126,75 @@ export async function logWorkerIssue(
     console.error(`[${workerName}] ${issueType}: ${message}`);
   } catch (error) {
     console.error("Failed to log worker issue:", error);
+  }
+}
+
+// Helper function to check if a track has been processed
+export async function checkTrackProcessed(
+  supabase: any,
+  trackId: string,
+  processingType: string
+): Promise<boolean> {
+  try {
+    // Check if this track has already been processed for producers
+    const { data, error } = await supabase
+      .from('track_producers')
+      .select('track_id')
+      .eq('track_id', trackId)
+      .limit(1);
+      
+    if (error) {
+      console.error(`Error checking if track ${trackId} was processed:`, error);
+      return false;
+    }
+    
+    // If we found any producers, this track was already processed
+    const alreadyProcessed = data && data.length > 0;
+    
+    if (alreadyProcessed) {
+      console.log(`Track ${trackId} already has producers identified, skipping`);
+    }
+    
+    return alreadyProcessed;
+  } catch (error) {
+    console.error(`Error in checkTrackProcessed for ${trackId}:`, error);
+    return false;
+  }
+}
+
+// Helper to safely process queue messages with idempotency
+export async function processQueueMessageSafely(
+  supabase: any,
+  queueName: string,
+  messageId: string,
+  processFn: () => Promise<any>,
+  idempotencyKey?: string,
+  idempotencyCheckFn?: () => Promise<boolean>
+): Promise<boolean> {
+  // Check for idempotency if provided
+  if (idempotencyCheckFn) {
+    try {
+      const alreadyProcessed = await idempotencyCheckFn();
+      if (alreadyProcessed) {
+        // Already processed this item, just delete the message
+        await deleteMessageWithRetries(supabase, queueName, messageId);
+        return true;
+      }
+    } catch (error) {
+      console.error(`Idempotency check failed:`, error);
+      // Continue processing as normal
+    }
+  }
+  
+  try {
+    // Process the message
+    await processFn();
+    
+    // Delete the message after successful processing
+    const deleted = await deleteMessageWithRetries(supabase, queueName, messageId);
+    return deleted;
+  } catch (error) {
+    console.error(`Error processing message ${messageId} from queue ${queueName}:`, error);
+    return false;
   }
 }

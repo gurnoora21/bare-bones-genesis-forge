@@ -2,7 +2,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { GeniusClient } from "../_shared/geniusClient.ts";
-import { deleteMessageWithRetries, logWorkerIssue } from "../_shared/queueHelper.ts";
+import { 
+  deleteMessageWithRetries, 
+  logWorkerIssue,
+  checkTrackProcessed,
+  processQueueMessageSafely
+} from "../_shared/queueHelper.ts";
 
 interface ProducerIdentificationMsg {
   trackId: string;
@@ -63,19 +68,22 @@ serve(async (req) => {
       
     const messageId = message.id;
     
-    try {
-      await identifyProducers(supabase, geniusClient, msg);
-      // Archive processed message
-      await deleteMessageWithRetries(supabase, "producer_identification", messageId.toString());
-      console.log(`Successfully processed producer identification message ${messageId}`);
-    } catch (error) {
-      console.error(`Error processing producer identification message ${messageId}:`, error);
-      // Message will return to queue after visibility timeout
-    }
+    // Use our safer processing function with idempotency check
+    await processQueueMessageSafely(
+      supabase,
+      "producer_identification",
+      messageId.toString(),
+      async () => await identifyProducers(supabase, geniusClient, msg),
+      msg.trackId,
+      async () => await checkTrackProcessed(supabase, msg.trackId, "producer_identification")
+    );
   });
 
   // Wait for all background tasks in a background process
-  EdgeRuntime.waitUntil(Promise.all(promises));
+  EdgeRuntime.waitUntil(Promise.all(promises).catch(err => {
+    console.error("Error in background processing:", err);
+    return [];
+  }));
   
   return new Response(JSON.stringify({ 
     processed: messages.length,
@@ -89,6 +97,12 @@ async function identifyProducers(
   msg: ProducerIdentificationMsg
 ) {
   const { trackId, trackName, albumId, artistId } = msg;
+  
+  // Quick check if track has already been processed
+  const alreadyProcessed = await checkTrackProcessed(supabase, trackId, "producer_identification");
+  if (alreadyProcessed) {
+    return { skipped: true };
+  }
   
   // Get track details from database
   const { data: trackData, error: trackError } = await supabase
@@ -246,16 +260,20 @@ async function identifyProducers(
 
     // If producer hasn't been enriched yet, enqueue social enrichment
     if (!dbProducer.enriched_at && !dbProducer.enrichment_failed) {
-      await supabase.functions.invoke("sendToQueue", {
-        body: {
-          queue_name: "social_enrichment",
-          message: { 
-            producerId: dbProducer.id,
-            producerName: producer.name
+      try {
+        await supabase.functions.invoke("sendToQueue", {
+          body: {
+            queue_name: "social_enrichment",
+            message: { 
+              producerId: dbProducer.id,
+              producerName: producer.name
+            }
           }
-        }
-      });
-      console.log(`Enqueued social enrichment for producer ${producer.name}`);
+        });
+        console.log(`Enqueued social enrichment for producer ${producer.name}`);
+      } catch (enqueueError) {
+        console.error(`Error enqueueing social enrichment for ${producer.name}:`, enqueueError);
+      }
     }
   }
 }
