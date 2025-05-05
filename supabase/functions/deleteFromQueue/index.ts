@@ -31,8 +31,10 @@ serve(async (req) => {
     
     // Rate limiting to prevent overloading the database
     const rateLimitKey = `ratelimit:deleteFromQueue`;
+    let requestCount = 1;
+    
     try {
-      const requestCount = await redis.incr(rateLimitKey);
+      requestCount = await redis.incr(rateLimitKey);
       if (requestCount === 1) {
         await redis.expire(rateLimitKey, 1); // 1 second TTL
       }
@@ -59,25 +61,43 @@ serve(async (req) => {
       console.warn("Redis rate limiting failed:", redisError);
     }
     
+    // Check idempotency - if we've already deleted this message successfully
+    try {
+      const deletedKey = `deleted:${queue_name}:${message_id}`;
+      const alreadyDeleted = await redis.exists(deletedKey);
+      
+      if (alreadyDeleted === 1) {
+        console.log(`Message ${message_id} was already deleted previously, returning success`);
+        return new Response(
+          JSON.stringify({ 
+            success: true, 
+            message: `Message ${message_id} already handled`, 
+            idempotent: true 
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    } catch (redisError) {
+      // Continue if Redis fails, idempotency check is not critical
+      console.warn("Redis idempotency check failed:", redisError);
+    }
+    
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
     
-    // Try multiple approaches to ensure deletion works
-    let success = false;
-    let attempts = 0;
-    const maxAttempts = 3;
-    
     // Add distributed lock to prevent concurrent attempts for the same message
     const lockKey = `delete_lock:${queue_name}:${message_id}`;
+    let lockAcquired = false;
+    
     try {
-      const lockAcquired = await redis.set(lockKey, "true", {
+      lockAcquired = await redis.set(lockKey, "true", {
         nx: true, // Only set if not exists
         ex: 30 // 30 second expiration
-      });
+      }) === 'OK';
       
-      if (lockAcquired !== 'OK') {
+      if (!lockAcquired) {
         console.log(`Another process is already trying to delete message ${message_id}, skipping`);
         return new Response(
           JSON.stringify({ 
@@ -92,83 +112,107 @@ serve(async (req) => {
       console.warn("Redis lock acquisition failed:", redisError);
     }
     
+    // Try multiple approaches with retries to ensure deletion works
+    let success = false;
+    let attempts = 0;
+    const maxAttempts = 3;
+    let deletionMethod = 'none';
+    
     while (!success && attempts < maxAttempts) {
       attempts++;
       
-      // Attempt 1: Try as numeric ID
-      if (attempts === 1) {
-        try {
-          const numericId = parseInt(message_id.toString(), 10);
-          if (!isNaN(numericId)) {
+      // Try different deletion methods in sequence
+      try {
+        // Attempt 1: Try using pg_delete_message RPC with message_id as numeric
+        if (!success && attempts <= maxAttempts) {
+          try {
+            const numericId = parseInt(message_id.toString(), 10);
+            
+            if (!isNaN(numericId)) {
+              const { data, error } = await supabase.rpc(
+                'pg_delete_message',
+                { 
+                  queue_name,
+                  message_id: numericId.toString() 
+                }
+              );
+              
+              if (!error && data === true) {
+                console.log(`Successfully deleted message ${message_id} using numeric ID (attempt ${attempts})`);
+                success = true;
+                deletionMethod = 'numeric_id';
+                break;
+              } else if (error) {
+                console.error(`Numeric ID deletion error (attempt ${attempts}):`, error);
+              }
+            }
+          } catch (e) {
+            console.error(`Exception in numeric deletion attempt ${attempts}:`, e);
+          }
+        }
+        
+        // Attempt 2: Try using pg_delete_message RPC with message_id as string
+        if (!success && attempts <= maxAttempts) {
+          try {
             const { data, error } = await supabase.rpc(
               'pg_delete_message',
               { 
                 queue_name,
-                message_id: numericId.toString() 
+                message_id: message_id.toString() 
               }
             );
             
             if (!error && data === true) {
-              console.log(`Successfully deleted message ${message_id} using numeric ID`);
+              console.log(`Successfully deleted message ${message_id} using string ID (attempt ${attempts})`);
               success = true;
+              deletionMethod = 'string_id';
               break;
+            } else if (error) {
+              console.error(`String ID deletion error (attempt ${attempts}):`, error);
             }
+          } catch (e) {
+            console.error(`Exception in string deletion attempt ${attempts}:`, e);
           }
-        } catch (e) {
-          console.error("Error with numeric ID deletion:", e);
         }
-      }
-      
-      // Attempt 2: Try as string ID
-      if (attempts === 2) {
-        try {
-          const { data, error } = await supabase.rpc(
-            'pg_delete_message',
-            { 
-              queue_name,
-              message_id: message_id.toString() 
+        
+        // Attempt 3: Try cross-schema operation as last resort
+        if (!success && attempts === maxAttempts) {
+          try {
+            const { data, error } = await supabase.rpc('cross_schema_queue_op', {
+              p_queue_name: queue_name,
+              p_message_id: message_id.toString(),
+              p_operation: 'delete'
+            });
+            
+            if (!error && data === true) {
+              console.log(`Successfully deleted message ${message_id} using cross-schema operation`);
+              success = true;
+              deletionMethod = 'cross_schema';
+              break;
+            } else if (error) {
+              console.error(`Cross-schema deletion error:`, error);
             }
-          );
-          
-          if (!error && data === true) {
-            console.log(`Successfully deleted message ${message_id} using string ID`);
-            success = true;
-            break;
+          } catch (e) {
+            console.error(`Exception in cross-schema deletion:`, e);
           }
-        } catch (e) {
-          console.error("Error with string ID deletion:", e);
         }
+      } catch (attemptError) {
+        console.error(`General error in deletion attempt ${attempts}:`, attemptError);
       }
       
-      // Attempt 3: Try direct SQL as a last resort
-      if (attempts === 3) {
-        try {
-          // Try to delete directly using SQL
-          const { data, error } = await supabase.rpc('cross_schema_queue_op', {
-            p_queue_name: queue_name,
-            p_message_id: message_id.toString(),
-            p_operation: 'delete'
-          });
-          
-          if (!error && data === true) {
-            console.log(`Successfully deleted message ${message_id} using cross-schema operation`);
-            success = true;
-            break;
-          }
-        } catch (e) {
-          console.error("Error with cross-schema deletion:", e);
-        }
-      }
-      
-      // Wait before retrying
+      // Wait before retrying with exponential backoff
       if (!success && attempts < maxAttempts) {
-        await new Promise(resolve => setTimeout(resolve, 100 * attempts));
+        const backoffMs = Math.min(100 * Math.pow(2, attempts), 2000);
+        const jitterMs = Math.floor(Math.random() * 100);
+        await new Promise(resolve => setTimeout(resolve, backoffMs + jitterMs));
       }
     }
     
     // If we couldn't delete, try to reset visibility timeout as a fallback
     if (!success) {
       try {
+        console.log(`Failed to delete message ${message_id} after ${maxAttempts} attempts, trying visibility reset`);
+        
         const { data: resetData, error: resetError } = await supabase.rpc(
           'reset_stuck_message',
           { 
@@ -182,6 +226,7 @@ serve(async (req) => {
         } else if (resetData === true) {
           console.log(`Reset visibility timeout for message ${message_id}`);
           success = true;
+          deletionMethod = 'visibility_reset';
         }
       } catch (resetError) {
         console.error("Error trying to reset visibility timeout:", resetError);
@@ -190,7 +235,9 @@ serve(async (req) => {
     
     // Release the lock regardless of outcome
     try {
-      await redis.del(lockKey);
+      if (lockAcquired) {
+        await redis.del(lockKey);
+      }
     } catch (redisError) {
       console.warn("Failed to release Redis lock:", redisError);
     }
@@ -200,12 +247,28 @@ serve(async (req) => {
       try {
         const deletedKey = `deleted:${queue_name}:${message_id}`;
         await redis.set(deletedKey, 'true', { ex: 86400 }); // 24 hour TTL
+        
+        // Also set a metadata entry with details about how it was deleted
+        await redis.set(
+          `deleted_meta:${queue_name}:${message_id}`, 
+          JSON.stringify({
+            method: deletionMethod,
+            timestamp: Date.now(),
+            attempts
+          }), 
+          { ex: 86400 }
+        );
       } catch (redisError) {
         console.warn("Failed to track deleted message in Redis:", redisError);
       }
       
       return new Response(
-        JSON.stringify({ success: true, message: `Message ${message_id} handled successfully` }),
+        JSON.stringify({ 
+          success: true, 
+          message: `Message ${message_id} deleted successfully`,
+          method: deletionMethod,
+          attempts
+        }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     } else {
@@ -233,6 +296,24 @@ serve(async (req) => {
           const forceResult = await forceDeleteResponse.json();
           if (forceResult.success) {
             console.log(`Successfully force-deleted message ${message_id}`);
+            
+            // Track successful force deletion in Redis for idempotency
+            try {
+              const deletedKey = `deleted:${queue_name}:${message_id}`;
+              await redis.set(deletedKey, 'true', { ex: 86400 }); // 24 hour TTL
+              await redis.set(
+                `deleted_meta:${queue_name}:${message_id}`, 
+                JSON.stringify({
+                  method: 'force_delete',
+                  timestamp: Date.now(),
+                  attempts: attempts + 1
+                }), 
+                { ex: 86400 }
+              );
+            } catch (redisError) {
+              console.warn("Failed to track force-deleted message in Redis:", redisError);
+            }
+            
             return new Response(
               JSON.stringify({ 
                 success: true, 
@@ -250,7 +331,7 @@ serve(async (req) => {
       return new Response(
         JSON.stringify({ 
           success: false, 
-          message: `Failed to handle message ${message_id} after ${maxAttempts} attempts` 
+          message: `Failed to handle message ${message_id} after all attempts` 
         }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );

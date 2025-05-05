@@ -1,3 +1,4 @@
+
 // Helper functions for queue operations
 
 import { Redis } from '@upstash/redis';
@@ -17,6 +18,20 @@ export async function deleteMessageWithRetries(
 ): Promise<boolean> {
   console.log(`Attempting to delete message ${messageId} from queue ${queueName} with up to ${maxRetries} retries`);
   
+  // Check if already deleted (idempotency)
+  try {
+    const deletedKey = `deleted:${queueName}:${messageId}`;
+    const alreadyDeleted = await redis.exists(deletedKey);
+    
+    if (alreadyDeleted === 1) {
+      console.log(`Message ${messageId} was already deleted previously, skipping`);
+      return true;
+    }
+  } catch (redisError) {
+    // Continue if Redis fails, idempotency check is not critical
+    console.warn(`Redis idempotency check failed for message ${messageId}:`, redisError);
+  }
+  
   let deleted = false;
   let attempts = 0;
   
@@ -32,6 +47,15 @@ export async function deleteMessageWithRetries(
     
     if (deleteResult?.data?.success) {
       console.log(`Successfully force-deleted message ${messageId} from ${queueName}`);
+      
+      // Mark as deleted in Redis for idempotency
+      try {
+        const deletedKey = `deleted:${queueName}:${messageId}`;
+        await redis.set(deletedKey, 'true', { ex: 86400 }); // 24 hour TTL
+      } catch (redisError) {
+        console.warn(`Failed to mark message ${messageId} as deleted in Redis:`, redisError);
+      }
+      
       return true;
     }
   } catch (e) {
@@ -54,6 +78,15 @@ export async function deleteMessageWithRetries(
       if (!error && data === true) {
         console.log(`Successfully deleted message ${messageId} from ${queueName} via RPC (attempt ${attempts})`);
         deleted = true;
+        
+        // Mark as deleted in Redis for idempotency
+        try {
+          const deletedKey = `deleted:${queueName}:${messageId}`;
+          await redis.set(deletedKey, 'true', { ex: 86400 }); // 24 hour TTL
+        } catch (redisError) {
+          console.warn(`Failed to mark message ${messageId} as deleted in Redis:`, redisError);
+        }
+        
         break;
       } else if (error) {
         console.error(`Delete attempt ${attempts} failed with RPC error:`, error);
@@ -89,7 +122,7 @@ export async function deleteMessageWithRetries(
       
       // Wait before retrying (exponential backoff with jitter)
       if (!deleted && attempts < maxRetries) {
-        const baseDelay = Math.pow(2, attempts) * 100;
+        const baseDelay = Math.min(Math.pow(2, attempts) * 100, 2000);
         const jitter = Math.floor(Math.random() * 100);
         const delayMs = baseDelay + jitter;
         await new Promise(resolve => setTimeout(resolve, delayMs));
@@ -99,7 +132,7 @@ export async function deleteMessageWithRetries(
       
       // Wait before retrying
       if (attempts < maxRetries) {
-        const delayMs = Math.pow(2, attempts) * 100;
+        const delayMs = Math.min(Math.pow(2, attempts) * 100, 2000); 
         await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     }
@@ -178,17 +211,21 @@ export async function checkEntityProcessed(
   entityId: string,
   processingType: string
 ): Promise<boolean> {
+  // First check in Redis cache for faster lookups
   try {
-    // Attempt to get a lock first to prevent race conditions
-    const hasLock = await acquireProcessingLock(`${entityType}:${processingType}`, entityId);
-    if (!hasLock) {
-      console.log(`Entity ${entityType} ${entityId} is currently being processed for ${processingType}, skipping`);
+    const processedKey = `processed:${entityType}:${processingType}:${entityId}`;
+    const exists = await redis.exists(processedKey);
+    
+    if (exists === 1) {
+      console.log(`Entity ${entityType} ${entityId} was already processed for ${processingType} (Redis cache hit)`);
       return true;
     }
-    
-    // General query function based on entity type
-    let query;
-    
+  } catch (error) {
+    // Continue to database check if Redis fails
+    console.warn(`Redis check failed for ${entityType} ${entityId}:`, error);
+  }
+  
+  try {
     if (entityType === 'track' && processingType === 'producer_identification') {
       // Check if this track has already been processed for producers
       const { data, error } = await supabase
@@ -207,12 +244,43 @@ export async function checkEntityProcessed(
       
       if (alreadyProcessed) {
         console.log(`Track ${entityId} already has producers identified, skipping`);
+        
+        // Cache this result in Redis for faster future lookups
+        try {
+          const processedKey = `processed:track:producer_identification:${entityId}`;
+          await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+        } catch (redisError) {
+          console.warn(`Failed to cache processed status for track ${entityId}:`, redisError);
+        }
       }
       
       return alreadyProcessed;
     }
     
-    // Other entity types can be implemented here with specific checks
+    // Album tracks processing check
+    if (entityType === 'album' && processingType === 'track_discovery') {
+      const { data: albumData, error } = await supabase
+        .from('tracks')
+        .select('id')
+        .eq('album_id', entityId)
+        .limit(1);
+        
+      const alreadyProcessed = albumData && albumData.length > 0;
+      
+      if (alreadyProcessed) {
+        console.log(`Album ${entityId} already has tracks discovered, skipping`);
+        
+        // Cache this result in Redis for faster future lookups
+        try {
+          const processedKey = `processed:album:track_discovery:${entityId}`;
+          await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+        } catch (redisError) {
+          console.warn(`Failed to cache processed status for album ${entityId}:`, redisError);
+        }
+      }
+      
+      return alreadyProcessed;
+    }
     
     return false;
   } catch (error) {
@@ -238,9 +306,10 @@ export async function processQueueMessageSafely(
   processFn: () => Promise<any>,
   idempotencyKey?: string,
   idempotencyCheckFn?: () => Promise<boolean>,
-  options: { maxRetries?: number; circuitBreaker?: boolean } = {}
+  options: { maxRetries?: number; circuitBreaker?: boolean; lockTimeout?: number } = {}
 ): Promise<boolean> {
   const maxRetries = options.maxRetries || 3;
+  const lockTimeout = options.lockTimeout || 300; // 5 minutes default
   let retries = 0;
   let success = false;
   
@@ -252,6 +321,7 @@ export async function processQueueMessageSafely(
       
       if (circuitStatus === 'open') {
         console.log(`Circuit breaker open for queue ${queueName}, skipping processing`);
+        // Don't delete the message, just return false to indicate failure
         return false;
       }
       
@@ -281,6 +351,25 @@ export async function processQueueMessageSafely(
     }
   }
   
+  // Combine queue name and message ID for locking
+  const processingLockKey = `processing:${queueName}:${messageId}`;
+  
+  // Try to acquire a distributed lock for this message
+  try {
+    const lockAcquired = await redis.set(processingLockKey, Date.now().toString(), {
+      nx: true,
+      ex: lockTimeout
+    });
+    
+    if (lockAcquired !== 'OK') {
+      console.log(`Message ${messageId} is already being processed, skipping`);
+      return true; // Return true since another process is handling it
+    }
+  } catch (redisError) {
+    // Continue if Redis fails, locking is not critical
+    console.warn(`Redis lock acquisition failed for message ${messageId}:`, redisError);
+  }
+  
   // If an idempotency key is provided, check Redis first for faster lookups
   if (idempotencyKey) {
     try {
@@ -290,6 +379,14 @@ export async function processQueueMessageSafely(
       if (alreadyProcessed) {
         console.log(`Idempotency check via Redis passed: ${idempotencyKey} already processed`);
         await deleteMessageWithRetries(supabase, queueName, messageId);
+        
+        // Release the lock
+        try {
+          await redis.del(processingLockKey);
+        } catch (redisError) {
+          console.warn(`Failed to release processing lock for ${messageId}:`, redisError);
+        }
+        
         return true;
       }
     } catch (redisError) {
@@ -306,6 +403,14 @@ export async function processQueueMessageSafely(
         console.log(`Idempotency check passed: item already processed`);
         // Delete the message after confirming it was already processed
         await deleteMessageWithRetries(supabase, queueName, messageId);
+        
+        // Release the lock
+        try {
+          await redis.del(processingLockKey);
+        } catch (redisError) {
+          console.warn(`Failed to release processing lock for ${messageId}:`, redisError);
+        }
+        
         return true;
       }
     } catch (error) {
@@ -344,14 +449,22 @@ export async function processQueueMessageSafely(
         }
       }
       
+      // Release the lock
+      try {
+        await redis.del(processingLockKey);
+      } catch (redisError) {
+        console.warn(`Failed to release processing lock for ${messageId}:`, redisError);
+      }
+      
+      success = deleted;
       return deleted;
     } catch (error) {
       retries++;
       console.error(`Error processing message ${messageId} from queue ${queueName} (attempt ${retries}/${maxRetries}):`, error);
       
       if (retries <= maxRetries) {
-        // Exponential backoff between retries
-        const delay = Math.pow(2, retries) * 100;
+        // Exponential backoff between retries with cap
+        const delay = Math.min(Math.pow(2, retries) * 100, 2000);
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
         // Log the issue if all retries failed
@@ -366,9 +479,37 @@ export async function processQueueMessageSafely(
             messageId
           }
         );
+        
+        // Release the lock
+        try {
+          await redis.del(processingLockKey);
+        } catch (redisError) {
+          console.warn(`Failed to release processing lock for ${messageId}:`, redisError);
+        }
       }
     }
   }
   
   return false;
+}
+
+// Enhanced function to track processing state of entities
+export async function trackProcessingState(
+  entityType: string,
+  entityId: string,
+  state: 'started' | 'completed' | 'failed',
+  details: any = {}
+): Promise<void> {
+  try {
+    const stateKey = `state:${entityType}:${entityId}`;
+    const stateData = {
+      state,
+      timestamp: Date.now(),
+      details
+    };
+    
+    await redis.set(stateKey, JSON.stringify(stateData), { ex: 86400 }); // 24 hour TTL
+  } catch (error) {
+    console.warn(`Failed to track processing state for ${entityType} ${entityId}:`, error);
+  }
 }
