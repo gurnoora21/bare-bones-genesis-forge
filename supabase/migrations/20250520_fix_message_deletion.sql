@@ -125,29 +125,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Create a function to get all queue tables
-CREATE OR REPLACE FUNCTION public.get_all_queue_tables()
-RETURNS TABLE (
-  schema_name TEXT,
-  table_name TEXT,
-  full_name TEXT
-) AS $$
-BEGIN
-  RETURN QUERY
-  SELECT 
-    table_schema::TEXT AS schema_name,
-    table_name::TEXT,
-    (table_schema || '.' || table_name)::TEXT AS full_name
-  FROM 
-    information_schema.tables
-  WHERE 
-    (table_name LIKE 'q\_%' OR table_name LIKE 'pgmq\_%')
-    AND table_type = 'BASE TABLE'
-  ORDER BY 
-    table_schema, table_name;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
 -- Set up improved auto queue monitoring
 DO $$
 BEGIN

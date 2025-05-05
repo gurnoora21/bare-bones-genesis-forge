@@ -1,6 +1,8 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { GeniusClient } from "../_shared/geniusClient.ts";
+import { deleteMessageWithRetries, logWorkerIssue } from "../_shared/queueHelper.ts";
 
 interface ProducerIdentificationMsg {
   trackId: string;
@@ -64,9 +66,7 @@ serve(async (req) => {
     try {
       await identifyProducers(supabase, geniusClient, msg);
       // Archive processed message
-      await supabase.functions.invoke("deleteFromQueue", {
-        body: { queue_name: "producer_identification", message_id: messageId }
-      });
+      await deleteMessageWithRetries(supabase, "producer_identification", messageId.toString());
       console.log(`Successfully processed producer identification message ${messageId}`);
     } catch (error) {
       console.error(`Error processing producer identification message ${messageId}:`, error);
