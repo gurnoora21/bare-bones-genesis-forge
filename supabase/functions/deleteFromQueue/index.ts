@@ -1,7 +1,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { Redis } from '@upstash/redis';
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
 // Initialize Redis client for distributed locks and rate limiting
 const redis = new Redis({
