@@ -4,7 +4,7 @@
  * with fallbacks for resilience
  */
 
-import { Redis } from "https://deno.land/x/upstash_redis@v1.20.2/mod.ts";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { MemoryCache } from "./memoryCache.ts";
 
 export class EnhancedRedisClient {

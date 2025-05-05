@@ -1,7 +1,7 @@
 
 // Helper functions for queue operations
 
-import { Redis } from '@upstash/redis';
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
 // Initialize Redis client for distributed locking and caching
 const redis = new Redis({
