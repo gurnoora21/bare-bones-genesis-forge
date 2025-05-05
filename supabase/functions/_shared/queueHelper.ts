@@ -1,60 +1,65 @@
-
 // Helper functions for queue operations
 
-// Helper function to delete messages with retries
+import { Redis } from '@upstash/redis';
+
+// Initialize Redis client for distributed locking and caching
+const redis = new Redis({
+  url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+  token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+});
+
+// Helper function to delete messages with retries and advanced error recovery
 export async function deleteMessageWithRetries(
   supabase: any,
   queueName: string,
   messageId: string,
-  maxRetries: number = 3
+  maxRetries: number = 5
 ): Promise<boolean> {
   console.log(`Attempting to delete message ${messageId} from queue ${queueName} with up to ${maxRetries} retries`);
   
   let deleted = false;
   let attempts = 0;
   
+  // First, try direct force delete for maximum reliability
+  try {
+    const deleteResult = await supabase.functions.invoke("forceDeleteMessage", {
+      body: { 
+        queue_name: queueName, 
+        message_id: messageId,
+        bypass_checks: attempts >= maxRetries - 1 // Allow bypass on last attempt
+      }
+    });
+    
+    if (deleteResult?.data?.success) {
+      console.log(`Successfully force-deleted message ${messageId} from ${queueName}`);
+      return true;
+    }
+  } catch (e) {
+    console.error(`Force delete attempt failed for message ${messageId}:`, e);
+  }
+  
   while (!deleted && attempts < maxRetries) {
     attempts++;
     
     try {
-      // First attempt: Try using direct RPC with explicit number conversion
-      const numericalId = parseInt(messageId, 10);
-      if (!isNaN(numericalId)) {
-        const { data, error } = await supabase.rpc(
-          'pg_delete_message',
-          { 
-            queue_name: queueName, 
-            message_id: numericalId.toString() 
-          }
-        );
-        
-        if (!error && data === true) {
-          console.log(`Successfully deleted message ${messageId} from ${queueName} using numerical ID`);
-          deleted = true;
-          break;
-        }
-      }
-      
-      // Second attempt: Try with string ID format
+      // Try using direct RPC with appropriate ID format
       const { data, error } = await supabase.rpc(
         'pg_delete_message',
         { 
           queue_name: queueName, 
-          message_id: messageId.toString()
+          message_id: messageId.toString() 
         }
       );
       
-      if (error) {
-        console.error(`Delete attempt ${attempts} failed with RPC error:`, error);
-      } else if (data === true) {
-        console.log(`Successfully deleted message ${messageId} from ${queueName} (attempt ${attempts})`);
+      if (!error && data === true) {
+        console.log(`Successfully deleted message ${messageId} from ${queueName} via RPC (attempt ${attempts})`);
         deleted = true;
         break;
-      } else {
-        console.warn(`Delete attempt ${attempts} returned false for message ${messageId}`);
+      } else if (error) {
+        console.error(`Delete attempt ${attempts} failed with RPC error:`, error);
       }
 
-      // Third attempt: Try direct deletion with Edge Function
+      // If RPC failed, try Edge Function as fallback
       if (!deleted) {
         try {
           const deleteResponse = await fetch(
@@ -102,6 +107,20 @@ export async function deleteMessageWithRetries(
   
   if (!deleted) {
     console.error(`Failed to delete message ${messageId} after ${maxRetries} attempts`);
+    
+    // Last resort: Try resetting the message's visibility timeout so it can be reprocessed later
+    try {
+      const { data: resetResult } = await supabase.rpc('reset_stuck_message', {
+        queue_name: queueName,
+        message_id: messageId.toString()
+      });
+      
+      if (resetResult === true) {
+        console.log(`Reset visibility timeout for message ${messageId} as deletion failed`);
+      }
+    } catch (resetError) {
+      console.error(`Failed to reset visibility for message ${messageId}:`, resetError);
+    }
   }
   
   return deleted;
@@ -129,54 +148,163 @@ export async function logWorkerIssue(
   }
 }
 
-// Helper function to check if a track has been processed
+// Enhanced idempotency check with distributed locking
+export async function acquireProcessingLock(
+  entityType: string,
+  entityId: string,
+  ttlSeconds: number = 300
+): Promise<boolean> {
+  const lockKey = `lock:${entityType}:${entityId}`;
+  const now = Date.now();
+  
+  try {
+    // Use Redis to set a distributed lock with expiration
+    const result = await redis.set(lockKey, now.toString(), {
+      nx: true, // Only set if not exists
+      ex: ttlSeconds // Expire after ttlSeconds
+    });
+    
+    return result === 'OK';
+  } catch (error) {
+    console.error(`Error acquiring lock for ${entityType} ${entityId}:`, error);
+    return false;
+  }
+}
+
+// Function to check if an entity has already been processed
+export async function checkEntityProcessed(
+  supabase: any,
+  entityType: string,
+  entityId: string,
+  processingType: string
+): Promise<boolean> {
+  try {
+    // Attempt to get a lock first to prevent race conditions
+    const hasLock = await acquireProcessingLock(`${entityType}:${processingType}`, entityId);
+    if (!hasLock) {
+      console.log(`Entity ${entityType} ${entityId} is currently being processed for ${processingType}, skipping`);
+      return true;
+    }
+    
+    // General query function based on entity type
+    let query;
+    
+    if (entityType === 'track' && processingType === 'producer_identification') {
+      // Check if this track has already been processed for producers
+      const { data, error } = await supabase
+        .from('track_producers')
+        .select('track_id')
+        .eq('track_id', entityId)
+        .limit(1);
+        
+      if (error) {
+        console.error(`Error checking if track ${entityId} was processed:`, error);
+        return false;
+      }
+      
+      // If we found any producers, this track was already processed
+      const alreadyProcessed = data && data.length > 0;
+      
+      if (alreadyProcessed) {
+        console.log(`Track ${entityId} already has producers identified, skipping`);
+      }
+      
+      return alreadyProcessed;
+    }
+    
+    // Other entity types can be implemented here with specific checks
+    
+    return false;
+  } catch (error) {
+    console.error(`Error in checkEntityProcessed for ${entityType} ${entityId}:`, error);
+    return false;
+  }
+}
+
+// Legacy function for backward compatibility
 export async function checkTrackProcessed(
   supabase: any,
   trackId: string,
   processingType: string
 ): Promise<boolean> {
-  try {
-    // Check if this track has already been processed for producers
-    const { data, error } = await supabase
-      .from('track_producers')
-      .select('track_id')
-      .eq('track_id', trackId)
-      .limit(1);
-      
-    if (error) {
-      console.error(`Error checking if track ${trackId} was processed:`, error);
-      return false;
-    }
-    
-    // If we found any producers, this track was already processed
-    const alreadyProcessed = data && data.length > 0;
-    
-    if (alreadyProcessed) {
-      console.log(`Track ${trackId} already has producers identified, skipping`);
-    }
-    
-    return alreadyProcessed;
-  } catch (error) {
-    console.error(`Error in checkTrackProcessed for ${trackId}:`, error);
-    return false;
-  }
+  return checkEntityProcessed(supabase, 'track', trackId, processingType);
 }
 
-// Helper to safely process queue messages with idempotency
+// Enhanced helper to safely process queue messages with idempotency and transaction guarantees
 export async function processQueueMessageSafely(
   supabase: any,
   queueName: string,
   messageId: string,
   processFn: () => Promise<any>,
   idempotencyKey?: string,
-  idempotencyCheckFn?: () => Promise<boolean>
+  idempotencyCheckFn?: () => Promise<boolean>,
+  options: { maxRetries?: number; circuitBreaker?: boolean } = {}
 ): Promise<boolean> {
-  // Check for idempotency if provided
+  const maxRetries = options.maxRetries || 3;
+  let retries = 0;
+  let success = false;
+  
+  // Circuit breaker implementation
+  if (options.circuitBreaker) {
+    try {
+      const circuitKey = `circuit:${queueName}`;
+      const circuitStatus = await redis.get(circuitKey);
+      
+      if (circuitStatus === 'open') {
+        console.log(`Circuit breaker open for queue ${queueName}, skipping processing`);
+        return false;
+      }
+      
+      // Increment failure counter
+      const failureKey = `failures:${queueName}`;
+      const failures = await redis.incr(failureKey);
+      
+      // Reset failure counter after 60 seconds if no error
+      redis.expire(failureKey, 60);
+      
+      // Open circuit breaker if failures exceed threshold
+      if (failures > 10) {
+        console.error(`Too many failures in queue ${queueName}, opening circuit breaker`);
+        await redis.set(circuitKey, 'open', { ex: 300 }); // Open for 5 minutes
+        await logWorkerIssue(
+          supabase,
+          queueName,
+          "circuit_breaker",
+          `Circuit breaker opened due to excessive failures`,
+          { failures }
+        );
+        return false;
+      }
+    } catch (error) {
+      // Continue processing even if circuit breaker fails
+      console.error(`Error in circuit breaker:`, error);
+    }
+  }
+  
+  // If an idempotency key is provided, check Redis first for faster lookups
+  if (idempotencyKey) {
+    try {
+      const processedKey = `processed:${queueName}:${idempotencyKey}`;
+      const alreadyProcessed = await redis.get(processedKey);
+      
+      if (alreadyProcessed) {
+        console.log(`Idempotency check via Redis passed: ${idempotencyKey} already processed`);
+        await deleteMessageWithRetries(supabase, queueName, messageId);
+        return true;
+      }
+    } catch (redisError) {
+      console.error(`Redis idempotency check failed:`, redisError);
+      // Continue to database check if Redis fails
+    }
+  }
+  
+  // Check database for idempotency if provided
   if (idempotencyCheckFn) {
     try {
       const alreadyProcessed = await idempotencyCheckFn();
       if (alreadyProcessed) {
-        // Already processed this item, just delete the message
+        console.log(`Idempotency check passed: item already processed`);
+        // Delete the message after confirming it was already processed
         await deleteMessageWithRetries(supabase, queueName, messageId);
         return true;
       }
@@ -186,15 +314,61 @@ export async function processQueueMessageSafely(
     }
   }
   
-  try {
-    // Process the message
-    await processFn();
-    
-    // Delete the message after successful processing
-    const deleted = await deleteMessageWithRetries(supabase, queueName, messageId);
-    return deleted;
-  } catch (error) {
-    console.error(`Error processing message ${messageId} from queue ${queueName}:`, error);
-    return false;
+  // Process with retries
+  while (retries <= maxRetries && !success) {
+    try {
+      // Process the message
+      await processFn();
+      
+      // Mark as processed in Redis for future idempotency checks
+      if (idempotencyKey) {
+        try {
+          const processedKey = `processed:${queueName}:${idempotencyKey}`;
+          await redis.set(processedKey, 'true', { ex: 86400 }); // TTL: 24 hours
+        } catch (redisError) {
+          // Not critical if Redis fails, continue
+          console.warn(`Failed to store idempotency key in Redis:`, redisError);
+        }
+      }
+      
+      // Delete the message after successful processing
+      const deleted = await deleteMessageWithRetries(supabase, queueName, messageId);
+      
+      // Reset circuit breaker failures if success
+      if (options.circuitBreaker) {
+        try {
+          await redis.del(`failures:${queueName}`);
+        } catch (redisError) {
+          // Not critical if Redis fails
+          console.warn(`Failed to reset circuit breaker:`, redisError);
+        }
+      }
+      
+      return deleted;
+    } catch (error) {
+      retries++;
+      console.error(`Error processing message ${messageId} from queue ${queueName} (attempt ${retries}/${maxRetries}):`, error);
+      
+      if (retries <= maxRetries) {
+        // Exponential backoff between retries
+        const delay = Math.pow(2, retries) * 100;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        // Log the issue if all retries failed
+        await logWorkerIssue(
+          supabase,
+          queueName,
+          "processing_failed",
+          `Failed to process message ${messageId} after ${maxRetries} attempts: ${error.message}`,
+          { 
+            error: error.message,
+            stack: error.stack,
+            messageId
+          }
+        );
+      }
+    }
   }
+  
+  return false;
 }

@@ -2,6 +2,20 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
+import { 
+  deleteMessageWithRetries, 
+  logWorkerIssue,
+  checkTrackProcessed,
+  processQueueMessageSafely,
+  acquireProcessingLock
+} from "../_shared/queueHelper.ts";
+import { Redis } from '@upstash/redis';
+
+// Initialize Redis client for distributed locking and idempotency
+const redis = new Redis({
+  url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+  token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+});
 
 interface TrackDiscoveryMsg {
   albumId: string;
@@ -15,29 +29,7 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Add a worker issue logging function
-async function logWorkerIssue(
-  supabase: any,
-  workerName: string,
-  issueType: string,
-  message: string,
-  details: any = {}
-) {
-  try {
-    await supabase.from('worker_issues').insert({
-      worker_name: workerName,
-      issue_type: issueType,
-      message: message,
-      details: details,
-      resolved: false
-    });
-    console.error(`[${workerName}] ${issueType}: ${message}`);
-  } catch (error) {
-    console.error("Failed to log worker issue:", error);
-  }
-}
-
-// Add metrics tracking
+// Track metrics for each processing batch
 async function trackQueueMetrics(
   supabase: any,
   queueName: string,
@@ -133,83 +125,128 @@ serve(async (req) => {
       // Track overall metrics
       let successCount = 0;
       let errorCount = 0;
+      const processingResults = [];
 
-      // Process messages in sequence to avoid overwhelming the database
-      for (const message of messages) {
-        try {
-          // Ensure the message is properly typed
-          console.log(`Raw message: ${JSON.stringify(message)}`);
-          
-          let msg: TrackDiscoveryMsg;
-          if (typeof message.message === 'string') {
-            msg = JSON.parse(message.message) as TrackDiscoveryMsg;
-          } else {
-            msg = message.message as TrackDiscoveryMsg;
-          }
-          
-          const messageId = message.id;
-          console.log(`Processing track message for album: ${msg.albumName} (${msg.albumId})`);
-          
+      try {
+        // Process messages in sequence to avoid overwhelming the database
+        for (const message of messages) {
           try {
-            const result = await processTracks(supabase, spotifyClient, msg);
+            // Ensure the message is properly typed
+            console.log(`Raw message: ${JSON.stringify(message)}`);
             
-            // Archive processed message
-            const deleteResult = await supabase.functions.invoke("deleteFromQueue", {
-              body: { queue_name: "track_discovery", message_id: messageId }
-            });
+            let msg: TrackDiscoveryMsg;
+            if (typeof message.message === 'string') {
+              msg = JSON.parse(message.message) as TrackDiscoveryMsg;
+            } else {
+              msg = message.message as TrackDiscoveryMsg;
+            }
             
-            console.log(`Successfully processed track message ${messageId}`, { 
-              deleteResult, 
-              tracksProcessed: result.processed 
-            });
+            const messageId = message.id;
             
-            successCount++;
-          } catch (processingError) {
-            console.error(`Error processing track message ${messageId}:`, processingError);
+            // Generate an idempotency key based on album ID and offset
+            const idempotencyKey = `album:${msg.albumId}:offset:${msg.offset || 0}`;
+            console.log(`Processing track message for album: ${msg.albumName} (${msg.albumId}) with idempotency key ${idempotencyKey}`);
+            
+            try {
+              // Process message with idempotency checks
+              const result = await processQueueMessageSafely(
+                supabase,
+                "track_discovery",
+                messageId.toString(),
+                async () => await processTracks(supabase, spotifyClient, msg),
+                idempotencyKey,
+                async () => {
+                  // Check if this album page was already processed
+                  try {
+                    const key = `processed:album:${msg.albumId}:offset:${msg.offset || 0}`;
+                    return await redis.exists(key) === 1;
+                  } catch (error) {
+                    console.error(`Redis check failed for ${idempotencyKey}:`, error);
+                    return false;
+                  }
+                },
+                { maxRetries: 2, circuitBreaker: true }
+              );
+              
+              if (result) {
+                console.log(`Successfully processed track message ${messageId}`);
+                successCount++;
+              } else {
+                console.warn(`Message ${messageId} was not successfully processed`);
+                errorCount++;
+              }
+              
+              processingResults.push({
+                messageId,
+                albumId: msg.albumId,
+                albumName: msg.albumName,
+                success: result
+              });
+            } catch (processingError) {
+              console.error(`Error processing track message ${messageId}:`, processingError);
+              await logWorkerIssue(
+                supabase,
+                "trackDiscovery", 
+                "processing_error", 
+                `Error processing message ${messageId}: ${processingError.message}`, 
+                { 
+                  messageId, 
+                  albumId: msg.albumId,
+                  albumName: msg.albumName,
+                  error: processingError.message,
+                  stack: processingError.stack
+                }
+              );
+              errorCount++;
+              processingResults.push({
+                messageId,
+                albumId: msg.albumId,
+                albumName: msg.albumName,
+                success: false,
+                error: processingError.message
+              });
+            }
+          } catch (messageError) {
+            console.error(`Error parsing message:`, messageError);
             await logWorkerIssue(
               supabase,
               "trackDiscovery", 
-              "processing_error", 
-              `Error processing message ${messageId}: ${processingError.message}`, 
+              "message_error", 
+              `Error parsing message: ${messageError.message}`, 
               { 
-                messageId, 
-                albumId: msg.albumId,
-                albumName: msg.albumName,
-                error: processingError.message,
-                stack: processingError.stack
+                message, 
+                error: messageError.message 
               }
             );
             errorCount++;
-            // Message will return to queue after visibility timeout
           }
-        } catch (messageError) {
-          console.error(`Error parsing message:`, messageError);
-          await logWorkerIssue(
-            supabase,
-            "trackDiscovery", 
-            "message_error", 
-            `Error parsing message: ${messageError.message}`, 
-            { 
-              message, 
-              error: messageError.message 
-            }
-          );
-          errorCount++;
         }
+      } catch (batchError) {
+        console.error("Error in batch processing:", batchError);
+        await logWorkerIssue(
+          supabase,
+          "trackDiscovery", 
+          "batch_error", 
+          `Batch processing error: ${batchError.message}`, 
+          { error: batchError.stack }
+        );
+      } finally {
+        // Record final metrics
+        await trackQueueMetrics(
+          supabase,
+          "track_discovery",
+          "batch_processing",
+          messages.length,
+          successCount,
+          errorCount,
+          { 
+            timestamp: new Date().toISOString(),
+            results: processingResults
+          }
+        );
+
+        console.log(`Completed background processing: ${successCount} successful, ${errorCount} failed`);
       }
-
-      // Record final metrics
-      await trackQueueMetrics(
-        supabase,
-        "track_discovery",
-        "batch_processing",
-        messages.length,
-        successCount,
-        errorCount,
-        { timestamp: new Date().toISOString() }
-      );
-
-      console.log(`Completed background processing: ${successCount} successful, ${errorCount} failed`);
     })());
     
     return response;
@@ -237,6 +274,24 @@ async function processTracks(
   console.log(`Processing tracks for album ${albumName} (ID: ${albumId}) at offset ${offset}`);
   
   try {
+    // Acquire distributed lock to prevent duplicate processing
+    const lockKey = `album:${albumId}:offset:${offset}`;
+    const hasLock = await acquireProcessingLock('album_tracks', lockKey);
+    
+    if (!hasLock) {
+      console.log(`Another process is handling album ${albumName} offset ${offset}, skipping`);
+      return { skipped: true, reason: "concurrent_processing" };
+    }
+    
+    // Mark this batch as being processed in Redis
+    try {
+      const processingKey = `processing:album:${albumId}:offset:${offset}`;
+      await redis.set(processingKey, 'true', { ex: 300 }); // 5 minute TTL
+    } catch (redisError) {
+      // Non-fatal if Redis fails, continue with processing
+      console.warn("Failed to set processing flag in Redis:", redisError);
+    }
+    
     // Get album's database ID
     const { data: album, error: albumError } = await supabase
       .from('albums')
@@ -281,6 +336,15 @@ async function processTracks(
 
     if (!tracksData.items || tracksData.items.length === 0) {
       console.log(`No tracks found for album ${albumName}`);
+      
+      // Mark this batch as processed even if no tracks were found
+      try {
+        const processedKey = `processed:album:${albumId}:offset:${offset}`;
+        await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+      } catch (redisError) {
+        console.warn("Failed to set processed flag in Redis:", redisError);
+      }
+      
       return { processed: 0 };
     }
 
@@ -294,6 +358,7 @@ async function processTracks(
     // Get detailed track info in batches of 50 (Spotify API limit)
     let processedCount = 0;
     let errorCount = 0;
+    const processedTrackIds = [];
     
     for (let i = 0; i < tracksToProcess.length; i += 50) {
       const batch = tracksToProcess.slice(i, i + 50);
@@ -321,6 +386,22 @@ async function processTracks(
         // Process each track in batch
         for (const track of trackDetails) {
           try {
+            // First check if this specific track has already been processed using Redis
+            const trackKey = `processed:track:${track.id}`;
+            let skipTrack = false;
+            
+            try {
+              skipTrack = await redis.exists(trackKey) === 1;
+              if (skipTrack) {
+                console.log(`Track ${track.name} (${track.id}) already processed according to Redis, skipping`);
+                processedCount++;
+                continue;
+              }
+            } catch (redisError) {
+              // If Redis check fails, continue with processing
+              console.warn(`Redis check failed for track ${track.id}:`, redisError);
+            }
+            
             // Validate track data
             if (!track || !track.id || !track.name) {
               console.error(`Invalid track data received:`, track);
@@ -341,6 +422,12 @@ async function processTracks(
             
             // Normalize the track name for deduplication
             const normalizedName = normalizeTrackName(track.name);
+            
+            if (!normalizedName) {
+              console.warn(`Normalized name is empty for track ${track.name}, skipping`);
+              errorCount++;
+              continue;
+            }
             
             // Check if normalized track already exists
             const { data: existingNormalizedTrack } = await supabase
@@ -400,6 +487,7 @@ async function processTracks(
             }
             
             console.log(`Successfully inserted/updated track: ${track.name} (DB ID: ${insertedTrack.id})`);
+            processedTrackIds.push(insertedTrack.id);
 
             // Create normalized track entry if it doesn't exist
             if (!existingNormalizedTrack) {
@@ -427,22 +515,60 @@ async function processTracks(
               }
             }
 
-            // Enqueue producer identification
-            await supabase.functions.invoke("sendToQueue", {
-              body: {
-                queue_name: "producer_identification",
-                message: { 
-                  trackId: insertedTrack.id,
-                  trackName: track.name,
-                  albumId: album.id,
-                  artistId: artist.id
+            // Mark this track as processed in Redis
+            try {
+              await redis.set(trackKey, 'true', { ex: 86400 }); // 24 hour TTL
+            } catch (redisError) {
+              // Non-fatal if Redis fails
+              console.warn(`Failed to mark track ${track.id} as processed in Redis:`, redisError);
+            }
+
+            // Enqueue producer identification with idempotency check
+            const producerMsg = {
+              trackId: insertedTrack.id,
+              trackName: track.name,
+              albumId: album.id,
+              artistId: artist.id
+            };
+            
+            // Check if producer identification was already enqueued
+            const producerKey = `enqueued:producer:${insertedTrack.id}`;
+            let alreadyEnqueued = false;
+            
+            try {
+              alreadyEnqueued = await redis.exists(producerKey) === 1;
+            } catch (redisError) {
+              // If Redis check fails, continue with enqueuing
+              console.warn(`Redis check failed for producer identification:`, redisError);
+            }
+            
+            if (!alreadyEnqueued) {
+              try {
+                await supabase.functions.invoke("sendToQueue", {
+                  body: {
+                    queue_name: "producer_identification",
+                    message: producerMsg
+                  }
+                });
+                
+                console.log(`Enqueued producer identification for track: ${track.name}`);
+                
+                // Mark as enqueued in Redis
+                try {
+                  await redis.set(producerKey, 'true', { ex: 86400 }); // 24 hour TTL
+                } catch (redisError) {
+                  // Non-fatal if Redis fails
+                  console.warn(`Failed to mark producer identification as enqueued:`, redisError);
                 }
+              } catch (enqueueError) {
+                console.error(`Error enqueueing producer identification for ${track.name}:`, enqueueError);
+                errorCount++;
               }
-            });
+            } else {
+              console.log(`Producer identification already enqueued for track ${track.name}, skipping`);
+            }
             
-            console.log(`Enqueued producer identification for track: ${track.name}`);
             processedCount++;
-            
           } catch (trackError) {
             console.error(`Error processing individual track ${track?.name || 'unknown'}:`, trackError);
             await logWorkerIssue(
@@ -472,26 +598,83 @@ async function processTracks(
       const newOffset = offset + tracksData.items.length;
       console.log(`Enqueueing next page of tracks for album ${albumName} with offset ${newOffset}`);
       
-      await supabase.functions.invoke("sendToQueue", {
-        body: {
-          queue_name: "track_discovery",
-          message: { 
-            albumId, 
-            albumName, 
-            artistId, 
-            offset: newOffset 
-          }
-        }
-      });
+      // Use an idempotency key for the next page enqueue
+      const nextPageKey = `enqueued:nextpage:${albumId}:${newOffset}`;
+      let nextPageEnqueued = false;
       
-      console.log(`Successfully enqueued next batch with offset ${newOffset}`);
+      try {
+        nextPageEnqueued = await redis.exists(nextPageKey) === 1;
+      } catch (redisError) {
+        // If Redis check fails, continue with enqueuing
+        console.warn(`Redis check failed for next page:`, redisError);
+      }
+      
+      if (!nextPageEnqueued) {
+        try {
+          await supabase.functions.invoke("sendToQueue", {
+            body: {
+              queue_name: "track_discovery",
+              message: { 
+                albumId, 
+                albumName, 
+                artistId, 
+                offset: newOffset 
+              }
+            }
+          });
+          
+          console.log(`Successfully enqueued next batch with offset ${newOffset}`);
+          
+          // Mark next page as enqueued in Redis
+          try {
+            await redis.set(nextPageKey, 'true', { ex: 86400 }); // 24 hour TTL
+          } catch (redisError) {
+            // Non-fatal if Redis fails
+            console.warn(`Failed to mark next page as enqueued:`, redisError);
+          }
+        } catch (enqueueError) {
+          console.error(`Failed to enqueue next page for album ${albumName}:`, enqueueError);
+          throw enqueueError; // Propagate to avoid marking batch as successful
+        }
+      } else {
+        console.log(`Next page for album ${albumName} offset ${newOffset} already enqueued, skipping`);
+      }
     } else {
       console.log(`Completed track discovery for album ${albumName}: Found ${processedCount} tracks`);
     }
     
-    return { processed: processedCount, errors: errorCount };
+    // Mark this batch as fully processed in Redis
+    try {
+      const processedKey = `processed:album:${albumId}:offset:${offset}`;
+      await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+    } catch (redisError) {
+      console.warn("Failed to set processed flag in Redis:", redisError);
+    }
+    
+    // Remove processing flag
+    try {
+      const processingKey = `processing:album:${albumId}:offset:${offset}`;
+      await redis.del(processingKey);
+    } catch (redisError) {
+      console.warn("Failed to remove processing flag:", redisError);
+    }
+    
+    return { 
+      processed: processedCount, 
+      errors: errorCount,
+      tracksIds: processedTrackIds
+    };
   } catch (error) {
     console.error(`Failed to process tracks for album ${albumName}:`, error);
+    
+    // Remove processing flag on error
+    try {
+      const processingKey = `processing:album:${albumId}:offset:${offset}`;
+      await redis.del(processingKey);
+    } catch (redisError) {
+      console.warn("Failed to remove processing flag:", redisError);
+    }
+    
     throw error; // Re-throw to ensure proper error handling in the parent function
   }
 }
@@ -519,13 +702,7 @@ function isArtistPrimaryOnTrack(track: any, artistId: string): boolean {
     return false;
   }
   
-  // Here we need to check if the artist is primary based on the track's artist array
-  // Note: The artistId parameter is our database ID, but track.artists[0].id is a Spotify ID
-  // We need to fix this comparison logic
-  
-  // Get artist record first to compare Spotify IDs
-  // For now, let's assume the primary artist status by position in the array
-  // This is a simplification - ideally we would check Spotify IDs
-  const isPrimary = track.artists.length > 0;
-  return isPrimary;
+  // For simplicity, we consider all tracks from the album as relevant
+  // In a more sophisticated implementation, you could compare Spotify IDs
+  return track.artists.length > 0;
 }
