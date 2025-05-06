@@ -141,7 +141,22 @@ serve(async (req) => {
               msg = message.message as TrackDiscoveryMsg;
             }
             
-            const messageId = message.id;
+            // FIX: Ensure messageId is defined before using it
+            const messageId = message.id || message.msg_id;
+            if (!messageId) {
+              console.error("Message ID is undefined or null, cannot process this message safely");
+              await logWorkerIssue(
+                supabase,
+                "trackDiscovery", 
+                "invalid_message", 
+                "Message ID is undefined or null", 
+                { 
+                  rawMessage: message
+                }
+              );
+              errorCount++;
+              continue;
+            }
             
             // Generate an idempotency key based on album ID and offset
             const idempotencyKey = `album:${msg.albumId}:offset:${msg.offset || 0}`;
@@ -152,7 +167,7 @@ serve(async (req) => {
               const result = await processQueueMessageSafely(
                 supabase,
                 "track_discovery",
-                messageId.toString(),
+                messageId.toString(), // FIX: toString() is now safe since we checked messageId is defined
                 async () => await processTracks(supabase, spotifyClient, msg),
                 idempotencyKey,
                 async () => {
