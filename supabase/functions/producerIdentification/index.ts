@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { GeniusClient } from "../_shared/geniusClient.ts";
@@ -92,6 +93,7 @@ serve(async (req) => {
       // Track overall metrics
       let successCount = 0;
       let errorCount = 0;
+      let dedupedCount = 0;
       const processingResults = [];
       
       try {
@@ -112,20 +114,39 @@ serve(async (req) => {
             const messageId = safeMessageIdString(message.id);
             console.log(`Processing producer identification for track: ${msg.trackName} (${msg.trackId})`);
             
-            // Use our safer processing function with idempotency check
-            const success = await processQueueMessageSafely(
+            // Create a unique idempotency key for this track's producer identification
+            const idempotencyKey = `track_producers:${msg.trackId}`;
+            
+            // Use our enhanced processing function with both idempotency check AND deduplication
+            const result = await processQueueMessageSafely(
               supabase,
               "producer_identification",
               messageId,
               async () => await identifyProducers(supabase, geniusClient, msg, redis),
-              `track_producers:${msg.trackId}`,
+              idempotencyKey,
               async () => await checkTrackProcessed(redis, msg.trackId, "producer_identification"),
-              { maxRetries: 2, circuitBreaker: true }
+              { 
+                maxRetries: 2, 
+                circuitBreaker: true,
+                deduplication: {
+                  enabled: true,
+                  redis,
+                  ttlSeconds: 3600, // 1 hour
+                  strictMatching: false // Use business identifier matching
+                }
+              }
             );
             
-            if (success) {
+            if (result) {
               console.log(`Successfully processed producer identification message ${messageId}`);
-              successCount++;
+              
+              // Check if it was a deduplication
+              if (typeof result === 'object' && result.deduplication) {
+                dedupedCount++;
+                console.log(`Message ${messageId} was handled by deduplication`);
+              } else {
+                successCount++;
+              }
             } else {
               console.warn(`Message ${messageId} was not successfully processed`);
               errorCount++;
@@ -135,7 +156,7 @@ serve(async (req) => {
               messageId,
               trackId: msg.trackId,
               trackName: msg.trackName,
-              success
+              success: result
             });
           } catch (messageError) {
             console.error(`Error parsing producer message:`, messageError);
@@ -172,13 +193,16 @@ serve(async (req) => {
             processed_count: messages.length,
             success_count: successCount,
             error_count: errorCount,
-            details: { results: processingResults }
+            details: { 
+              results: processingResults,
+              deduplicated_count: dedupedCount
+            }
           });
         } catch (metricsError) {
           console.error("Failed to record metrics:", metricsError);
         }
         
-        console.log(`Completed producer identification background processing: ${successCount} successful, ${errorCount} failed`);
+        console.log(`Completed producer identification background processing: ${successCount} successful, ${errorCount} failed, ${dedupedCount} deduplicated`);
       }
     })());
     

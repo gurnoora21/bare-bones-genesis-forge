@@ -1,5 +1,6 @@
 
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { DeduplicationService, getDeduplicationService } from "./deduplication.ts";
 
 // Helper function to safely format message ID as string
 export function safeMessageIdString(messageId: any): string | null {
@@ -146,27 +147,60 @@ export async function logWorkerIssue(
   }
 }
 
-// Function to process a queue message with safety checks and idempotency
+// Enhanced options for queue processing
+export interface ProcessQueueOptions {
+  maxRetries?: number;
+  circuitBreaker?: boolean;
+  timeoutMs?: number;
+  deduplication?: {
+    enabled: boolean;
+    redis?: Redis;
+    ttlSeconds?: number;
+    strictMatching?: boolean;
+  };
+}
+
+// Function to process a queue message with safety checks, idempotency, and deduplication
 export async function processQueueMessageSafely(
   supabase: any,
   queueName: string,
-  messageId: string | null, // FIX: Allow null messageId
+  messageId: string | null,
   processingFunction: () => Promise<any>,
   idempotencyKey: string,
   alreadyProcessedCheck?: () => Promise<boolean>,
-  options: {
-    maxRetries?: number;
-    circuitBreaker?: boolean;
-    timeoutMs?: number;
-  } = {}
+  options: ProcessQueueOptions = {}
 ): Promise<boolean> {
-  // FIX: Handle null or undefined messageId
+  // Handle null or undefined messageId
   if (!messageId) {
     console.error(`Cannot process message with null or undefined ID for queue ${queueName}`);
     return false;
   }
 
   try {
+    // Check deduplication if enabled
+    if (options.deduplication?.enabled && options.deduplication.redis) {
+      const redis = options.deduplication.redis;
+      const deduplicationService = getDeduplicationService(redis);
+      
+      // Use idempotency key for deduplication
+      const isDuplicate = await deduplicationService.isDuplicate(
+        queueName, 
+        idempotencyKey,
+        { 
+          ttlSeconds: options.deduplication.ttlSeconds || 3600,
+          useStrictPayloadMatch: options.deduplication.strictMatching ?? true
+        }
+      );
+      
+      if (isDuplicate) {
+        console.log(`Deduplication: Skipping duplicate message ${messageId} with key ${idempotencyKey} in queue ${queueName}`);
+        
+        // Delete the message since it's being skipped as a duplicate
+        await deleteMessageWithRetries(supabase, queueName, messageId);
+        return true; // Indicate successful handling (by skipping)
+      }
+    }
+
     // Check if already processed (if check function provided)
     if (alreadyProcessedCheck) {
       try {
@@ -191,6 +225,22 @@ export async function processQueueMessageSafely(
     const deleteSuccess = await deleteMessageWithRetries(supabase, queueName, messageId);
     if (!deleteSuccess) {
       console.warn(`Warning: Could not delete message ${messageId} from ${queueName} after successful processing`);
+    }
+
+    // If deduplication is enabled, mark as processed to prevent future duplicates
+    if (options.deduplication?.enabled && options.deduplication.redis) {
+      try {
+        const redis = options.deduplication.redis;
+        const deduplicationService = getDeduplicationService(redis);
+        await deduplicationService.markAsProcessed(
+          queueName,
+          idempotencyKey,
+          options.deduplication.ttlSeconds || 3600
+        );
+        console.log(`Marked message with key ${idempotencyKey} as processed for future deduplication`);
+      } catch (e) {
+        console.warn(`Failed to mark message as processed for deduplication: ${e}`);
+      }
     }
 
     return true;
