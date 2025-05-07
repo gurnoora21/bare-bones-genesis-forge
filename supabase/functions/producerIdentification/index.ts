@@ -6,7 +6,8 @@ import {
   logWorkerIssue,
   checkTrackProcessed,
   processQueueMessageSafely,
-  acquireProcessingLock
+  acquireProcessingLock,
+  safeMessageIdString
 } from "../_shared/queueHelper.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
@@ -106,9 +107,9 @@ serve(async (req) => {
             } else {
               msg = message.message as ProducerIdentificationMsg;
             }
-              
-            // FIX: Make sure messageId isn't undefined before calling toString()
-            const messageId = message.id ? message.id.toString() : null;
+            
+            // Safely get the message ID 
+            const messageId = safeMessageIdString(message.id);
             console.log(`Processing producer identification for track: ${msg.trackName} (${msg.trackId})`);
             
             // Use our safer processing function with idempotency check
@@ -118,7 +119,6 @@ serve(async (req) => {
               messageId,
               async () => await identifyProducers(supabase, geniusClient, msg, redis),
               `track_producers:${msg.trackId}`,
-              // FIX: Pass redis client instead of supabase and remove third parameter
               async () => await checkTrackProcessed(redis, msg.trackId, "producer_identification"),
               { maxRetries: 2, circuitBreaker: true }
             );
@@ -198,7 +198,7 @@ serve(async (req) => {
   }
 });
 
-// FIX: Updated to accept redis parameter
+// Keep existing implementation of identifyProducers function
 async function identifyProducers(
   supabase: any, 
   geniusClient: any,
