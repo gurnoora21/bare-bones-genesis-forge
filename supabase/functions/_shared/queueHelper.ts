@@ -11,7 +11,8 @@ export function safeMessageIdString(messageId: any): string | null {
 // Function to check if a track has already been processed
 export async function checkTrackProcessed(
   redis: any, 
-  trackId: string
+  trackId: string,
+  queueName: string = "general" // Added queue name parameter with default
 ): Promise<boolean> {
   if (!redis) {
     console.warn("Redis client is not initialized, skipping Redis check.");
@@ -19,7 +20,7 @@ export async function checkTrackProcessed(
   }
 
   try {
-    const key = `processed:track:${trackId}`;
+    const key = `processed:${queueName}:${trackId}`;
     return await redis.exists(key) === 1;
   } catch (error) {
     console.error(`Redis check failed for track ${trackId}:`, error);

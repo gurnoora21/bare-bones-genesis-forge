@@ -107,17 +107,19 @@ serve(async (req) => {
               msg = message.message as ProducerIdentificationMsg;
             }
               
-            const messageId = message.id;
+            // FIX: Make sure messageId isn't undefined before calling toString()
+            const messageId = message.id ? message.id.toString() : null;
             console.log(`Processing producer identification for track: ${msg.trackName} (${msg.trackId})`);
             
             // Use our safer processing function with idempotency check
             const success = await processQueueMessageSafely(
               supabase,
               "producer_identification",
-              messageId.toString(),
-              async () => await identifyProducers(supabase, geniusClient, msg),
+              messageId,
+              async () => await identifyProducers(supabase, geniusClient, msg, redis),
               `track_producers:${msg.trackId}`,
-              async () => await checkTrackProcessed(supabase, msg.trackId, "producer_identification"),
+              // FIX: Pass redis client instead of supabase and remove third parameter
+              async () => await checkTrackProcessed(redis, msg.trackId, "producer_identification"),
               { maxRetries: 2, circuitBreaker: true }
             );
             
@@ -196,10 +198,12 @@ serve(async (req) => {
   }
 });
 
+// FIX: Updated to accept redis parameter
 async function identifyProducers(
   supabase: any, 
   geniusClient: any,
-  msg: ProducerIdentificationMsg
+  msg: ProducerIdentificationMsg,
+  redis: Redis
 ) {
   const { trackId, trackName, albumId, artistId } = msg;
   
@@ -221,7 +225,8 @@ async function identifyProducers(
     }
     
     // Quick double-check if track is already processed
-    const alreadyProcessed = await checkTrackProcessed(supabase, trackId, "producer_identification");
+    // FIX: Updated to pass redis client and proper queue name
+    const alreadyProcessed = await checkTrackProcessed(redis, trackId, "producer_identification");
     if (alreadyProcessed) {
       console.log(`Track ${trackName} (${trackId}) already has producers, skipping`);
       return { skipped: true, reason: "already_processed" };
