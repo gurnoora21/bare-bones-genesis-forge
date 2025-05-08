@@ -131,6 +131,45 @@ export type Database = {
           },
         ]
       }
+      processing_status: {
+        Row: {
+          attempts: number | null
+          created_at: string | null
+          entity_id: string
+          entity_type: string
+          id: string
+          last_error: string | null
+          last_processed_at: string | null
+          metadata: Json | null
+          state: string
+          updated_at: string | null
+        }
+        Insert: {
+          attempts?: number | null
+          created_at?: string | null
+          entity_id: string
+          entity_type: string
+          id?: string
+          last_error?: string | null
+          last_processed_at?: string | null
+          metadata?: Json | null
+          state: string
+          updated_at?: string | null
+        }
+        Update: {
+          attempts?: number | null
+          created_at?: string | null
+          entity_id?: string
+          entity_type?: string
+          id?: string
+          last_error?: string | null
+          last_processed_at?: string | null
+          metadata?: Json | null
+          state?: string
+          updated_at?: string | null
+        }
+        Relationships: []
+      }
       producers: {
         Row: {
           created_at: string | null
@@ -379,6 +418,14 @@ export type Database = {
       }
     }
     Functions: {
+      acquire_processing_lock: {
+        Args: {
+          p_entity_type: string
+          p_entity_id: string
+          p_timeout_minutes?: number
+        }
+        Returns: boolean
+      }
       check_worker_crons: {
         Args: Record<PropertyKey, never>
         Returns: {

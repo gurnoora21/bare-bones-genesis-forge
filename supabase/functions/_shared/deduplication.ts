@@ -1,5 +1,6 @@
 
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { getEnvironmentTTL } from "./stateManager.ts";
 
 export interface DeduplicationOptions {
   ttlSeconds?: number; // How long to remember processed messages
@@ -23,7 +24,7 @@ export class DeduplicationService {
     options: DeduplicationOptions = {}
   ): Promise<boolean> {
     const {
-      ttlSeconds = 3600, // 1 hour default
+      ttlSeconds = getEnvironmentTTL(), // Use environment-specific TTL by default
       useStrictPayloadMatch = true,
       useRedisFallback = true
     } = options;
@@ -119,7 +120,7 @@ export class DeduplicationService {
   async markAsProcessed(
     queueName: string,
     payload: any,
-    ttlSeconds = 3600
+    ttlSeconds = getEnvironmentTTL() // Use environment-specific TTL
   ): Promise<void> {
     try {
       const payloadStr = typeof payload === 'string' 
@@ -141,7 +142,7 @@ export class DeduplicationService {
       // Set the key with expiration
       await this.redis.set(deduplicationKey, 'true', { ex: ttlSeconds });
     } catch (error) {
-      console.warn(`Failed to mark message as processed: ${error}`);
+      console.warn(`Failed to mark message as processed: ${error.message}`);
     }
   }
 }
