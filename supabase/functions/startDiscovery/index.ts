@@ -1,7 +1,6 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -45,45 +44,20 @@ serve(async (req) => {
     
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
     
-    console.log(`Attempting to enqueue artist discovery for: ${artistName}`);
+    console.log(`Starting artist discovery for: ${artistName}`);
 
     // Create a unique idempotency key for this request
     const idempotencyKey = `artist:name:${artistName.toLowerCase()}`;
 
-    // Method 1: Use the direct pg_enqueue RPC function for message insertion
+    // Use direct pg_enqueue RPC function for message insertion
     const { data: messageId, error: enqueueError } = await supabase.rpc('pg_enqueue', {
       queue_name: 'artist_discovery',
       message_body: { artistName, _idempotencyKey: idempotencyKey }
     });
     
     if (enqueueError) {
-      console.error("Queue error from pg_enqueue:", enqueueError);
-      
-      // Fall back to Method 2: Try sendToQueue function 
-      try {
-        console.log("Falling back to sendToQueue function");
-        
-        const response = await supabase.functions.invoke('sendToQueue', { 
-          body: { 
-            queue_name: 'artist_discovery',
-            message: { artistName, _idempotencyKey: idempotencyKey },
-            deduplication_options: {
-              enabled: true,
-              ttlSeconds: 3600 // 1 hour
-            }
-          }
-        });
-        
-        if (response.error) {
-          throw new Error(`sendToQueue failed: ${response.error}`);
-        } else {
-          console.log("Successfully used sendToQueue function:", response.data);
-          messageId = response.data.messageId;
-        }
-      } catch (sendToQueueError) {
-        console.error("Both enqueueing methods failed:", sendToQueueError);
-        throw enqueueError; // Throw the original error since that's the primary method
-      }
+      console.error("Failed to enqueue artist discovery:", enqueueError);
+      throw new Error(`Failed to enqueue artist discovery: ${enqueueError.message}`);
     }
     
     if (!messageId) {
@@ -102,32 +76,8 @@ serve(async (req) => {
       
       if (workerResponse.error) {
         console.warn("Could not trigger worker via functions.invoke:", workerResponse.error);
-        
-        // Fall back to direct HTTP call
-        try {
-          const directResponse = await fetch(
-            `${supabaseUrl}/functions/v1/artistDiscovery`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-              },
-              body: JSON.stringify({ triggeredManually: true })
-            }
-          );
-          
-          if (!directResponse.ok) {
-            throw new Error(`HTTP error: ${directResponse.status} ${directResponse.statusText}`);
-          }
-          
-          console.log("Artist discovery worker triggered successfully via direct HTTP");
-        } catch (httpError) {
-          console.warn("Could not trigger worker via direct HTTP:", httpError);
-          console.log("Worker will be triggered by scheduled cron job instead");
-        }
       } else {
-        console.log("Artist discovery worker triggered successfully via functions.invoke");
+        console.log("Artist discovery worker triggered successfully");
       }
     } catch (triggerError) {
       console.warn("Error triggering worker:", triggerError);
