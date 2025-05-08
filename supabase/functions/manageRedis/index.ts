@@ -27,13 +27,29 @@ serve(async (req) => {
       token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
     });
     
-    // Parse the request URL
+    // Check if we're receiving body data or path parameters
+    let operation = '';
+    
+    // Parse the request URL for path-based operations
     const url = new URL(req.url);
     const pathname = url.pathname.split('/').filter(Boolean);
     
-    // Extract the operation from the path
-    // Format: /manageRedis/{operation}
-    const operation = pathname[1] || '';
+    // Try to get operation from URL path first
+    if (pathname.length > 1) {
+      operation = pathname[1];
+    } 
+    
+    // If not found in URL, try to get from request body
+    if (!operation && req.body) {
+      try {
+        const body = await req.json();
+        operation = body.operation || '';
+      } catch (e) {
+        console.log("No valid JSON body or no operation specified");
+      }
+    }
+    
+    console.log(`Processing operation: ${operation}`);
     
     // Handle operation: clear-idempotency
     if (operation === 'clear-idempotency' && req.method === 'DELETE') {
@@ -79,7 +95,20 @@ serve(async (req) => {
     
     // Handle operation: clear-by-pattern
     if (operation === 'clear-by-pattern' && req.method === 'DELETE') {
-      const { pattern } = await req.json();
+      let pattern = '';
+      
+      try {
+        const body = await req.json();
+        pattern = body.pattern || '';
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ error: "Pattern is required in the request body" }),
+          { 
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            status: 400 
+          }
+        );
+      }
       
       if (!pattern) {
         return new Response(

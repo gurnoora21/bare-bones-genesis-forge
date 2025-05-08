@@ -26,10 +26,10 @@ serve(async (req) => {
     
     console.log("Calling manageRedis to clear idempotency keys");
     
-    // Call the manageRedis function to clear idempotency keys
+    // Call the manageRedis function with the proper path and method
     const { data, error } = await supabase.functions.invoke('manageRedis', {
       method: 'DELETE',
-      path: 'clear-idempotency'
+      body: { operation: 'clear-idempotency' }
     });
     
     if (error) {
