@@ -457,6 +457,10 @@ export type Database = {
         Args: { queue_name: string; msg_text: string }
         Returns: number[]
       }
+      raw_sql_query: {
+        Args: { sql_query: string; params?: Json }
+        Returns: Json
+      }
       reset_stuck_message: {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
