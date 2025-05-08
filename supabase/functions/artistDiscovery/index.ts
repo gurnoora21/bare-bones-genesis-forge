@@ -1,6 +1,10 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { processQueueMessageSafely, logWorkerIssue, deleteMessageWithRetries } from "../_shared/queueHelper.ts";
+import { DeduplicationService } from "../_shared/deduplication.ts";
+import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 
 interface ArtistDiscoveryMsg {
   artistId?: string;
@@ -133,6 +137,15 @@ serve(async (req) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
+  
+  // Initialize Redis client
+  const redis = new Redis({
+    url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+    token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+  });
+  
+  // Initialize metrics
+  const metrics = getDeduplicationMetrics(redis);
 
   console.log("Starting artist discovery worker process...");
 
@@ -220,6 +233,7 @@ serve(async (req) => {
         
         let successCount = 0;
         let errorCount = 0;
+        let dedupedCount = 0;
 
         for (const message of messages) {
           // Ensure the message is properly parsed
@@ -240,29 +254,71 @@ serve(async (req) => {
             const messageId = message.id || message.msg_id;
             console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
             
+            // Create idempotency key based on artist ID or name
+            const idempotencyKey = msg.artistId 
+              ? `artist:id:${msg.artistId}` 
+              : `artist:name:${msg.artistName}`;
+            
             try {
-              await processArtistWithoutCache(supabase, spotifyClient, msg);
-              console.log(`Successfully processed artist with fallback method`);
-              
-              // Delete message using our improved function
-              const deleteSuccess = await deleteMessageWithRetries(
-                supabase, 
-                "artist_discovery", 
-                messageId.toString()
+              // Process message with deduplication
+              const result = await processQueueMessageSafely(
+                supabase,
+                "artist_discovery",
+                messageId.toString(),
+                async () => await processArtistWithoutCache(supabase, spotifyClient, msg),
+                idempotencyKey, 
+                async () => {
+                  // Check if this artist was already processed
+                  if (msg.artistId) {
+                    const { data } = await supabase
+                      .from('artists')
+                      .select('id')
+                      .eq('spotify_id', msg.artistId)
+                      .maybeSingle();
+                    return !!data;
+                  } else if (msg.artistName) {
+                    try {
+                      const artistKey = `processed:artist:name:${msg.artistName.toLowerCase()}`;
+                      return await redis.exists(artistKey) === 1;
+                    } catch (redisError) {
+                      console.warn(`Redis check failed for artist ${msg.artistName}:`, redisError);
+                      return false;
+                    }
+                  }
+                  return false;
+                },
+                {
+                  maxRetries: 2,
+                  deduplication: {
+                    enabled: true,
+                    redis,
+                    ttlSeconds: 86400, // 24 hour deduplication window
+                    strictMatching: false
+                  }
+                }
               );
               
-              if (deleteSuccess) {
-                console.log(`Successfully processed and deleted message ${messageId}`);
-                successCount++;
+              if (result) {
+                if (typeof result === 'object' && result.deduplication) {
+                  dedupedCount++;
+                  await metrics.recordDeduplicated("artist_discovery", "consumer");
+                  console.log(`Message ${messageId} was handled by deduplication`);
+                } else {
+                  successCount++;
+                  console.log(`Successfully processed artist with ID: ${result.id}`);
+                  
+                  // Mark this artist as processed in Redis
+                  if (msg.artistName) {
+                    try {
+                      const artistKey = `processed:artist:name:${msg.artistName.toLowerCase()}`;
+                      await redis.set(artistKey, 'true', { ex: 86400 });
+                    } catch (redisError) {
+                      console.warn(`Failed to mark artist ${msg.artistName} as processed in Redis:`, redisError);
+                    }
+                  }
+                }
               } else {
-                console.error(`Failed to delete message ${messageId} after multiple attempts`);
-                await logWorkerIssue(
-                  supabase,
-                  "artistDiscovery", 
-                  "queue_delete_failure", 
-                  `Failed to delete message ${messageId} after processing`, 
-                  { messageId }
-                );
+                console.error(`Failed to process message ${messageId}`);
                 errorCount++;
               }
             } catch (processError) {
@@ -289,7 +345,25 @@ serve(async (req) => {
           }
         }
 
-        console.log(`Background processing complete: ${successCount} successful, ${errorCount} failed`);
+        console.log(`Background processing complete: ${successCount} successful, ${dedupedCount} deduplicated, ${errorCount} failed`);
+        
+        // Record metrics
+        try {
+          await supabase.from('queue_metrics').insert({
+            queue_name: "artist_discovery",
+            operation: "batch_processing",
+            started_at: new Date().toISOString(),
+            finished_at: new Date().toISOString(),
+            processed_count: messages.length,
+            success_count: successCount,
+            error_count: errorCount,
+            details: { 
+              deduplicated_count: dedupedCount
+            }
+          });
+        } catch (metricsError) {
+          console.error("Failed to record metrics:", metricsError);
+        }
       } catch (backgroundError) {
         console.error("Error in background processing:", backgroundError);
         await logWorkerIssue(

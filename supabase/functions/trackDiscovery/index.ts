@@ -10,6 +10,8 @@ import {
   acquireProcessingLock
 } from "../_shared/queueHelper.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { DeduplicationService } from "../_shared/deduplication.ts";
+import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 
 // Initialize Redis client for distributed locking and idempotency
 const redis = new Redis({
@@ -68,6 +70,9 @@ serve(async (req) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
+  
+  // Initialize metrics
+  const metrics = getDeduplicationMetrics(redis);
 
   try {
     console.log("Starting track discovery process");
@@ -125,6 +130,7 @@ serve(async (req) => {
       // Track overall metrics
       let successCount = 0;
       let errorCount = 0;
+      let dedupedCount = 0;
       const processingResults = [];
 
       try {
@@ -180,12 +186,27 @@ serve(async (req) => {
                     return false;
                   }
                 },
-                { maxRetries: 2, circuitBreaker: true }
+                { 
+                  maxRetries: 2, 
+                  circuitBreaker: true,
+                  deduplication: {
+                    enabled: true,
+                    redis,
+                    ttlSeconds: 3600, // 1 hour
+                    strictMatching: false
+                  }
+                }
               );
               
               if (result) {
-                console.log(`Successfully processed track message ${messageId}`);
-                successCount++;
+                if (typeof result === 'object' && result.deduplication) {
+                  dedupedCount++;
+                  await metrics.recordDeduplicated("track_discovery", "consumer");
+                  console.log(`Message ${messageId} was handled by deduplication`);
+                } else {
+                  console.log(`Successfully processed track message ${messageId}`);
+                  successCount++;
+                }
               } else {
                 console.warn(`Message ${messageId} was not successfully processed`);
                 errorCount++;
@@ -195,7 +216,8 @@ serve(async (req) => {
                 messageId,
                 albumId: msg.albumId,
                 albumName: msg.albumName,
-                success: result
+                success: result ? true : false,
+                deduplication: typeof result === 'object' && result.deduplication
               });
             } catch (processingError) {
               console.error(`Error processing track message ${messageId}:`, processingError);
@@ -256,11 +278,12 @@ serve(async (req) => {
           errorCount,
           { 
             timestamp: new Date().toISOString(),
+            deduplicated_count: dedupedCount,
             results: processingResults
           }
         );
 
-        console.log(`Completed background processing: ${successCount} successful, ${errorCount} failed`);
+        console.log(`Completed background processing: ${successCount} successful, ${dedupedCount} deduplicated, ${errorCount} failed`);
       }
     })());
     

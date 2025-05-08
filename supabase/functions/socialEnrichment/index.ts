@@ -1,6 +1,10 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { processQueueMessageSafely } from "../_shared/queueHelper.ts";
+import { DeduplicationService } from "../_shared/deduplication.ts";
+import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 
 interface SocialEnrichmentMsg {
   producerId: string;
@@ -22,6 +26,15 @@ serve(async (req) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
+
+  // Initialize Redis client
+  const redis = new Redis({
+    url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+    token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+  });
+
+  // Initialize metrics
+  const metrics = getDeduplicationMetrics(redis);
 
   // Process queue batch
   const { data: messages, error } = await supabase.functions.invoke("readQueue", {
@@ -50,17 +63,41 @@ serve(async (req) => {
       
     const messageId = message.id;
     
-    try {
-      await enrichProducerProfile(supabase, msg);
-      // Archive processed message
-      await supabase.functions.invoke("deleteFromQueue", {
-        body: { queue_name: "social_enrichment", message_id: messageId }
-      });
-      console.log(`Successfully processed social enrichment message ${messageId}`);
-    } catch (error) {
-      console.error(`Error processing social enrichment message ${messageId}:`, error);
-      // Message will return to queue after visibility timeout
-    }
+    // Create idempotency key for this producer
+    const idempotencyKey = `social_enrichment:producer:${msg.producerId}`;
+
+    // Use enhanced processQueueMessageSafely with deduplication
+    await processQueueMessageSafely(
+      supabase,
+      "social_enrichment",
+      messageId.toString(),
+      async () => await enrichProducerProfile(supabase, msg),
+      idempotencyKey,
+      async () => {
+        // Check if this producer was already enriched
+        try {
+          const { data } = await supabase
+            .from('producers')
+            .select('enriched_at, enrichment_failed')
+            .eq('id', msg.producerId)
+            .single();
+            
+          return data && (data.enriched_at !== null || data.enrichment_failed === true);
+        } catch (error) {
+          console.warn(`Error checking if producer ${msg.producerId} was enriched:`, error);
+          return false;
+        }
+      },
+      {
+        maxRetries: 2,
+        deduplication: {
+          enabled: true,
+          redis,
+          ttlSeconds: 86400, // 24 hour deduplication window
+          strictMatching: true
+        }
+      }
+    );
   });
 
   // Wait for all background tasks in a background process

@@ -1,7 +1,10 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
-import { deleteMessageWithRetries, logWorkerIssue } from "../_shared/queueHelper.ts";
+import { deleteMessageWithRetries, logWorkerIssue, processQueueMessageSafely } from "../_shared/queueHelper.ts";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { DeduplicationService } from "../_shared/deduplication.ts";
+import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 
 interface AlbumDiscoveryMsg {
   artistId: string;
@@ -23,6 +26,15 @@ serve(async (req) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
+
+  // Initialize Redis client
+  const redis = new Redis({
+    url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+    token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+  });
+  
+  // Initialize metrics
+  const metrics = getDeduplicationMetrics(redis);
 
   try {
     // Process queue batch
@@ -92,6 +104,7 @@ serve(async (req) => {
     EdgeRuntime.waitUntil((async () => {
       let successCount = 0;
       let errorCount = 0;
+      let dedupedCount = 0;
       
       for (const message of messages) {
         try {
@@ -106,28 +119,57 @@ serve(async (req) => {
           const messageId = message.id || message.msg_id;
           console.log(`Processing album message for artist ID: ${msg.artistId}, offset: ${msg.offset}`);
           
+          // Create idempotency key based on artist ID and offset
+          const idempotencyKey = `artist:${msg.artistId}:albums:offset:${msg.offset}`;
+          
           try {
-            await processAlbums(supabase, spotifyClient, msg);
-            
-            // Delete the message using our improved function
-            const deleteSuccess = await deleteMessageWithRetries(
-              supabase, 
-              "album_discovery", 
-              messageId.toString()
+            // Process message with deduplication
+            const result = await processQueueMessageSafely(
+              supabase,
+              "album_discovery",
+              messageId.toString(),
+              async () => await processAlbums(supabase, spotifyClient, msg),
+              idempotencyKey,
+              async () => {
+                // Check if this album page was already processed
+                try {
+                  const key = `processed:artist:${msg.artistId}:albums:offset:${msg.offset}`;
+                  return await redis.exists(key) === 1;
+                } catch (error) {
+                  console.error(`Redis check failed for ${idempotencyKey}:`, error);
+                  return false;
+                }
+              },
+              {
+                maxRetries: 2,
+                deduplication: {
+                  enabled: true,
+                  redis,
+                  ttlSeconds: 3600, // 1 hour deduplication window
+                  strictMatching: false
+                }
+              }
             );
             
-            if (deleteSuccess) {
-              console.log(`Successfully processed and deleted album message ${messageId}`);
-              successCount++;
+            if (result) {
+              if (typeof result === 'object' && result.deduplication) {
+                dedupedCount++;
+                await metrics.recordDeduplicated("album_discovery", "consumer");
+                console.log(`Message ${messageId} was handled by deduplication`);
+              } else {
+                successCount++;
+                console.log(`Successfully processed album discovery for artist ${msg.artistId}, offset ${msg.offset}`);
+                
+                // Mark this batch as processed in Redis
+                try {
+                  const processedKey = `processed:artist:${msg.artistId}:albums:offset:${msg.offset}`;
+                  await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+                } catch (redisError) {
+                  console.warn(`Failed to mark batch as processed in Redis:`, redisError);
+                }
+              }
             } else {
-              console.error(`Failed to delete album message ${messageId} after multiple attempts`);
-              await logWorkerIssue(
-                supabase,
-                "albumDiscovery", 
-                "queue_delete_failure", 
-                `Failed to delete message ${messageId} after processing`, 
-                { messageId }
-              );
+              console.error(`Failed to process message ${messageId}`);
               errorCount++;
             }
           } catch (processError) {
@@ -147,7 +189,25 @@ serve(async (req) => {
         }
       }
       
-      console.log(`Completed background processing: ${successCount} successful, ${errorCount} failed`);
+      console.log(`Completed background processing: ${successCount} successful, ${dedupedCount} deduplicated, ${errorCount} failed`);
+      
+      // Record metrics
+      try {
+        await supabase.from('queue_metrics').insert({
+          queue_name: "album_discovery",
+          operation: "batch_processing",
+          started_at: new Date().toISOString(),
+          finished_at: new Date().toISOString(),
+          processed_count: messages.length,
+          success_count: successCount,
+          error_count: errorCount,
+          details: { 
+            deduplicated_count: dedupedCount
+          }
+        });
+      } catch (metricsError) {
+        console.error("Failed to record metrics:", metricsError);
+      }
     })());
     
     return response;
