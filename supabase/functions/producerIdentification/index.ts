@@ -25,12 +25,6 @@ interface ProducerIdentificationMsg {
   artistId: string;
 }
 
-interface ProducerCandidate {
-  name: string;
-  confidence: number;
-  source: string;
-}
-
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -100,19 +94,68 @@ serve(async (req) => {
         // Process messages in sequence to avoid overwhelming external APIs
         for (const message of messages) {
           try {
-            // Ensure the message is properly typed
-            console.log(`Raw producer message: ${JSON.stringify(message)}`);
+            // Debug: Log the raw message structure to diagnose ID issues
+            console.log(`Raw producer message:`, JSON.stringify(message));
             
             let msg: ProducerIdentificationMsg;
             if (typeof message.message === 'string') {
-              msg = JSON.parse(message.message) as ProducerIdentificationMsg;
+              try {
+                msg = JSON.parse(message.message) as ProducerIdentificationMsg;
+              } catch (parseError) {
+                console.error(`Failed to parse message as JSON:`, parseError);
+                await logWorkerIssue(
+                  supabase,
+                  "producerIdentification", 
+                  "parse_error", 
+                  `Failed to parse message as JSON: ${parseError.message}`, 
+                  { message }
+                );
+                errorCount++;
+                continue;
+              }
             } else {
               msg = message.message as ProducerIdentificationMsg;
             }
             
-            // Safely get the message ID 
-            const messageId = safeMessageIdString(message.id);
-            console.log(`Processing producer identification for track: ${msg.trackName} (${msg.trackId})`);
+            // Extra validation for required message fields
+            if (!msg.trackId || !msg.artistId || !msg.albumId) {
+              console.error(`Invalid message format - missing required fields:`, msg);
+              await logWorkerIssue(
+                supabase,
+                "producerIdentification", 
+                "invalid_message", 
+                "Message missing required fields", 
+                { msg }
+              );
+              errorCount++;
+              continue;
+            }
+            
+            // Enhanced message ID extraction with fallbacks
+            let messageId: string;
+            
+            if (message.id !== undefined && message.id !== null) {
+              messageId = String(message.id);
+            } else if (message.msg_id !== undefined && message.msg_id !== null) {
+              messageId = String(message.msg_id);
+            } else {
+              // If no ID is available, generate one deterministically from the message content
+              console.warn(`No message ID found, generating a deterministic one from track ID`);
+              messageId = `generated-${msg.trackId}-${Date.now()}`;
+              
+              await logWorkerIssue(
+                supabase,
+                "producerIdentification", 
+                "missing_message_id", 
+                "Message had no ID, using generated ID", 
+                { 
+                  generatedId: messageId,
+                  originalMessage: message 
+                }
+              );
+            }
+            
+            console.log(`Processing producer identification for track: ${msg.trackName} (${msg.trackId}) with message ID: ${messageId}`);
             
             // Create a unique idempotency key for this track's producer identification
             const idempotencyKey = `track_producers:${msg.trackId}`;
@@ -159,12 +202,12 @@ serve(async (req) => {
               success: result
             });
           } catch (messageError) {
-            console.error(`Error parsing producer message:`, messageError);
+            console.error(`Error processing producer message:`, messageError);
             await logWorkerIssue(
               supabase,
               "producerIdentification", 
               "message_error", 
-              `Error parsing message: ${messageError.message}`, 
+              `Error processing message: ${messageError.message}`, 
               { 
                 message, 
                 error: messageError.message 

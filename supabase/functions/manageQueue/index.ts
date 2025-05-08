@@ -34,172 +34,193 @@ serve(async (req) => {
     
     console.log(`Queue operation: ${operation} on queue ${queue_name}`);
     
-    // Get queue table name
-    let queueTable = '';
-    try {
-      const { data: tableData, error: tableError } = await supabase.rpc(
-        'raw_sql_query',
-        { 
-          sql_query: `SELECT pgmq.get_queue_table_name($1) as table_name`,
-          params: [queue_name]
-        }
-      );
-      
-      if (!tableError && tableData && tableData.length > 0 && tableData[0].table_name) {
-        queueTable = tableData[0].table_name;
-      } else {
-        queueTable = `pgmq_${queue_name}`;
-      }
-    } catch (tableError) {
-      queueTable = `pgmq_${queue_name}`;
-    }
-    
-    let result;
-    
+    // Handle different operations
     switch (operation) {
-      case 'purge':
-        // Purge all messages from queue
-        const { data: purgeData, error: purgeError } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              DO $$
-              BEGIN
-                EXECUTE format('TRUNCATE TABLE %I', $1);
-              END $$;
-              SELECT 'Queue purged' as result;
-            `,
-            params: [queueTable]
-          }
+      case 'list_stuck': {
+        // List messages with visibility timeouts that haven't been processed
+        const min_minutes = max_age_minutes || 10;
+        const { data, error } = await supabase.rpc(
+          'list_stuck_messages',
+          { queue_name, min_minutes_locked: min_minutes }
         );
         
-        if (purgeError) throw purgeError;
-        result = { operation: 'purge', status: 'success', data: purgeData };
-        break;
+        if (error) {
+          console.error("Error listing stuck messages:", error);
+          return new Response(JSON.stringify({ error: error.message }), 
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
         
-      case 'reset_visibility': 
-        // Reset visibility timeout for all messages or a specific message
-        let resetQuery = message_id ?
-          `UPDATE ${queueTable} SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1` :
-          `UPDATE ${queueTable} SET vt = NULL WHERE vt IS NOT NULL`;
-        
-        const resetParams = message_id ? [message_id.toString()] : [];
-        
-        const { data: resetData, error: resetError } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              WITH reset_result AS (
-                ${resetQuery}
-                RETURNING *
-              )
-              SELECT COUNT(*) as reset_count FROM reset_result
-            `,
-            params: resetParams
-          }
+        return new Response(JSON.stringify({ 
+          stuck_messages: data,
+          count: data?.length || 0
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      case 'reset_visibility': {
+        // Reset visibility timeout for stuck messages
+        const min_minutes = max_age_minutes || 10;
+        const { data, error } = await supabase.rpc(
+          'reset_stuck_messages',
+          { queue_name, min_minutes_locked: min_minutes }
         );
         
-        if (resetError) throw resetError;
-        result = { operation: 'reset_visibility', status: 'success', data: resetData };
-        break;
+        if (error) {
+          console.error("Error resetting stuck messages:", error);
+          return new Response(JSON.stringify({ error: error.message }), 
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
         
-      case 'list_stuck':
-        // List messages that appear to be stuck (visibility timeout expired)
-        const maxAgeMinutes = max_age_minutes || 10; // Default to 10 minutes
-        
-        const { data: stuckData, error: stuckError } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              SELECT 
-                id, 
-                msg_id, 
-                message, 
-                vt, 
-                read_ct,
-                created_at,
-                EXTRACT(EPOCH FROM (NOW() - vt))/60 AS minutes_since_locked
-              FROM ${queueTable}
-              WHERE 
-                vt IS NOT NULL 
-                AND vt < NOW() - INTERVAL '${maxAgeMinutes} minutes'
-              ORDER BY vt ASC
-            `,
-            params: []
-          }
-        );
-        
-        if (stuckError) throw stuckError;
-        result = { operation: 'list_stuck', status: 'success', data: stuckData };
-        break;
-        
-      case 'delete_by_id':
-        // Delete a specific message by ID
+        return new Response(JSON.stringify({ 
+          reset_count: data,
+          success: true
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      case 'delete_by_id': {
         if (!message_id) {
           throw new Error("message_id is required for delete_by_id operation");
         }
         
-        const { data: deleteData, error: deleteError } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              WITH deleted AS (
-                DELETE FROM ${queueTable}
-                WHERE id::TEXT = $1 OR msg_id::TEXT = $1
-                RETURNING *
-              )
-              SELECT COUNT(*) as deleted_count FROM deleted
-            `,
-            params: [message_id.toString()]
+        // Use enhanced deletion to handle different message ID formats
+        const { data, error } = await supabase.rpc(
+          'ensure_message_deleted',
+          { 
+            queue_name, 
+            message_id,
+            max_attempts: 3
           }
         );
         
-        if (deleteError) throw deleteError;
-        result = { operation: 'delete_by_id', status: 'success', data: deleteData };
-        break;
+        if (error) {
+          console.error(`Error deleting message ${message_id}:`, error);
+          return new Response(JSON.stringify({ error: error.message }), 
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
         
-      case 'fix_stuck':
-        // Automatically fix stuck messages (reset visibility timeout for stuck messages)
-        const fixTimeout = visibility_timeout || 60; // Default to 60 seconds
-        const fixMaxAge = max_age_minutes || 10; // Default to 10 minutes
+        return new Response(JSON.stringify({ 
+          deleted: data,
+          message_id
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      case 'fix_stuck': {
+        // This is a stronger reset that forces cleanup on all stuck messages
+        // It first lists all stuck messages, then deletes and re-enqueues them if needed
+        const min_minutes = max_age_minutes || 20; // Higher threshold for intervention
         
-        const { data: fixData, error: fixError } = await supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              WITH fixed AS (
-                UPDATE ${queueTable}
-                SET vt = NULL
-                WHERE 
-                  vt IS NOT NULL 
-                  AND vt < NOW() - INTERVAL '${fixMaxAge} minutes'
-                RETURNING *
-              )
-              SELECT COUNT(*) as fixed_count FROM fixed
-            `,
-            params: []
-          }
+        // Get list of stuck messages
+        const { data: stuckMessages, error: listError } = await supabase.rpc(
+          'list_stuck_messages',
+          { queue_name, min_minutes_locked: min_minutes }
         );
         
-        if (fixError) throw fixError;
-        result = { operation: 'fix_stuck', status: 'success', data: fixData };
-        break;
+        if (listError) {
+          console.error("Error listing stuck messages:", listError);
+          return new Response(JSON.stringify({ error: listError.message }), 
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
         
+        if (!stuckMessages || stuckMessages.length === 0) {
+          return new Response(JSON.stringify({ 
+            message: "No stuck messages found",
+            count: 0
+          }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        
+        // Process each stuck message
+        const results = [];
+        let fixCount = 0;
+        
+        for (const stuck of stuckMessages) {
+          // Try to delete the message first
+          const { data: deleted, error: deleteError } = await supabase.rpc(
+            'ensure_message_deleted',
+            { 
+              queue_name, 
+              message_id: stuck.id,
+              max_attempts: 2
+            }
+          );
+          
+          if (deleteError) {
+            console.error(`Error deleting stuck message ${stuck.id}:`, deleteError);
+            results.push({
+              message_id: stuck.id,
+              success: false,
+              error: deleteError.message
+            });
+            continue;
+          }
+          
+          // Re-enqueue the message if requested
+          if (deleted) {
+            try {
+              const { data: reEnqueued, error: enqueueError } = await supabase.rpc(
+                'pg_enqueue',
+                { 
+                  queue_name,
+                  message_body: stuck.message
+                }
+              );
+              
+              if (enqueueError) {
+                console.error(`Error re-enqueueing message:`, enqueueError);
+                results.push({
+                  message_id: stuck.id,
+                  deleted: true,
+                  re_enqueued: false,
+                  error: enqueueError.message
+                });
+              } else {
+                results.push({
+                  message_id: stuck.id,
+                  deleted: true,
+                  re_enqueued: true,
+                  new_message_id: reEnqueued
+                });
+                fixCount++;
+              }
+            } catch (e) {
+              console.error(`Error in re-enqueue process:`, e);
+              results.push({
+                message_id: stuck.id,
+                deleted: true,
+                re_enqueued: false,
+                error: e.message
+              });
+            }
+          } else {
+            results.push({
+              message_id: stuck.id,
+              deleted: false,
+              re_enqueued: false,
+              error: "Could not delete message"
+            });
+          }
+        }
+        
+        return new Response(JSON.stringify({ 
+          fixed_count: fixCount,
+          total_count: stuckMessages.length,
+          results
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      case 'purge': {
+        // This is a dangerous operation that clears all messages from a queue
+        throw new Error("Purge operation not implemented yet for safety. Contact support.");
+      }
+      
       default:
         throw new Error(`Unknown operation: ${operation}`);
     }
-    
-    return new Response(
-      JSON.stringify(result),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-    
   } catch (error) {
-    console.error("Error managing queue:", error);
-    
-    return new Response(
-      JSON.stringify({ error: error.message }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    console.error("Error in queue management:", error);
+    return new Response(JSON.stringify({ 
+      error: error.message 
+    }), { 
+      status: 400, 
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    });
   }
 });
