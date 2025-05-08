@@ -1,6 +1,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -14,53 +15,126 @@ serve(async (req) => {
   }
 
   try {
-    // Expect { artistName: "Artist Name" } in the request body
-    const { artistName } = await req.json();
-    
-    if (!artistName) {
+    // Parse request body
+    let artistName;
+    try {
+      const body = await req.json();
+      artistName = body.artistName;
+      
+      if (!artistName) {
+        return new Response(
+          JSON.stringify({ error: "artistName is required" }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    } catch (parseError) {
+      console.error("Error parsing request body:", parseError);
       return new Response(
-        JSON.stringify({ error: "artistName is required" }),
+        JSON.stringify({ error: "Invalid request body - must be valid JSON with artistName" }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
     
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    // Initialize Supabase client
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    
+    if (!supabaseUrl || !supabaseServiceKey) {
+      throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables");
+    }
+    
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
     
     console.log(`Attempting to enqueue artist discovery for: ${artistName}`);
-    
-    // Use pg_enqueue RPC function for message insertion
-    const { data: messageId, error } = await supabase.rpc('pg_enqueue', {
+
+    // Create a unique idempotency key for this request
+    const idempotencyKey = `artist:name:${artistName.toLowerCase()}`;
+
+    // Method 1: Use the direct pg_enqueue RPC function for message insertion
+    const { data: messageId, error: enqueueError } = await supabase.rpc('pg_enqueue', {
       queue_name: 'artist_discovery',
-      message_body: { artistName } // This will be automatically converted to JSONB
+      message_body: { artistName, _idempotencyKey: idempotencyKey }
     });
     
-    if (error) {
-      console.error("Queue error:", error);
-      throw error;
+    if (enqueueError) {
+      console.error("Queue error from pg_enqueue:", enqueueError);
+      
+      // Fall back to Method 2: Try sendToQueue function 
+      try {
+        console.log("Falling back to sendToQueue function");
+        
+        const response = await supabase.functions.invoke('sendToQueue', { 
+          body: { 
+            queue_name: 'artist_discovery',
+            message: { artistName, _idempotencyKey: idempotencyKey },
+            deduplication_options: {
+              enabled: true,
+              ttlSeconds: 3600 // 1 hour
+            }
+          }
+        });
+        
+        if (response.error) {
+          throw new Error(`sendToQueue failed: ${response.error}`);
+        } else {
+          console.log("Successfully used sendToQueue function:", response.data);
+          messageId = response.data.messageId;
+        }
+      } catch (sendToQueueError) {
+        console.error("Both enqueueing methods failed:", sendToQueueError);
+        throw enqueueError; // Throw the original error since that's the primary method
+      }
+    }
+    
+    if (!messageId) {
+      throw new Error("Failed to get message ID after enqueueing");
     }
     
     console.log(`Successfully enqueued artist discovery, message ID: ${messageId}`);
     
     // Manually trigger the artist discovery worker to process immediately
+    console.log("Triggering artist discovery worker");
+    
     try {
-      await fetch(
-        `${Deno.env.get("SUPABASE_URL")}/functions/v1/artistDiscovery`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+      const workerResponse = await supabase.functions.invoke('artistDiscovery', {
+        body: { triggeredManually: true }
+      });
+      
+      if (workerResponse.error) {
+        console.warn("Could not trigger worker via functions.invoke:", workerResponse.error);
+        
+        // Fall back to direct HTTP call
+        try {
+          const directResponse = await fetch(
+            `${supabaseUrl}/functions/v1/artistDiscovery`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
+              },
+              body: JSON.stringify({ triggeredManually: true })
+            }
+          );
+          
+          if (!directResponse.ok) {
+            throw new Error(`HTTP error: ${directResponse.status} ${directResponse.statusText}`);
           }
+          
+          console.log("Artist discovery worker triggered successfully via direct HTTP");
+        } catch (httpError) {
+          console.warn("Could not trigger worker via direct HTTP:", httpError);
+          console.log("Worker will be triggered by scheduled cron job instead");
         }
-      );
-      console.log("Artist discovery worker triggered successfully");
+      } else {
+        console.log("Artist discovery worker triggered successfully via functions.invoke");
+      }
     } catch (triggerError) {
-      console.warn("Could not trigger worker directly, queue will be processed on schedule:", triggerError);
+      console.warn("Error triggering worker:", triggerError);
+      console.log("Worker will be triggered by scheduled cron job instead");
     }
     
+    // Return success response
     return new Response(
       JSON.stringify({ 
         success: true, 
