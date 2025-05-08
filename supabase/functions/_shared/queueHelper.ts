@@ -11,26 +11,6 @@ export function safeMessageIdString(messageId: any): string | null {
   return messageId.toString();
 }
 
-// Function to check if a track has already been processed
-export async function checkTrackProcessed(
-  redis: any, 
-  trackId: string,
-  queueName: string = "general" // Added queue name parameter with default
-): Promise<boolean> {
-  if (!redis) {
-    console.warn("Redis client is not initialized, skipping Redis check.");
-    return false;
-  }
-
-  try {
-    const key = `processed:${queueName}:${trackId}`;
-    return await redis.exists(key) === 1;
-  } catch (error) {
-    console.error(`Redis check failed for track ${trackId}:`, error);
-    return false;
-  }
-}
-
 // Function to safely delete a message from a queue with retries
 export async function deleteMessageWithRetries(
   supabase: any,

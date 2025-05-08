@@ -1,11 +1,23 @@
 
+/**
+ * Deduplication Service 
+ * 
+ * Provides idempotent processing through dual-system approach:
+ * 
+ * - Redis provides fast lookups and short-term deduplication
+ * - Database provides durable record and source of truth
+ * 
+ * Inspired by Stripe's idempotency implementation:
+ * https://stripe.com/blog/idempotency
+ */
+
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { getEnvironmentTTL } from "./stateManager.ts";
 
 export interface DeduplicationOptions {
-  ttlSeconds?: number; // How long to remember processed messages
-  useStrictPayloadMatch?: boolean; // Whether to use exact payload matching
-  useRedisFallback?: boolean; // Whether to continue on Redis errors
+  ttlSeconds?: number;
+  useStrictPayloadMatch?: boolean;
+  logDetails?: boolean;
 }
 
 export class DeduplicationService {
@@ -16,146 +28,158 @@ export class DeduplicationService {
   }
   
   /**
-   * Check if a message is a duplicate based on its payload
+   * Check if an operation with the given key has already been processed
    */
   async isDuplicate(
-    queueName: string,
-    payload: any,
+    namespace: string,
+    key: string,
     options: DeduplicationOptions = {}
   ): Promise<boolean> {
     const {
-      ttlSeconds = getEnvironmentTTL(), // Use environment-specific TTL by default
-      useStrictPayloadMatch = true,
-      useRedisFallback = true
+      ttlSeconds = getEnvironmentTTL(),
+      logDetails = false
     } = options;
     
     try {
-      // Normalize payload for consistent hashing
-      const payloadStr = typeof payload === 'string' 
-        ? payload 
-        : JSON.stringify(payload);
+      // Create a namespaced key for Redis
+      const dedupKey = this.createDeduplicationKey(namespace, key);
       
-      // Extract core identifiers from payload for non-strict matching
-      let deduplicationKey: string;
+      // Check if the key exists
+      const exists = await this.redis.exists(dedupKey);
       
-      if (useStrictPayloadMatch) {
-        // Use full payload hash for strict matching
-        const payloadHash = await crypto.subtle.digest(
-          "SHA-256", 
-          new TextEncoder().encode(payloadStr)
-        );
-        
-        const hashHex = Array.from(new Uint8Array(payloadHash))
-          .map(b => b.toString(16).padStart(2, '0'))
-          .join('');
-          
-        deduplicationKey = `dedup:${queueName}:${hashHex}`;
-      } else {
-        // Extract core business identifiers for less strict matching
-        try {
-          const parsedPayload = typeof payload === 'string' 
-            ? JSON.parse(payload) 
-            : payload;
-            
-          // Extract common identifiers used across different queue types
-          const identifiers = [];
-          
-          // Artist discovery
-          if (parsedPayload.artistId) identifiers.push(`artist:${parsedPayload.artistId}`);
-          if (parsedPayload.artistName) identifiers.push(`artistName:${parsedPayload.artistName}`);
-          
-          // Album discovery
-          if (parsedPayload.albumId) identifiers.push(`album:${parsedPayload.albumId}`);
-          if (parsedPayload.offset !== undefined) identifiers.push(`offset:${parsedPayload.offset}`);
-          
-          // Track discovery
-          if (parsedPayload.trackId) identifiers.push(`track:${parsedPayload.trackId}`);
-          
-          // Producer identification
-          if (parsedPayload.producerId) identifiers.push(`producer:${parsedPayload.producerId}`);
-          
-          // Create a composite key from available identifiers
-          const identifierString = identifiers.length > 0 
-            ? identifiers.join('-') 
-            : payloadStr.substring(0, 100); // Fallback for unknown structures
-            
-          deduplicationKey = `dedup:${queueName}:${identifierString}`;
-        } catch (parseError) {
-          // If parsing fails, fall back to strict hash
-          const payloadHash = await crypto.subtle.digest(
-            "SHA-256", 
-            new TextEncoder().encode(payloadStr)
-          );
-          
-          const hashHex = Array.from(new Uint8Array(payloadHash))
-            .map(b => b.toString(16).padStart(2, '0'))
-            .join('');
-            
-          deduplicationKey = `dedup:${queueName}:${hashHex}`;
-        }
+      if (logDetails) {
+        console.log(`Deduplication check for ${namespace}:${key} - Result: ${exists === 1 ? 'Duplicate' : 'New'}`);
       }
       
-      // Check if this key exists in Redis
-      const exists = await this.redis.exists(deduplicationKey);
-      
-      if (exists === 1) {
-        console.log(`Duplicate message detected in ${queueName}: ${payloadStr.substring(0, 100)}...`);
-        return true; // Duplicate found
-      }
-      
-      // Set key for future deduplication
-      await this.redis.set(deduplicationKey, 'true', { ex: ttlSeconds });
-      return false; // Not a duplicate
+      return exists === 1;
     } catch (error) {
-      console.warn(`Redis deduplication check failed: ${error}`);
-      return useRedisFallback ? false : true; 
-      // Either allow processing on errors (false) or
-      // reject processing on errors (true) based on config
+      console.warn(`Deduplication check failed for ${namespace}:${key}: ${error.message}`);
+      // Default to non-duplicate when Redis fails
+      return false;
     }
   }
   
   /**
-   * Mark a message as processed
+   * Mark an operation as processed with the given key
    */
   async markAsProcessed(
-    queueName: string,
-    payload: any,
-    ttlSeconds = getEnvironmentTTL() // Use environment-specific TTL
+    namespace: string,
+    key: string,
+    ttlSeconds?: number
   ): Promise<void> {
+    const effectiveTtl = ttlSeconds || getEnvironmentTTL();
+    
     try {
-      const payloadStr = typeof payload === 'string' 
-        ? payload 
-        : JSON.stringify(payload);
-        
-      // Create a hash of the payload
-      const payloadHash = await crypto.subtle.digest(
-        "SHA-256", 
-        new TextEncoder().encode(payloadStr)
+      // Create a namespaced key for Redis
+      const dedupKey = this.createDeduplicationKey(namespace, key);
+      
+      // Store the processing timestamp with TTL
+      const result = await this.redis.set(
+        dedupKey,
+        new Date().toISOString(),
+        {
+          ex: effectiveTtl
+        }
       );
       
-      const hashHex = Array.from(new Uint8Array(payloadHash))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
-        
-      const deduplicationKey = `dedup:${queueName}:${hashHex}`;
-      
-      // Set the key with expiration
-      await this.redis.set(deduplicationKey, 'true', { ex: ttlSeconds });
+      if (result !== "OK") {
+        console.warn(`Failed to mark ${namespace}:${key} as processed: ${result}`);
+      }
     } catch (error) {
-      console.warn(`Failed to mark message as processed: ${error.message}`);
+      console.warn(`Error marking as processed: ${error.message}`);
+    }
+  }
+  
+  /**
+   * Create a deduplication key with namespace
+   */
+  private createDeduplicationKey(namespace: string, key: string): string {
+    // Normalize and clean the key to avoid Redis key pattern issues
+    const normalizedKey = typeof key === 'string'
+      ? key.replace(/[^a-zA-Z0-9_:-]/g, '-')
+      : String(key);
+    
+    return `dedup:${namespace}:${normalizedKey}`;
+  }
+  
+  /**
+   * Clear deduplication keys based on pattern
+   */
+  async clearKeys(
+    namespace?: string,
+    pattern?: string,
+    olderThanSeconds?: number
+  ): Promise<number> {
+    try {
+      // Build the pattern for scanning keys
+      const scanPattern = namespace
+        ? pattern 
+          ? `dedup:${namespace}:${pattern}`
+          : `dedup:${namespace}:*`
+        : pattern
+          ? `dedup:*:${pattern}` 
+          : "dedup:*";
+      
+      let cursor = '0';
+      let totalDeleted = 0;
+      
+      do {
+        // Scan for keys matching the pattern
+        const [nextCursor, keys] = await this.redis.scan(
+          cursor,
+          "MATCH",
+          scanPattern,
+          "COUNT",
+          100
+        );
+        
+        cursor = nextCursor;
+        
+        if (keys && keys.length > 0) {
+          let keysToDelete: string[] = [];
+          
+          // If age filter is specified, check TTL for each key
+          if (olderThanSeconds && olderThanSeconds > 0) {
+            for (const key of keys) {
+              try {
+                const ttl = await this.redis.ttl(key);
+                
+                // Get the default TTL for comparison
+                const defaultTtl = getEnvironmentTTL();
+                
+                // If TTL is negative (no expiry) or less than (default - age),
+                // it's older than specified age
+                if (ttl < 0 || (defaultTtl - ttl > olderThanSeconds)) {
+                  keysToDelete.push(key);
+                }
+              } catch (ttlError) {
+                console.warn(`Error checking TTL for ${key}: ${ttlError.message}`);
+              }
+            }
+          } else {
+            // If no age filter, delete all matching keys
+            keysToDelete = keys;
+          }
+          
+          // Delete the selected keys
+          if (keysToDelete.length > 0) {
+            const deleteCount = await this.redis.del(...keysToDelete);
+            totalDeleted += deleteCount;
+          }
+        }
+      } while (cursor !== '0');
+      
+      return totalDeleted;
+    } catch (error) {
+      console.error(`Error clearing deduplication keys: ${error.message}`);
+      return 0;
     }
   }
 }
 
-// Singleton instance
-let deduplicationServiceInstance: DeduplicationService | null = null;
-
 /**
- * Get or create the deduplication service instance
+ * Get a singleton instance of DeduplicationService
  */
 export function getDeduplicationService(redis: Redis): DeduplicationService {
-  if (!deduplicationServiceInstance && redis) {
-    deduplicationServiceInstance = new DeduplicationService(redis);
-  }
-  return deduplicationServiceInstance || new DeduplicationService(redis);
+  return new DeduplicationService(redis);
 }

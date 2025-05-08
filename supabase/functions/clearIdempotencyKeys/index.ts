@@ -1,6 +1,6 @@
 
 // Enhanced edge function to clear idempotency keys
-// Supports queue-specific clearing and age-based filtering
+// Supports queue-specific clearing, age-based filtering, and database state coordination
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
@@ -26,7 +26,10 @@ serve(async (req) => {
     
     // Extract parameters from URL or request body
     let queueName = '';
+    let entityType = '';
     let ageMinutes = 0;
+    let clearDatabase = false; // Flag to coordinate with database state
+    let keyPattern = ''; // For advanced pattern-based matching
     
     // Parse the URL for path parameters, e.g., /clearIdempotencyKeys/artist_discovery/60
     const url = new URL(req.url);
@@ -44,50 +47,106 @@ serve(async (req) => {
     if (!queueName) {
       queueName = url.searchParams.get('queue') || '';
     }
+    if (!entityType) {
+      entityType = url.searchParams.get('entityType') || '';
+    }
     if (!ageMinutes) {
       ageMinutes = parseInt(url.searchParams.get('age') || '0');
     }
+    if (!keyPattern) {
+      keyPattern = url.searchParams.get('pattern') || '';
+    }
+    clearDatabase = url.searchParams.get('clearDatabase') === 'true';
     
     // If still not found, try request body
-    if ((!queueName || !ageMinutes) && req.body) {
+    if (req.body) {
       try {
         const body = await req.json();
-        if (!queueName) {
+        if (!queueName && (body.queue || body.queueName)) {
           queueName = body.queue || body.queueName || '';
         }
-        if (!ageMinutes) {
+        if (!entityType && body.entityType) {
+          entityType = body.entityType;
+        }
+        if (!ageMinutes && (body.age || body.ageMinutes)) {
           ageMinutes = body.age || body.ageMinutes || 0;
+        }
+        if (!keyPattern && body.pattern) {
+          keyPattern = body.pattern;
+        }
+        if (body.clearDatabase !== undefined) {
+          clearDatabase = !!body.clearDatabase;
         }
       } catch (e) {
         // Ignore JSON parsing errors
       }
     }
     
-    console.log(`Calling manageRedis to clear idempotency keys for queue: ${queueName || 'all'}, age: ${ageMinutes || 'all'}`);
+    // Set up the request for manageRedis
+    const redisOperation = {
+      operation: 'clear-idempotency',
+      queueName,
+      entityType,
+      pattern: keyPattern,
+      age: ageMinutes
+    };
     
-    // Call the manageRedis function with the proper path and method
-    const { data, error } = await supabase.functions.invoke('manageRedis', {
+    console.log(`Calling manageRedis to clear idempotency keys: ${JSON.stringify(redisOperation)}`);
+    
+    // Clear Redis idempotency keys
+    const { data: redisResult, error: redisError } = await supabase.functions.invoke('manageRedis', {
       method: 'DELETE',
-      body: { 
-        operation: 'clear-idempotency',
-        queueName,
-        age: ageMinutes
-      }
+      body: redisOperation
     });
     
-    if (error) {
-      console.error("Error clearing idempotency keys:", error);
-      throw new Error(`Failed to clear idempotency keys: ${error.message}`);
+    if (redisError) {
+      console.error("Error clearing Redis idempotency keys:", redisError);
+      throw new Error(`Failed to clear idempotency keys from Redis: ${redisError.message}`);
     }
     
-    console.log("Successfully cleared idempotency keys:", data);
+    const result = {
+      success: true,
+      redisKeysDeleted: redisResult?.keysDeleted || 0,
+      databaseEntitiesReset: 0,
+      message: `Cleared ${redisResult?.keysDeleted || 0} Redis idempotency keys`,
+    };
+    
+    // If database coordination is requested, also reset database state
+    if (clearDatabase && (entityType || queueName)) {
+      try {
+        // Convert queue name to entity type if needed
+        const dbEntityType = entityType || queueName.replace(/_/g, '-');
+        
+        // Get age in minutes, defaulting to 24 hours if not specified
+        const dbAgeMinutes = ageMinutes || 24 * 60;
+        
+        // Call database function to reset entity processing state
+        const { data: dbResult, error: dbError } = await supabase.rpc(
+          'reset_entity_processing_state',
+          {
+            p_entity_type: dbEntityType,
+            p_older_than_minutes: dbAgeMinutes,
+            p_target_states: ['COMPLETED', 'FAILED']
+          }
+        );
+        
+        if (dbError) {
+          console.warn("Warning: Database state reset failed:", dbError);
+          result.databaseError = dbError.message;
+        } else {
+          result.databaseEntitiesReset = dbResult?.length || 0;
+          result.message = `Successfully cleared ${result.redisKeysDeleted} Redis keys and reset ${result.databaseEntitiesReset} database entities`;
+        }
+      } catch (dbExc) {
+        console.warn("Exception during database reset:", dbExc);
+        result.databaseError = dbExc.message;
+      }
+    }
+    
+    console.log("Successfully cleared idempotency keys:", result);
     
     return new Response(
-      JSON.stringify({ 
-        success: true,
-        message: `Successfully cleared ${data.keysDeleted} idempotency keys`,
-        details: data
-      }),
+      JSON.stringify(result),
       { 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         status: 200 
