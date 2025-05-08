@@ -69,3 +69,5 @@ verify_jwt = false
 [functions.queueMonitor]
 verify_jwt = false
 
+[functions.checkQueueMessage]
+verify_jwt = false
