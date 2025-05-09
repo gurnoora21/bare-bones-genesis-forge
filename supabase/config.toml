@@ -1,5 +1,4 @@
 
-# Project ID
 project_id = "wshetxovyxtfqohhbvpg"
 
 [api]
@@ -11,6 +10,13 @@ schemas = ["public", "storage", "graphql_public"]
 port = 54322
 shadow_port = 54320
 major_version = 15
+
+[db.pooler]
+enabled = false
+port = 54329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
 
 [realtime]
 enabled = true
@@ -26,48 +32,78 @@ port = 54324
 
 [storage]
 enabled = true
-file_size_limit = "50MiB"
 
 [auth]
 enabled = true
 site_url = "http://localhost:3000"
 
-[analytics]
+[auth.email]
+enabled = true
+
+[auth.sms]
+enabled = true
+
+[auth.external.apple]
 enabled = false
 
-# Schedule for queue workers
-[functions.artistDiscovery]
-verify_jwt = false
+[auth.external.azure]
+enabled = false
 
-[functions.albumDiscovery]
-verify_jwt = false
+[auth.external.bitbucket]
+enabled = false
 
-[functions.trackDiscovery]
-verify_jwt = false
+[auth.external.discord]
+enabled = false
 
-[functions.producerIdentification]
-verify_jwt = false
+[auth.external.facebook]
+enabled = false
 
-[functions.socialEnrichment]
-verify_jwt = false
+[auth.external.figma]
+enabled = false
 
-[functions.readQueue]
-verify_jwt = false
+[auth.external.github]
+enabled = false
 
-[functions.sendToQueue]
-verify_jwt = false
+[auth.external.gitlab]
+enabled = false
 
-[functions.deleteFromQueue]
-verify_jwt = false
+[auth.external.google]
+enabled = false
 
-[functions.startDiscovery]
-verify_jwt = false
+[auth.external.keycloak]
+enabled = false
 
-[functions.manageQueue]
-verify_jwt = false
+[auth.external.linkedin]
+enabled = false
 
-[functions.queueMonitor]
-verify_jwt = false
+[auth.external.notion]
+enabled = false
 
-[functions.checkQueueMessage]
-verify_jwt = false
+[auth.external.slack]
+enabled = false
+
+[auth.external.spotify]
+enabled = false
+
+[auth.external.twitch]
+enabled = false
+
+[auth.external.twitter]
+enabled = false
+
+[auth.external.workos]
+enabled = false
+
+[auth.external.zoom]
+enabled = false
+
+[analytics]
+enabled = false
+port = 54327
+vector_port = 54328
+
+[experimental]
+storageV2 = false
+
+[functions]
+lockManager = {}

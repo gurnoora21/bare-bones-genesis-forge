@@ -1,4 +1,3 @@
-
 /**
  * Idempotent Worker Base Class
  * 
@@ -629,6 +628,82 @@ export abstract class IdempotentWorker<TMessage, TResult> {
       console.log(`[${correlationId}] Message sent to dead letter queue: ${reason}`);
     } catch (dlqError) {
       console.error(`[${correlationId}] Error sending to dead letter queue:`, dlqError);
+    }
+  }
+  
+  /**
+   * Acquire a processing lock using the lock manager
+   */
+  protected async acquireProcessingLock(entityType: string, entityId: string, options: any = {}): Promise<boolean> {
+    try {
+      // Use the lockManager edge function
+      const { data, error } = await this.supabase.functions.invoke("lockManager", {
+        body: {
+          operation: "acquire",
+          entityType,
+          entityId,
+          options: {
+            timeoutMinutes: options.timeoutMinutes || 30,
+            ttlSeconds: options.ttlSeconds || 1800,
+            workerId: this.getWorkerId(),
+            correlationId: this.correlationId
+          }
+        }
+      });
+      
+      if (error) {
+        this.logger.error(`Error acquiring lock for ${entityType}:${entityId}:`, error);
+        return false;
+      }
+      
+      if (data && data.acquired) {
+        this.logger.info(`[${this.correlationId}] Successfully acquired lock for ${entityType}:${entityId} via ${data.method}`);
+        return true;
+      } else {
+        const reason = data?.reason || "Unknown reason";
+        this.logger.info(`[${this.correlationId}] Failed to acquire lock for ${entityType}:${entityId}: ${reason}`);
+        return false;
+      }
+    } catch (error) {
+      this.logger.error(`[${this.correlationId}] Exception acquiring lock for ${entityType}:${entityId}:`, error);
+      return false;
+    }
+  }
+  
+  /**
+   * Release a processing lock using the lock manager
+   */
+  protected async releaseProcessingLock(entityType: string, entityId: string): Promise<boolean> {
+    try {
+      // Use the lockManager edge function
+      const { data, error } = await this.supabase.functions.invoke("lockManager", {
+        body: {
+          operation: "release",
+          entityType,
+          entityId,
+          options: {
+            workerId: this.getWorkerId(),
+            correlationId: this.correlationId
+          }
+        }
+      });
+      
+      if (error) {
+        this.logger.error(`[${this.correlationId}] Error releasing lock for ${entityType}:${entityId}:`, error);
+        return false;
+      }
+      
+      if (data && data.released) {
+        this.logger.info(`[${this.correlationId}] Successfully released lock for ${entityType}:${entityId}`);
+        return true;
+      } else {
+        const errors = data?.errors ? JSON.stringify(data.errors) : "Unknown reason";
+        this.logger.info(`[${this.correlationId}] Failed to release lock for ${entityType}:${entityId}: ${errors}`);
+        return false;
+      }
+    } catch (error) {
+      this.logger.error(`[${this.correlationId}] Exception releasing lock for ${entityType}:${entityId}:`, error);
+      return false;
     }
   }
   

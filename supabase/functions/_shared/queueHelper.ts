@@ -1,75 +1,11 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { StateTransitionResult, ProcessingState } from "./stateManager.ts";
+import { DeduplicationService } from "./deduplication.ts";
 
 /**
- * Queue Helper Functions
- * Provides utilities for safe queue message processing with idempotency
+ * Logs worker issues to the database for monitoring and debugging
  */
-
-import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { DeduplicationService, getDeduplicationService } from "./deduplication.ts";
-import { CoordinatedStateManager, getStateManager } from "./coordinatedStateManager.ts";
-import { ProcessingState, ErrorCategory, classifyError, generateCorrelationId } from "./stateManager.ts";
-import { DeduplicationMetrics, getDeduplicationMetrics } from "./metrics.ts";
-
-// Helper function to safely format message ID as string
-export function safeMessageIdString(messageId: any): string | null {
-  if (messageId === undefined || messageId === null) {
-    return null;
-  }
-  return messageId.toString();
-}
-
-// Function to safely delete a message from a queue with retries
-export async function deleteMessageWithRetries(
-  supabase: any,
-  queueName: string,
-  messageId: any,
-  maxRetries = 3
-): Promise<boolean> {
-  // Validate messageId
-  if (messageId === undefined || messageId === null) {
-    console.error(`Cannot delete message with undefined or null ID from ${queueName}`);
-    return false;
-  }
-
-  const messageIdStr = messageId.toString();
-  let retries = 0;
-  let success = false;
-
-  while (retries < maxRetries && !success) {
-    try {
-      const { data, error } = await supabase.functions.invoke("deleteFromQueue", {
-        body: {
-          queue_name: queueName,
-          message_id: messageIdStr
-        }
-      });
-
-      if (error) {
-        console.error(`Error deleting message ${messageIdStr} (attempt ${retries + 1}):`, error);
-      } else if (data && data.success) {
-        success = true;
-        console.log(`Successfully deleted message ${messageIdStr} from ${queueName}`);
-        break;
-      } else {
-        console.warn(`Failed to delete message ${messageIdStr} (attempt ${retries + 1})`);
-      }
-    } catch (err) {
-      console.error(`Exception deleting message ${messageIdStr} (attempt ${retries + 1}):`, err);
-    }
-
-    retries++;
-    if (retries < maxRetries) {
-      // Exponential backoff with jitter
-      const delay = Math.floor(100 * Math.pow(2, retries) * (0.8 + Math.random() * 0.4));
-      console.log(`Retrying deletion in ${delay}ms...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-
-  return success;
-}
-
-// Function to log worker issues to the database
 export async function logWorkerIssue(
   supabase: any,
   workerName: string,
@@ -78,658 +14,302 @@ export async function logWorkerIssue(
   details: any = {}
 ): Promise<void> {
   try {
-    const now = new Date().toISOString();
-    const logEntry = {
+    const { error } = await supabase.from('worker_issues').insert({
       worker_name: workerName,
       issue_type: issueType,
       message: message,
       details: details,
-      created_at: now,
-      updated_at: now
-    };
-
-    const { error } = await supabase
-      .from('worker_issues')
-      .insert(logEntry);
+      created_at: new Date().toISOString()
+    });
 
     if (error) {
       console.error("Failed to log worker issue to database:", error);
-    } else {
-      console.log(`Logged worker issue: ${message}`);
     }
   } catch (error) {
-    console.error("Unexpected error logging worker issue:", error);
+    console.error("Error logging worker issue:", error);
   }
 }
 
-// Enhanced options for queue processing
-export interface ProcessQueueOptions {
-  maxRetries?: number;
-  circuitBreaker?: boolean;
-  timeoutMs?: number;
-  deduplication?: {
-    enabled: boolean;
-    redis?: Redis;
-    ttlSeconds?: number;
-    strictMatching?: boolean;
-  };
-  stateManagement?: {
-    enabled: boolean;
-    entityType?: string;
-    entityId?: string;
-    timeoutMinutes?: number;
-  };
-  deadLetter?: {
-    enabled: boolean;
-    queue?: string;
-    errorCategories?: ErrorCategory[];
-  };
-  correlationId?: string;
-  metrics?: {
-    enabled: boolean;
-    redis?: Redis;
-  };
-  retryStrategy?: {
-    baseDelayMs?: number;
-    maxDelayMs?: number;
-    jitterFactor?: number;
-  };
-}
-
-// Return type for process queue
-export interface ProcessResult {
-  success: boolean;
-  deduplication?: boolean;
-  stateManaged?: boolean;
-  deadLettered?: boolean;
-  error?: string;
-  errorCategory?: ErrorCategory;
-  correlationId?: string;
-  processingTimeMs?: number;
-  retryCount?: number;
-}
-
-// Function to calculate retry delay with exponential backoff and jitter
-function calculateRetryDelay(
-  attempt: number, 
-  baseDelay: number = 100, 
-  maxDelay: number = 30000, 
-  jitterFactor: number = 0.2
-): number {
-  // Calculate exponential backoff
-  const expBackoff = Math.min(maxDelay, baseDelay * Math.pow(2, attempt));
-  
-  // Add jitter
-  const jitter = expBackoff * jitterFactor;
-  const jitterRange = jitter * 2; // Total range is +/- jitter
-  const randomJitter = Math.random() * jitterRange - jitter; // Random value between -jitter and +jitter
-  
-  return Math.max(baseDelay, Math.floor(expBackoff + randomJitter));
-}
-
-// Create a processing lock with heartbeat
-export async function acquireProcessingLock(
-  entityType: string, 
-  entityId: string,
-  correlationId?: string,
-  options: { 
-    timeoutMinutes?: number;
-    heartbeatIntervalSeconds?: number;
-  } = {}
-): Promise<boolean> {
-  try {
-    // Use PostgreSQL advisory lock
-    const result = await fetch('pg_lock_acquire', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        entity_type: entityType,
-        entity_id: entityId,
-        timeout_minutes: options.timeoutMinutes || 30
-      })
-    });
-    
-    if (result.ok) {
-      const data = await result.json();
-      return data.acquired === true;
-    }
-    
-    return false;
-  } catch (error) {
-    console.error(`Error acquiring lock for ${entityType}:${entityId}: ${error.message}`);
-    return false;
-  }
-}
-
-// Check if a track has been processed
-export async function checkTrackProcessed(
-  redis: Redis,
-  trackId: string,
-  processingType: string
-): Promise<boolean> {
-  try {
-    const processedKey = `processed:${processingType}:${trackId}`;
-    return await redis.exists(processedKey) === 1;
-  } catch (error) {
-    console.warn(`Redis check failed for ${trackId}: ${error.message}`);
-    return false;
-  }
-}
-
-// Send a message to a dead-letter queue
-async function sendToDeadLetterQueue(
+/**
+ * Deletes a message from the queue with retries
+ */
+export async function deleteMessageWithRetries(
   supabase: any,
   queueName: string,
-  originalMessage: any,
-  error: Error,
-  correlationId: string,
-  originalMessageId?: string
+  messageId: string,
+  maxRetries: number = 3,
+  delayMs: number = 500
+): Promise<boolean> {
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      const { error } = await supabase.functions.invoke("deleteMessage", {
+        body: {
+          queue_name: queueName,
+          msg_id: messageId
+        }
+      });
+
+      if (error) {
+        console.error(`Attempt ${attempt + 1} to delete message ${messageId} failed:`, error);
+        attempt++;
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      } else {
+        console.log(`Message ${messageId} deleted successfully from queue ${queueName}`);
+        return true;
+      }
+    } catch (error) {
+      console.error(`Exception during attempt ${attempt + 1} to delete message ${messageId}:`, error);
+      attempt++;
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+
+  console.error(`Failed to delete message ${messageId} after ${maxRetries} attempts`);
+  return false;
+}
+
+/**
+ * Checks if a track has already been processed
+ */
+export async function checkTrackProcessed(
+  supabase: any,
+  trackSpotifyId: string
 ): Promise<boolean> {
   try {
-    const deadLetterQueueName = `${queueName}_dlq`;
-    const errorCategory = classifyError(error);
-    const deadLetterMessage = {
-      originalMessage,
-      error: {
-        message: error.message,
-        stack: error.stack,
-        name: error.name,
-        category: errorCategory
-      },
-      metadata: {
-        failedAt: new Date().toISOString(),
-        correlationId,
-        originalQueue: queueName,
-        originalMessageId
-      }
-    };
-    
-    const { error: enqueueError } = await supabase.functions.invoke("sendToQueue", {
-      body: {
-        queue_name: deadLetterQueueName,
-        message: deadLetterMessage
-      }
-    });
-    
-    if (enqueueError) {
-      console.error(`Error sending to dead-letter queue ${deadLetterQueueName}:`, enqueueError);
+    const { data, error } = await supabase
+      .from('tracks')
+      .select('id')
+      .eq('spotify_id', trackSpotifyId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Error checking if track exists:", error);
       return false;
     }
-    
-    console.log(`Message sent to dead-letter queue ${deadLetterQueueName} with correlationId ${correlationId}`);
-    return true;
-  } catch (enqueueError) {
-    console.error(`Failed to send to dead-letter queue:`, enqueueError);
+
+    return !!data;
+  } catch (error) {
+    console.error("Error checking if track exists:", error);
     return false;
   }
 }
 
-// Function to process a queue message with safety checks, idempotency, and deduplication
+/**
+ * Safely processes a queue message with idempotency and deduplication
+ */
 export async function processQueueMessageSafely(
   supabase: any,
   queueName: string,
-  messageId: string | null,
-  processingFunction: () => Promise<any>,
+  messageId: string,
+  processMessage: () => Promise<any>,
   idempotencyKey: string,
-  alreadyProcessedCheck?: () => Promise<boolean>,
-  options: ProcessQueueOptions = {}
-): Promise<ProcessResult> {
-  // Handle null or undefined messageId
-  if (!messageId) {
-    console.error(`Cannot process message with null or undefined ID for queue ${queueName}`);
-    return { success: false, error: "Missing messageId" };
-  }
-
-  // Generate correlation ID if not provided
-  const correlationId = options.correlationId || 
-    generateCorrelationId(`corr`);
+  isAlreadyProcessed: () => Promise<boolean>,
+  options: any = {}
+): Promise<any> {
+  const { 
+    maxRetries = 3, 
+    retryDelayMs = 1000,
+    circuitBreaker = false,
+    deduplication = { enabled: false, redis: null, ttlSeconds: 3600, strictMatching: true }
+  } = options;
   
-  console.log(`[${correlationId}] Processing message ${messageId} from queue ${queueName}`);
+  let attempt = 0;
+  let lastError: any = null;
   
-  const startTime = Date.now();
-  let stateManager: CoordinatedStateManager | undefined;
-  let deduplicationService: DeduplicationService | undefined;
-  let metrics: DeduplicationMetrics | undefined;
-  let retryCount = 0;
+  // Initialize deduplication service if enabled
+  const deduplicationService = deduplication.enabled && deduplication.redis
+    ? new DeduplicationService(deduplication.redis, {
+      ttlSeconds: deduplication.ttlSeconds,
+      strictMatching: deduplication.strictMatching
+    })
+    : null;
   
-  // Result object to track what happened
-  const result: ProcessResult = {
-    success: false,
-    correlationId,
-    retryCount
-  };
-
-  // Calculate retry parameters from options
-  const retryStrategy = options.retryStrategy || {};
-  const baseDelayMs = retryStrategy.baseDelayMs || 100;
-  const maxDelayMs = retryStrategy.maxDelayMs || 30000;
-  const jitterFactor = retryStrategy.jitterFactor || 0.2;
-  
-  // Setup max retries
-  const maxRetries = options.maxRetries || 2;
-
-  try {
-    // Initialize metrics if enabled
-    if (options.metrics?.enabled && options.metrics?.redis) {
-      metrics = getDeduplicationMetrics(options.metrics.redis);
-    }
-    
-    // Initialize state management if enabled
-    if (options.stateManagement?.enabled) {
-      console.log(`[${correlationId}] Using state management`);
-      let redisClient: Redis | undefined;
-      
-      if (options.deduplication?.enabled && options.deduplication.redis) {
-        redisClient = options.deduplication.redis;
-      }
-      
-      stateManager = getStateManager(supabase, redisClient);
-      
-      const entityType = options.stateManagement.entityType || queueName;
-      const entityId = options.stateManagement.entityId || idempotencyKey;
-      const timeoutMinutes = options.stateManagement.timeoutMinutes || 30;
-      
-      // Try to acquire a processing lock
-      const lockAcquired = await stateManager.acquireProcessingLock(
-        entityType, 
-        entityId,
-        {
-          timeoutMinutes,
-          correlationId
-        }
-      );
-      
-      if (!lockAcquired) {
-        console.log(`[${correlationId}] Failed to acquire processing lock, skipping message ${messageId}`);
+  while (attempt <= maxRetries) {
+    try {
+      // Check if message was already processed using the provided function
+      if (await isAlreadyProcessed()) {
+        console.log(`Message ${messageId} (key: ${idempotencyKey}) already processed, skipping`);
         
-        // Delete the message since we're skipping it (already being processed elsewhere)
+        // Delete message from queue to prevent reprocessing
         await deleteMessageWithRetries(supabase, queueName, messageId);
         
-        result.stateManaged = true;
-        result.success = true; // We consider this successful since it's being handled elsewhere
-        return result;
+        return { deduplication: true, skipped: true, reason: "already_processed" };
       }
       
-      result.stateManaged = true;
-    }
-  
-    // Check deduplication if enabled
-    if (options.deduplication?.enabled && options.deduplication.redis) {
-      console.log(`[${correlationId}] Using deduplication service`);
-      const redis = options.deduplication.redis;
-      deduplicationService = getDeduplicationService(redis);
-      
-      // Use idempotency key for deduplication
-      const isDuplicate = await deduplicationService.isDuplicate(
-        queueName, 
-        idempotencyKey,
-        { 
-          ttlSeconds: options.deduplication.ttlSeconds,
-          useStrictPayloadMatch: options.deduplication.strictMatching ?? true,
-          logDetails: true
-        },
-        { correlationId }
-      );
-      
-      if (isDuplicate) {
-        console.log(`[${correlationId}] Deduplication: Skipping duplicate message ${messageId} with key ${idempotencyKey} in queue ${queueName}`);
-        
-        // Delete the message since it's being skipped as a duplicate
-        await deleteMessageWithRetries(supabase, queueName, messageId);
-        
-        // Record deduplication metric if enabled
-        if (metrics) {
-          await metrics.recordDeduplicated(queueName, "consumer", correlationId);
-        }
-        
-        result.deduplication = true;
-        result.success = true; // We consider this successful since it's a duplicate
-        return result;
-      }
-    }
-
-    // Check if already processed (if check function provided)
-    if (alreadyProcessedCheck) {
-      try {
-        const alreadyProcessed = await alreadyProcessedCheck();
-        if (alreadyProcessed) {
-          console.log(`[${correlationId}] Message ${messageId} with key ${idempotencyKey} was already processed, skipping`);
+      // Check for deduplication
+      if (deduplicationService) {
+        const deduplicated = await deduplicationService.checkAndRegister(idempotencyKey);
+        if (deduplicated) {
+          console.log(`Message ${messageId} (key: ${idempotencyKey}) deduplicated, skipping`);
           
-          // Still need to delete the message since it's being skipped
+          // Delete message from queue to prevent reprocessing
           await deleteMessageWithRetries(supabase, queueName, messageId);
           
-          // Record as duplicate if metrics are enabled
-          if (metrics) {
-            await metrics.recordDeduplicated(queueName, "consumer", correlationId);
-          }
-          
-          result.success = true;
-          return result;
-        }
-      } catch (error) {
-        console.warn(`[${correlationId}] Error checking if message ${messageId} was already processed:`, error);
-        // Continue with processing since we can't be sure if it was processed
-      }
-    }
-
-    // Process the message with retries and timeout
-    console.log(`[${correlationId}] Executing processing function for message ${messageId}`);
-    
-    // Wrap the processing function with retries
-    let processResult;
-    let lastError: Error | null = null;
-    
-    for (retryCount = 0; retryCount <= maxRetries; retryCount++) {
-      try {
-        if (retryCount > 0) {
-          console.log(`[${correlationId}] Retry attempt ${retryCount} of ${maxRetries} for message ${messageId}`);
-        }
-        
-        // Process with timeout if specified
-        if (options.timeoutMs) {
-          // Process with timeout
-          processResult = await Promise.race([
-            processingFunction(),
-            new Promise((_, reject) => 
-              setTimeout(() => reject(new Error(`Processing timeout after ${options.timeoutMs}ms`)), options.timeoutMs)
-            )
-          ]);
-        } else {
-          // Process without timeout
-          processResult = await processingFunction();
-        }
-        
-        // Success! Break out of retry loop
-        lastError = null;
-        break;
-      } catch (error) {
-        lastError = error;
-        const errorCategory = classifyError(error);
-        result.errorCategory = errorCategory;
-        
-        console.error(`[${correlationId}] Error processing message ${messageId} (attempt ${retryCount + 1}):`, error);
-        
-        // Check if we should retry based on error category
-        const isRetriable = (
-          errorCategory === ErrorCategory.TRANSIENT || 
-          errorCategory === ErrorCategory.UNKNOWN
-        );
-        
-        // If this is not a retriable error or we're out of retries, break the loop
-        if (!isRetriable || retryCount >= maxRetries) {
-          break;
-        }
-        
-        // Calculate backoff delay
-        const delayMs = calculateRetryDelay(retryCount, baseDelayMs, maxDelayMs, jitterFactor);
-        console.log(`[${correlationId}] Retrying in ${delayMs}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
-    }
-    
-    // Check if we encountered an error
-    if (lastError) {
-      // If state management is enabled, mark entity as failed
-      if (options.stateManagement?.enabled && stateManager) {
-        const entityType = options.stateManagement.entityType || queueName;
-        const entityId = options.stateManagement.entityId || idempotencyKey;
-        
-        await stateManager.markAsFailed(
-          entityType, 
-          entityId, 
-          lastError.message,
-          {
-            correlationId,
-            timestamp: new Date().toISOString(),
-            retries: retryCount
-          }
-        );
-      }
-      
-      // Record failure metric if enabled
-      if (metrics) {
-        const errorType = lastError instanceof Error ? lastError.constructor.name : 'UnknownError';
-        await metrics.recordFailure(queueName, "consumer", errorType, lastError.message);
-      }
-      
-      // Send to dead-letter queue if enabled
-      if (options.deadLetter?.enabled) {
-        const errorCategory = classifyError(lastError);
-        const eligibleCategories = options.deadLetter.errorCategories || [
-          ErrorCategory.PERMANENT, 
-          ErrorCategory.UNKNOWN
-        ];
-        
-        if (eligibleCategories.includes(errorCategory)) {
-          const deadLetterSuccess = await sendToDeadLetterQueue(
-            supabase, 
-            queueName, 
-            { idempotencyKey }, // Replace with actual message content if available 
-            lastError, 
-            correlationId,
-            messageId
-          );
-          
-          if (deadLetterSuccess) {
-            result.deadLettered = true;
-            
-            // Mark as DEAD_LETTER in state manager
-            if (options.stateManagement?.enabled && stateManager) {
-              const entityType = options.stateManagement.entityType || queueName;
-              const entityId = options.stateManagement.entityId || idempotencyKey;
-              
-              await stateManager.markAsDeadLetter(
-                entityType,
-                entityId,
-                lastError.message,
-                {
-                  correlationId,
-                  deadLetteredAt: new Date().toISOString(),
-                  retries: retryCount
-                }
-              );
-            }
-            
-            // Delete original message since it's been moved to DLQ
-            await deleteMessageWithRetries(supabase, queueName, messageId);
-          }
+          return { deduplication: true, skipped: true, reason: "deduplicated" };
         }
       }
       
-      result.error = lastError.message;
-      result.success = false;
-      result.retryCount = retryCount;
+      // Process the message
+      const result = await processMessage();
+      
+      // If successful, delete message from queue
+      await deleteMessageWithRetries(supabase, queueName, messageId);
       
       return result;
-    }
-    
-    console.log(`[${correlationId}] Processing complete for message ${messageId}`);
-
-    // Delete message from queue after successful processing
-    const deleteSuccess = await deleteMessageWithRetries(supabase, queueName, messageId);
-    if (!deleteSuccess) {
-      console.warn(`[${correlationId}] Warning: Could not delete message ${messageId} from ${queueName} after successful processing`);
-    }
-
-    // If state management is enabled, mark entity as completed
-    if (options.stateManagement?.enabled && stateManager) {
-      const entityType = options.stateManagement.entityType || queueName;
-      const entityId = options.stateManagement.entityId || idempotencyKey;
+    } catch (error) {
+      lastError = error;
+      console.error(`Attempt ${attempt + 1} to process message ${messageId} failed:`, error);
       
-      await stateManager.markAsCompleted(entityType, entityId, {
-        processedAt: new Date().toISOString(),
-        result: processResult,
-        correlationId
-      });
-    }
-
-    // If deduplication is enabled, mark as processed to prevent future duplicates
-    if (options.deduplication?.enabled && options.deduplication.redis && deduplicationService) {
-      try {
-        await deduplicationService.markAsProcessed(
-          queueName,
-          idempotencyKey,
-          options.deduplication.ttlSeconds,
-          { correlationId, operation: "process" }
-        );
-        console.log(`[${correlationId}] Marked message with key ${idempotencyKey} as processed for future deduplication`);
-      } catch (e) {
-        console.warn(`[${correlationId}] Failed to mark message as processed for deduplication: ${e}`);
+      // Implement circuit breaker pattern
+      if (circuitBreaker && attempt >= 3) {
+        console.warn(`Circuit breaker triggered for message ${messageId} after multiple failures`);
+        throw error; // Stop retrying
       }
-    }
-    
-    // Record processing metrics if enabled
-    if (metrics) {
-      const processingTime = Date.now() - startTime;
-      await metrics.recordProcessed(queueName, "consumer", processingTime);
-      result.processingTimeMs = processingTime;
-    }
-
-    result.success = true;
-    result.retryCount = retryCount;
-    return result;
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`[${correlationId}] Error processing message ${messageId}:`, error);
-    
-    // If state management is enabled, mark entity as failed
-    if (options.stateManagement?.enabled && stateManager) {
-      const entityType = options.stateManagement.entityType || queueName;
-      const entityId = options.stateManagement.entityId || idempotencyKey;
       
-      await stateManager.markAsFailed(
-        entityType, 
-        entityId, 
-        errorMessage,
-        {
-          correlationId,
-          timestamp: new Date().toISOString()
-        }
-      );
+      attempt++;
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
     }
-    
-    // Record failure metric if enabled
-    if (metrics) {
-      const errorType = error instanceof Error ? error.constructor.name : 'UnknownError';
-      await metrics.recordFailure(queueName, "consumer", errorType, errorMessage);
-    }
-    
-    result.error = errorMessage;
-    result.success = false;
-    result.retryCount = retryCount;
-    
-    return result;
   }
+  
+  console.error(`Failed to process message ${messageId} after ${maxRetries} attempts`);
+  
+  // Log the final error
+  await logWorkerIssue(
+    supabase,
+    queueName,
+    "processing_failure",
+    `Failed to process message ${messageId} after multiple retries`,
+    {
+      messageId: messageId,
+      idempotencyKey: idempotencyKey,
+      error: lastError ? lastError.message : "Unknown error",
+      stack: lastError ? lastError.stack : null
+    }
+  );
+  
+  throw lastError; // Re-throw the last error after all retries have failed
 }
 
-// Function to check if processing for an entity should be skipped
-export async function checkSkipProcessing(
-  supabase: any,
-  redis: Redis,
+/**
+ * Acquires a processing lock for an entity to prevent duplicate processing
+ */
+export async function acquireProcessingLock(
   entityType: string,
-  entityId: string
+  entityId: string,
+  options: any = {}
 ): Promise<boolean> {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL") || "",
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
+  );
+
   try {
-    // Initialize state manager
-    const stateManager = getStateManager(supabase, redis);
+    // Use the lockManager edge function to acquire a lock
+    const { data, error } = await supabase.functions.invoke("lockManager", {
+      body: {
+        operation: "acquire",
+        entityType,
+        entityId,
+        options: {
+          timeoutMinutes: options.timeoutMinutes || 30,
+          ttlSeconds: options.ttlSeconds || 1800,
+          workerId: Deno.env.get("WORKER_ID") || `worker_${Math.random().toString(36).substring(2, 10)}`,
+          correlationId: options.correlationId || `lock_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
+        }
+      }
+    });
     
-    // Check if entity is already processed
-    const isProcessed = await stateManager.isProcessed(entityType, entityId);
+    if (error) {
+      console.error(`Error acquiring lock for ${entityType}:${entityId}:`, error);
+      return false;
+    }
     
-    return isProcessed;
+    if (data && data.acquired) {
+      console.log(`Successfully acquired lock for ${entityType}:${entityId} via ${data.method}`);
+      return true;
+    } else {
+      const reason = data?.reason || "Unknown reason";
+      console.log(`Failed to acquire lock for ${entityType}:${entityId}: ${reason}`);
+      return false;
+    }
   } catch (error) {
-    console.warn(`Error checking if processing should be skipped: ${error.message}`);
+    console.error(`Exception acquiring lock for ${entityType}:${entityId}:`, error);
     return false;
   }
 }
 
-// Function to log processing metrics
-export async function logProcessingMetrics(
-  supabase: any,
-  queueName: string,
-  operation: string,
-  results: {
-    processed: number,
-    success: number,
-    error: number,
-    details?: any
-  }
-): Promise<void> {
-  try {
-    const now = new Date().toISOString();
-    
-    await supabase.from('queue_metrics').insert({
-      queue_name: queueName,
-      operation: operation,
-      started_at: now,
-      finished_at: now,
-      processed_count: results.processed,
-      success_count: results.success,
-      error_count: results.error,
-      details: results.details || {}
-    });
-  } catch (error) {
-    console.warn(`Failed to log metrics: ${error.message}`);
-  }
-}
-
-// Function to requeue a message from the dead-letter queue back to the original queue
-export async function requeueFromDeadLetter(
-  supabase: any,
-  dlqName: string,
-  messageId: string
+/**
+ * Releases a processing lock
+ */
+export async function releaseProcessingLock(
+  entityType: string,
+  entityId: string,
+  workerId?: string
 ): Promise<boolean> {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL") || "",
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
+  );
+
   try {
-    // Read message from DLQ without deleting it
-    const { data: messages, error } = await supabase.functions.invoke("readQueue", {
-      body: { 
-        queue_name: dlqName,
-        batch_size: 1,
-        visibility_timeout: 60,
-        message_id: messageId
-      }
-    });
-    
-    if (error || !messages || messages.length === 0) {
-      console.error(`Error reading message ${messageId} from ${dlqName}:`, error || "No message found");
-      return false;
-    }
-    
-    const dlqMessage = messages[0];
-    const originalMessage = dlqMessage.message.originalMessage;
-    const originalQueue = dlqMessage.message.metadata?.originalQueue;
-    
-    if (!originalMessage || !originalQueue) {
-      console.error(`Invalid DLQ message format for ${messageId}`);
-      return false;
-    }
-    
-    // Send message back to original queue
-    const { error: sendError } = await supabase.functions.invoke("sendToQueue", {
+    // Use the lockManager edge function to release a lock
+    const { data, error } = await supabase.functions.invoke("lockManager", {
       body: {
-        queue_name: originalQueue,
-        message: originalMessage,
-        metadata: {
-          requeuedAt: new Date().toISOString(),
-          requeuedFrom: dlqName,
-          originalDlqMessageId: messageId,
-          retryAttempt: (dlqMessage.message.metadata?.retryAttempt || 0) + 1
+        operation: "release",
+        entityType,
+        entityId,
+        options: {
+          workerId: workerId || Deno.env.get("WORKER_ID") || undefined,
         }
       }
     });
     
-    if (sendError) {
-      console.error(`Error sending message back to ${originalQueue}:`, sendError);
+    if (error) {
+      console.error(`Error releasing lock for ${entityType}:${entityId}:`, error);
       return false;
     }
     
-    // Delete from DLQ
-    await deleteMessageWithRetries(supabase, dlqName, messageId);
-    
-    console.log(`Successfully requeued message ${messageId} from ${dlqName} to ${originalQueue}`);
+    if (data && data.released) {
+      console.log(`Successfully released lock for ${entityType}:${entityId}`);
+      return true;
+    } else {
+      const errors = data?.errors ? JSON.stringify(data.errors) : "Unknown reason";
+      console.log(`Failed to release lock for ${entityType}:${entityId}: ${errors}`);
+      return false;
+    }
+  } catch (error) {
+    console.error(`Exception releasing lock for ${entityType}:${entityId}:`, error);
+    return false;
+  }
+}
+
+/**
+ * Enqueues a message to a Supabase queue
+ */
+export async function enqueueMessage(
+  supabase: any,
+  queueName: string,
+  message: any
+): Promise<boolean> {
+  try {
+    const { error } = await supabase.functions.invoke("sendToQueue", {
+      body: {
+        queue_name: queueName,
+        message: message
+      }
+    });
+
+    if (error) {
+      console.error(`Error enqueueing message to queue ${queueName}:`, error);
+      return false;
+    }
+
+    console.log(`Message successfully enqueued to queue ${queueName}`);
     return true;
   } catch (error) {
-    console.error(`Error requeuing message from DLQ:`, error);
+    console.error(`Exception enqueueing message to queue ${queueName}:`, error);
     return false;
   }
 }
