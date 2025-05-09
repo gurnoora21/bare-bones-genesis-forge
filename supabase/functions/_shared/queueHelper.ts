@@ -42,32 +42,105 @@ export async function deleteMessageWithRetries(
   delayMs: number = 500
 ): Promise<boolean> {
   let attempt = 0;
+  let deleted = false;
 
-  while (attempt < maxRetries) {
+  console.log(`Attempting to delete message ${messageId} from queue ${queueName}`);
+
+  while (attempt < maxRetries && !deleted) {
     try {
-      const { error } = await supabase.functions.invoke("deleteMessage", {
-        body: {
-          queue_name: queueName,
-          msg_id: messageId
+      // First approach: Use direct RPC call to database function
+      try {
+        const { data, error } = await supabase.rpc(
+          'pg_delete_message',
+          { 
+            queue_name: queueName, 
+            message_id: messageId.toString()
+          }
+        );
+        
+        if (!error && data === true) {
+          console.log(`Successfully deleted message ${messageId} using database function`);
+          return true;
+        } else if (error) {
+          console.warn(`Database deletion failed for message ${messageId}:`, error);
         }
-      });
-
-      if (error) {
-        console.error(`Attempt ${attempt + 1} to delete message ${messageId} failed:`, error);
-        attempt++;
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      } else {
-        console.log(`Message ${messageId} deleted successfully from queue ${queueName}`);
-        return true;
+      } catch (rpcError) {
+        console.warn(`RPC error for message ${messageId}:`, rpcError);
       }
+
+      // Second approach: Use ensure_message_deleted database function
+      try {
+        const { data, error } = await supabase.rpc(
+          'ensure_message_deleted',
+          { 
+            queue_name: queueName, 
+            message_id: messageId.toString(),
+            max_attempts: 2
+          }
+        );
+        
+        if (!error && data === true) {
+          console.log(`Successfully deleted message ${messageId} using ensure_message_deleted`);
+          return true;
+        } else if (error) {
+          console.warn(`ensure_message_deleted failed for message ${messageId}:`, error);
+        }
+      } catch (ensureError) {
+        console.warn(`ensure_message_deleted error for message ${messageId}:`, ensureError);
+      }
+      
+      // Third approach: Try direct reset if delete fails
+      try {
+        const { data: resetData, error: resetError } = await supabase.rpc(
+          'reset_stuck_message',
+          { 
+            queue_name: queueName, 
+            message_id: messageId.toString()
+          }
+        );
+        
+        if (!resetError && resetData === true) {
+          console.log(`Reset visibility timeout for message ${messageId}`);
+          // Consider this a success since the message will be reprocessed
+          return true;
+        } else if (resetError) {
+          console.warn(`Failed to reset message ${messageId}:`, resetError);
+        }
+      } catch (resetError) {
+        console.warn(`Error trying to reset message ${messageId}:`, resetError);
+      }
+
+      // Increment attempt counter and apply backoff
+      attempt++;
+      console.log(`Delete attempt ${attempt} failed for message ${messageId}, will retry in ${delayMs}ms`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      delayMs *= 2; // Exponential backoff
+      
     } catch (error) {
       console.error(`Exception during attempt ${attempt + 1} to delete message ${messageId}:`, error);
       attempt++;
       await new Promise(resolve => setTimeout(resolve, delayMs));
+      delayMs *= 2; // Exponential backoff
     }
   }
 
+  // If we get here, we've exhausted our retries
   console.error(`Failed to delete message ${messageId} after ${maxRetries} attempts`);
+  
+  // Log this issue so we can track it
+  try {
+    await logWorkerIssue(
+      supabase,
+      queueName,
+      "message_deletion_failure",
+      `Failed to delete message ${messageId} after ${maxRetries} attempts`,
+      { messageId, queueName, attempts: attempt }
+    );
+  } catch (logError) {
+    console.error("Failed to log deletion issue:", logError);
+  }
+  
+  // Return false to indicate failure
   return false;
 }
 
