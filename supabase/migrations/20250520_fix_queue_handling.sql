@@ -101,150 +101,90 @@ BEGIN
   -- Get the actual queue table name with schema
   SELECT public.get_queue_table_name_safe(queue_name) INTO queue_table;
   
-  -- Reset visibility timeout for the message
+  -- Try with text comparison for maximum flexibility
   BEGIN
-    EXECUTE format('UPDATE %s SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1 RETURNING TRUE', queue_table)
-      USING message_id INTO success;
+    EXECUTE format('UPDATE %s SET vt = NULL WHERE msg_id::TEXT = $1 OR id::TEXT = $1', queue_table)
+    USING message_id;
+    GET DIAGNOSTICS success = ROW_COUNT;
     
-    RETURN COALESCE(success, FALSE);
+    IF success > 0 THEN
+      RETURN TRUE;
+    END IF;
   EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Failed to reset visibility timeout: %', SQLERRM;
-    RETURN FALSE;
+    RAISE WARNING 'Failed to reset visibility timeout for message % in queue %', message_id, queue_name;
   END;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- 4. Create cross-schema queue operation function
-CREATE OR REPLACE FUNCTION public.cross_schema_queue_op(
-  p_queue_name TEXT,
-  p_message_id TEXT,
-  p_operation TEXT
-) RETURNS BOOLEAN AS $$
-DECLARE
-  pgmq_exists BOOLEAN;
-  public_exists BOOLEAN;
-  success BOOLEAN := FALSE;
-BEGIN
-  -- Check if tables exist in different schemas
-  SELECT EXISTS (
-    SELECT 1 FROM information_schema.tables 
-    WHERE table_schema = 'pgmq' AND table_name = 'q_' || p_queue_name
-  ) INTO pgmq_exists;
-  
-  SELECT EXISTS (
-    SELECT 1 FROM information_schema.tables 
-    WHERE table_schema = 'public' AND table_name = 'pgmq_' || p_queue_name
-  ) INTO public_exists;
-  
-  -- Execute the requested operation
-  IF p_operation = 'delete' THEN
-    -- Try in pgmq schema
-    IF pgmq_exists THEN
-      BEGIN
-        EXECUTE format('DELETE FROM pgmq.q_%I WHERE id::TEXT = $1 OR msg_id::TEXT = $1 RETURNING TRUE', p_queue_name)
-          USING p_message_id INTO success;
-        
-        IF success THEN
-          RETURN TRUE;
-        END IF;
-      EXCEPTION WHEN OTHERS THEN
-        -- Continue to next attempt
-      END;
-    END IF;
-    
-    -- Try in public schema
-    IF public_exists THEN
-      BEGIN
-        EXECUTE format('DELETE FROM public.pgmq_%I WHERE id::TEXT = $1 OR msg_id::TEXT = $1 RETURNING TRUE', p_queue_name)
-          USING p_message_id INTO success;
-          
-        RETURN COALESCE(success, FALSE);
-      EXCEPTION WHEN OTHERS THEN
-        RETURN FALSE;
-      END;
-    END IF;
-  ELSIF p_operation = 'reset' THEN
-    -- Try in pgmq schema
-    IF pgmq_exists THEN
-      BEGIN
-        EXECUTE format('UPDATE pgmq.q_%I SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1 RETURNING TRUE', p_queue_name)
-          USING p_message_id INTO success;
-          
-        IF success THEN
-          RETURN TRUE;
-        END IF;
-      EXCEPTION WHEN OTHERS THEN
-        -- Continue to next attempt
-      END;
-    END IF;
-    
-    -- Try in public schema
-    IF public_exists THEN
-      BEGIN
-        EXECUTE format('UPDATE public.pgmq_%I SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1 RETURNING TRUE', p_queue_name)
-          USING p_message_id INTO success;
-          
-        RETURN COALESCE(success, FALSE);
-      EXCEPTION WHEN OTHERS THEN
-        RETURN FALSE;
-      END;
-    END IF;
-  END IF;
   
   RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- 5. Create a function to handle raw SQL queries safely
-CREATE OR REPLACE FUNCTION public.raw_sql_query(
-  sql_query TEXT
+-- 4. Create cross-schema queue operation function
+CREATE OR REPLACE FUNCTION public.cross_schema_queue_op(
+  p_operation TEXT,
+  p_queue_name TEXT,
+  p_message_id TEXT DEFAULT NULL,
+  p_params JSONB DEFAULT '{}'::JSONB
 ) RETURNS JSONB AS $$
 DECLARE
-  result JSONB;
+  v_result JSONB := '{}'::JSONB;
+  v_success BOOLEAN := FALSE;
+  v_tables RECORD;
 BEGIN
-  EXECUTE sql_query INTO result;
-  RETURN result;
-EXCEPTION WHEN OTHERS THEN
-  RETURN jsonb_build_object('error', SQLERRM);
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- 6. Set up a cron job to automatically check for and reset stuck messages
-DO $$
-BEGIN
-  PERFORM cron.unschedule('auto-reset-stuck-messages');
-EXCEPTION WHEN OTHERS THEN
-  RAISE NOTICE 'Cron job did not exist yet, will be created';
-END $$;
-
-SELECT cron.schedule(
-  'auto-reset-stuck-messages',
-  '*/5 * * * *',  -- Run every 5 minutes
-  $$
-  DO $$
-  DECLARE
-    queue_record RECORD;
-    reset_count INT;
-  BEGIN
-    FOR queue_record IN 
-      SELECT table_name FROM information_schema.tables 
-      WHERE table_schema = 'pgmq' AND table_name LIKE 'q_%'
-    LOOP
+  -- Try operations across all possible queue table locations
+  FOR v_tables IN 
+    SELECT s.nspname AS schema_name, c.relname AS table_name
+    FROM pg_class c 
+    JOIN pg_namespace s ON c.relnamespace = s.oid
+    WHERE (c.relname LIKE 'q\_' || p_queue_name OR c.relname = 'q_' || p_queue_name 
+           OR c.relname LIKE 'pgmq\_%' || p_queue_name)
+    AND c.relkind = 'r'
+  LOOP
+    -- Determine operation to perform
+    IF p_operation = 'delete' THEN
       BEGIN
-        EXECUTE FORMAT('
-          UPDATE pgmq.%I SET vt = NULL 
-          WHERE vt IS NOT NULL AND vt < NOW() - INTERVAL ''15 minutes''', 
-          queue_record.table_name
-        );
-        GET DIAGNOSTICS reset_count = ROW_COUNT;
+        EXECUTE format('DELETE FROM %I.%I WHERE id::TEXT = $1 OR msg_id::TEXT = $1', 
+                      v_tables.schema_name, v_tables.table_name)
+        USING p_message_id;
+        GET DIAGNOSTICS v_success = ROW_COUNT;
         
-        IF reset_count > 0 THEN
-          RAISE NOTICE 'Reset % stuck messages in %', reset_count, queue_record.table_name;
+        IF v_success > 0 THEN
+          RETURN jsonb_build_object(
+            'success', TRUE, 
+            'operation', 'delete', 
+            'table', v_tables.schema_name || '.' || v_tables.table_name, 
+            'message_id', p_message_id
+          );
         END IF;
       EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'Failed to reset messages in %: %', queue_record.table_name, SQLERRM;
+        -- Just continue to next table
+        NULL;
       END;
-    END LOOP;
-  END $$;
-  $$
-);
+    ELSIF p_operation = 'reset' THEN
+      BEGIN
+        EXECUTE format('UPDATE %I.%I SET vt = NULL WHERE id::TEXT = $1 OR msg_id::TEXT = $1', 
+                      v_tables.schema_name, v_tables.table_name)
+        USING p_message_id;
+        GET DIAGNOSTICS v_success = ROW_COUNT;
+        
+        IF v_success > 0 THEN
+          RETURN jsonb_build_object(
+            'success', TRUE, 
+            'operation', 'reset', 
+            'table', v_tables.schema_name || '.' || v_tables.table_name, 
+            'message_id', p_message_id
+          );
+        END IF;
+      EXCEPTION WHEN OTHERS THEN
+        -- Just continue to next table
+        NULL;
+      END;
+    END IF;
+  END LOOP;
+  
+  -- If we got here, all attempts failed
+  RETURN jsonb_build_object(
+    'success', FALSE,
+    'error', 'Failed to ' || p_operation || ' message ' || p_message_id || ' in any queue table'
+  );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
