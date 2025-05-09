@@ -1,7 +1,14 @@
 
+/**
+ * Queue Helper Functions
+ * Provides utilities for safe queue message processing with idempotency
+ */
+
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService, getDeduplicationService } from "./deduplication.ts";
-import { StateManager, EntityType, ProcessingState } from "./stateManager.ts";
+import { CoordinatedStateManager, getStateManager } from "./coordinatedStateManager.ts";
+import { ProcessingState } from "./stateManager.ts";
+import { DeduplicationMetrics, getDeduplicationMetrics } from "./metrics.ts";
 
 // Helper function to safely format message ID as string
 export function safeMessageIdString(messageId: any): string | null {
@@ -18,7 +25,7 @@ export async function deleteMessageWithRetries(
   messageId: any,
   maxRetries = 3
 ): Promise<boolean> {
-  // FIX: Add messageId validation
+  // Validate messageId
   if (messageId === undefined || messageId === null) {
     console.error(`Cannot delete message with undefined or null ID from ${queueName}`);
     return false;
@@ -62,40 +69,6 @@ export async function deleteMessageWithRetries(
   return success;
 }
 
-// Function to acquire a distributed processing lock
-export async function acquireProcessingLock(
-  lockType: string,
-  resourceKey: string,
-  ttlSeconds: number = 300
-): Promise<boolean> {
-  const redis = new Redis({
-    url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
-    token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
-  });
-
-  const lockKey = `lock:${lockType}:${resourceKey}`;
-  const lockValue = new Date().toISOString();
-
-  try {
-    // Acquire lock using SET NX command
-    const result = await redis.set(lockKey, lockValue, {
-      ex: ttlSeconds,
-      nx: true,
-    });
-
-    if (result === "OK") {
-      console.log(`Acquired lock ${lockKey}`);
-      return true;
-    } else {
-      console.warn(`Failed to acquire lock ${lockKey}`);
-      return false;
-    }
-  } catch (error) {
-    console.error(`Error acquiring lock ${lockKey}:`, error);
-    return false;
-  }
-}
-
 // Function to log worker issues to the database
 export async function logWorkerIssue(
   supabase: any,
@@ -107,11 +80,12 @@ export async function logWorkerIssue(
   try {
     const now = new Date().toISOString();
     const logEntry = {
-      timestamp: now,
       worker_name: workerName,
       issue_type: issueType,
       message: message,
-      details: details
+      details: details,
+      created_at: now,
+      updated_at: now
     };
 
     const { error } = await supabase
@@ -141,20 +115,25 @@ export interface ProcessQueueOptions {
   };
   stateManagement?: {
     enabled: boolean;
-    entityType?: EntityType | string;
+    entityType?: string;
     entityId?: string;
     timeoutMinutes?: number;
   };
   correlationId?: string;
+  metrics?: {
+    enabled: boolean;
+    redis?: Redis;
+  };
 }
 
-// Return type for process queue with more details
+// Return type for process queue
 export interface ProcessResult {
   success: boolean;
   deduplication?: boolean;
   stateManaged?: boolean;
   error?: string;
   correlationId?: string;
+  processingTimeMs?: number;
 }
 
 // Function to process a queue message with safety checks, idempotency, and deduplication
@@ -179,8 +158,10 @@ export async function processQueueMessageSafely(
   
   console.log(`[${correlationId}] Processing message ${messageId} from queue ${queueName}`);
   
-  let stateManager: StateManager | undefined;
+  const startTime = Date.now();
+  let stateManager: CoordinatedStateManager | undefined;
   let deduplicationService: DeduplicationService | undefined;
+  let metrics: DeduplicationMetrics | undefined;
   
   // Result object to track what happened
   const result: ProcessResult = {
@@ -189,10 +170,21 @@ export async function processQueueMessageSafely(
   };
 
   try {
+    // Initialize metrics if enabled
+    if (options.metrics?.enabled && options.metrics?.redis) {
+      metrics = getDeduplicationMetrics(options.metrics.redis);
+    }
+    
     // Initialize state management if enabled
     if (options.stateManagement?.enabled) {
       console.log(`[${correlationId}] Using state management`);
-      stateManager = new StateManager(supabase);
+      let redisClient: Redis | undefined;
+      
+      if (options.deduplication?.enabled && options.deduplication.redis) {
+        redisClient = options.deduplication.redis;
+      }
+      
+      stateManager = getStateManager(supabase, redisClient);
       
       const entityType = options.stateManagement.entityType || queueName;
       const entityId = options.stateManagement.entityId || idempotencyKey;
@@ -202,7 +194,10 @@ export async function processQueueMessageSafely(
       const lockAcquired = await stateManager.acquireProcessingLock(
         entityType, 
         entityId,
-        timeoutMinutes
+        {
+          timeoutMinutes,
+          correlationId
+        }
       );
       
       if (!lockAcquired) {
@@ -231,8 +226,10 @@ export async function processQueueMessageSafely(
         idempotencyKey,
         { 
           ttlSeconds: options.deduplication.ttlSeconds,
-          useStrictPayloadMatch: options.deduplication.strictMatching ?? true
-        }
+          useStrictPayloadMatch: options.deduplication.strictMatching ?? true,
+          logDetails: true
+        },
+        { correlationId }
       );
       
       if (isDuplicate) {
@@ -240,6 +237,11 @@ export async function processQueueMessageSafely(
         
         // Delete the message since it's being skipped as a duplicate
         await deleteMessageWithRetries(supabase, queueName, messageId);
+        
+        // Record deduplication metric if enabled
+        if (metrics) {
+          await metrics.recordDeduplicated(queueName, "consumer", correlationId);
+        }
         
         result.deduplication = true;
         result.success = true; // We consider this successful since it's a duplicate
@@ -257,6 +259,11 @@ export async function processQueueMessageSafely(
           // Still need to delete the message since it's being skipped
           await deleteMessageWithRetries(supabase, queueName, messageId);
           
+          // Record as duplicate if metrics are enabled
+          if (metrics) {
+            await metrics.recordDeduplicated(queueName, "consumer", correlationId);
+          }
+          
           result.success = true;
           return result;
         }
@@ -266,10 +273,24 @@ export async function processQueueMessageSafely(
       }
     }
 
-    // Process the message
+    // Process the message with timeout if specified
     console.log(`[${correlationId}] Executing processing function for message ${messageId}`);
-    const processResult = await processingFunction();
-    console.log(`[${correlationId}] Processing complete for message ${messageId}, result:`, processResult);
+    
+    let processResult;
+    if (options.timeoutMs) {
+      // Process with timeout
+      processResult = await Promise.race([
+        processingFunction(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error(`Processing timeout after ${options.timeoutMs}ms`)), options.timeoutMs)
+        )
+      ]);
+    } else {
+      // Process without timeout
+      processResult = await processingFunction();
+    }
+    
+    console.log(`[${correlationId}] Processing complete for message ${messageId}`);
 
     // Delete message from queue after successful processing
     const deleteSuccess = await deleteMessageWithRetries(supabase, queueName, messageId);
@@ -295,17 +316,26 @@ export async function processQueueMessageSafely(
         await deduplicationService.markAsProcessed(
           queueName,
           idempotencyKey,
-          options.deduplication.ttlSeconds
+          options.deduplication.ttlSeconds,
+          { correlationId, operation: "process" }
         );
         console.log(`[${correlationId}] Marked message with key ${idempotencyKey} as processed for future deduplication`);
       } catch (e) {
         console.warn(`[${correlationId}] Failed to mark message as processed for deduplication: ${e}`);
       }
     }
+    
+    // Record processing metrics if enabled
+    if (metrics) {
+      const processingTime = Date.now() - startTime;
+      await metrics.recordProcessed(queueName, "consumer", processingTime);
+      result.processingTimeMs = processingTime;
+    }
 
     result.success = true;
     return result;
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
     console.error(`[${correlationId}] Error processing message ${messageId}:`, error);
     
     // If state management is enabled, mark entity as failed
@@ -316,7 +346,7 @@ export async function processQueueMessageSafely(
       await stateManager.markAsFailed(
         entityType, 
         entityId, 
-        error instanceof Error ? error.message : String(error),
+        errorMessage,
         {
           correlationId,
           timestamp: new Date().toISOString()
@@ -324,10 +354,66 @@ export async function processQueueMessageSafely(
       );
     }
     
-    result.error = error instanceof Error ? error.message : String(error);
+    // Record failure metric if enabled
+    if (metrics) {
+      const errorType = error instanceof Error ? error.constructor.name : 'UnknownError';
+      await metrics.recordFailure(queueName, "consumer", errorType, errorMessage);
+    }
+    
+    result.error = errorMessage;
     result.success = false;
     
-    // Don't try to delete the message on error, let it return to the queue
     return result;
+  }
+}
+
+// Function to check if processing for an entity should be skipped
+export async function checkSkipProcessing(
+  supabase: any,
+  redis: Redis,
+  entityType: string,
+  entityId: string
+): Promise<boolean> {
+  try {
+    // Initialize state manager
+    const stateManager = getStateManager(supabase, redis);
+    
+    // Check if entity is already processed
+    const isProcessed = await stateManager.isProcessed(entityType, entityId);
+    
+    return isProcessed;
+  } catch (error) {
+    console.warn(`Error checking if processing should be skipped: ${error.message}`);
+    return false;
+  }
+}
+
+// Function to log processing metrics
+export async function logProcessingMetrics(
+  supabase: any,
+  queueName: string,
+  operation: string,
+  results: {
+    processed: number,
+    success: number,
+    error: number,
+    details?: any
+  }
+): Promise<void> {
+  try {
+    const now = new Date().toISOString();
+    
+    await supabase.from('queue_metrics').insert({
+      queue_name: queueName,
+      operation: operation,
+      started_at: now,
+      finished_at: now,
+      processed_count: results.processed,
+      success_count: results.success,
+      error_count: results.error,
+      details: results.details || {}
+    });
+  } catch (error) {
+    console.warn(`Failed to log metrics: ${error.message}`);
   }
 }

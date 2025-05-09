@@ -1,189 +1,231 @@
 
-import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { getEnvironmentTTL } from "./stateManager.ts";
-
-// Constants for Redis key prefixes
-const DEDUPLICATION_METRICS_PREFIX = "metrics:deduplication";
-
-// Interface for deduplication metrics
-export interface DeduplicationMetrics {
-  recordDeduplicated(queueName: string, source: string): Promise<void>;
-  recordProcessed(queueName: string, source: string): Promise<void>;
-  getMetricsForQueue(queueName: string): Promise<DeduplicationMetricsData>;
-  resetMetricsForQueue(queueName: string): Promise<boolean>;
-}
-
-// Data structure for deduplication metrics
-export interface DeduplicationMetricsData {
-  totalProcessed: number;
-  totalDeduplicated: number;
-  deduplicationRate: number;
-  queueName: string;
-  sources: Record<string, {
-    processed: number;
-    deduplicated: number;
-    rate: number;
-  }>;
-}
-
 /**
- * Deduplication metrics service implementation
+ * Metrics and Monitoring Service
+ * 
+ * Tracks worker health, error rates, and performance metrics
  */
-class DeduplicationMetricsImpl implements DeduplicationMetrics {
+
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+
+export interface MetricsOptions {
+  ttlSeconds?: number;
+  useCircuitBreaker?: boolean;
+}
+
+export class DeduplicationMetrics {
   private redis: Redis;
-  private ttl: number;
-
-  constructor(redis: Redis) {
+  private circuitBreakerEnabled: boolean = true;
+  private circuitBreakerState = {
+    failures: 0,
+    lastFailure: 0,
+    isOpen: false
+  };
+  
+  constructor(redis: Redis, options: MetricsOptions = {}) {
     this.redis = redis;
-    this.ttl = getEnvironmentTTL(); // Use environment-specific TTL
+    this.circuitBreakerEnabled = options.useCircuitBreaker !== false;
   }
-
+  
   /**
-   * Record a deduplicated message
+   * Record a successful message deduplication
    */
-  async recordDeduplicated(queueName: string, source: string): Promise<void> {
+  async recordDeduplicated(
+    queue: string,
+    worker: string,
+    correlationId?: string
+  ): Promise<boolean> {
+    if (this.isCircuitOpen()) return false;
+    
     try {
-      const queueKey = `${DEDUPLICATION_METRICS_PREFIX}:${queueName}:deduplicated`;
-      const sourceKey = `${DEDUPLICATION_METRICS_PREFIX}:${queueName}:source:${source}:deduplicated`;
+      const date = new Date().toISOString().split('T')[0];
+      const key = `metrics:dedup:${date}:${queue}:${worker}`;
       
-      await Promise.all([
-        this.redis.incr(queueKey),
-        this.redis.incr(sourceKey),
-        this.redis.expire(queueKey, this.ttl),
-        this.redis.expire(sourceKey, this.ttl)
-      ]);
-    } catch (error) {
-      console.warn(`Failed to record deduplicated metric: ${error}`);
-    }
-  }
-
-  /**
-   * Record a processed message
-   */
-  async recordProcessed(queueName: string, source: string): Promise<void> {
-    try {
-      const queueKey = `${DEDUPLICATION_METRICS_PREFIX}:${queueName}:processed`;
-      const sourceKey = `${DEDUPLICATION_METRICS_PREFIX}:${queueName}:source:${source}:processed`;
+      // Increment deduplication counter
+      await this.redis.hincrby(key, 'deduplicated', 1);
       
-      await Promise.all([
-        this.redis.incr(queueKey),
-        this.redis.incr(sourceKey),
-        this.redis.expire(queueKey, this.ttl),
-        this.redis.expire(sourceKey, this.ttl)
-      ]);
-    } catch (error) {
-      console.warn(`Failed to record processed metric: ${error}`);
-    }
-  }
-
-  /**
-   * Get metrics for a specific queue
-   */
-  async getMetricsForQueue(queueName: string): Promise<DeduplicationMetricsData> {
-    try {
-      // Get the total counts
-      const [totalProcessed, totalDeduplicated] = await Promise.all([
-        this.redis.get(`${DEDUPLICATION_METRICS_PREFIX}:${queueName}:processed`),
-        this.redis.get(`${DEDUPLICATION_METRICS_PREFIX}:${queueName}:deduplicated`)
-      ]);
+      // Set expiration if not already set (30 days)
+      await this.redis.expire(key, 60 * 60 * 24 * 30);
       
-      // Calculate deduplication rate
-      const processed = parseInt(totalProcessed as string) || 0;
-      const deduplicated = parseInt(totalDeduplicated as string) || 0;
-      const rate = processed > 0 ? deduplicated / processed : 0;
-      
-      // Get the pattern for source keys
-      const sourceProcessedPattern = `${DEDUPLICATION_METRICS_PREFIX}:${queueName}:source:*:processed`;
-      const sourceDeduplicatedPattern = `${DEDUPLICATION_METRICS_PREFIX}:${queueName}:source:*:deduplicated`;
-      
-      // Get all source keys
-      const [processedKeys, deduplicatedKeys] = await Promise.all([
-        this.redis.keys(sourceProcessedPattern),
-        this.redis.keys(sourceDeduplicatedPattern)
-      ]);
-      
-      // Build a unique set of sources
-      const sourcesSet = new Set<string>();
-      processedKeys.forEach(key => {
-        const source = key.split(':')[4]; // Extract source from key pattern
-        sourcesSet.add(source);
-      });
-      deduplicatedKeys.forEach(key => {
-        const source = key.split(':')[4]; // Extract source from key pattern
-        sourcesSet.add(source);
-      });
-      
-      // For each source, get the metrics
-      const sources: Record<string, { processed: number; deduplicated: number; rate: number }> = {};
-      
-      await Promise.all(Array.from(sourcesSet).map(async source => {
-        const [sourceProcessed, sourceDeduplicated] = await Promise.all([
-          this.redis.get(`${DEDUPLICATION_METRICS_PREFIX}:${queueName}:source:${source}:processed`),
-          this.redis.get(`${DEDUPLICATION_METRICS_PREFIX}:${queueName}:source:${source}:deduplicated`)
-        ]);
-        
-        const p = parseInt(sourceProcessed as string) || 0;
-        const d = parseInt(sourceDeduplicated as string) || 0;
-        const r = p > 0 ? d / p : 0;
-        
-        sources[source] = {
-          processed: p,
-          deduplicated: d,
-          rate: r
-        };
-      }));
-      
-      return {
-        totalProcessed: processed,
-        totalDeduplicated: deduplicated,
-        deduplicationRate: rate,
-        queueName,
-        sources
-      };
-    } catch (error) {
-      console.error(`Failed to get metrics for queue ${queueName}:`, error);
-      
-      // Return empty metrics on error
-      return {
-        totalProcessed: 0,
-        totalDeduplicated: 0,
-        deduplicationRate: 0,
-        queueName,
-        sources: {}
-      };
-    }
-  }
-
-  /**
-   * Reset metrics for a specific queue
-   */
-  async resetMetricsForQueue(queueName: string): Promise<boolean> {
-    try {
-      // Get all keys for this queue
-      const keys = await this.redis.keys(`${DEDUPLICATION_METRICS_PREFIX}:${queueName}:*`);
-      
-      // Delete all keys if there are any
-      if (keys.length > 0) {
-        await this.redis.del(keys);
-      }
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
       
       return true;
     } catch (error) {
-      console.error(`Failed to reset metrics for queue ${queueName}:`, error);
+      this.incrementCircuitFailure();
+      console.error(`Error recording deduplication metric: ${error.message}`);
       return false;
     }
   }
+  
+  /**
+   * Record a successfully processed message
+   */
+  async recordProcessed(
+    queue: string,
+    worker: string,
+    processingTimeMs?: number
+  ): Promise<boolean> {
+    if (this.isCircuitOpen()) return false;
+    
+    try {
+      const date = new Date().toISOString().split('T')[0];
+      const key = `metrics:processed:${date}:${queue}:${worker}`;
+      
+      // Increment processed counter
+      await this.redis.hincrby(key, 'processed', 1);
+      
+      // Track processing time if provided
+      if (processingTimeMs !== undefined) {
+        await this.redis.hincrby(key, 'processing_time_total', processingTimeMs);
+        await this.redis.hincrby(key, 'processing_count', 1);
+      }
+      
+      // Set expiration (30 days)
+      await this.redis.expire(key, 60 * 60 * 24 * 30);
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
+      return true;
+    } catch (error) {
+      this.incrementCircuitFailure();
+      console.error(`Error recording processing metric: ${error.message}`);
+      return false;
+    }
+  }
+  
+  /**
+   * Record a failed message processing attempt
+   */
+  async recordFailure(
+    queue: string,
+    worker: string,
+    errorType: string,
+    errorMessage?: string
+  ): Promise<boolean> {
+    if (this.isCircuitOpen()) return false;
+    
+    try {
+      const date = new Date().toISOString().split('T')[0];
+      const key = `metrics:failures:${date}:${queue}:${worker}`;
+      const errorKey = errorType || 'unknown_error';
+      
+      // Increment general failure counter
+      await this.redis.hincrby(key, 'failures', 1);
+      
+      // Increment specific error type counter
+      await this.redis.hincrby(key, `error:${errorKey}`, 1);
+      
+      // Store most recent error if provided
+      if (errorMessage) {
+        await this.redis.hset(
+          key, 
+          'last_error', 
+          JSON.stringify({
+            message: errorMessage,
+            timestamp: new Date().toISOString()
+          })
+        );
+      }
+      
+      // Set expiration (30 days)
+      await this.redis.expire(key, 60 * 60 * 24 * 30);
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
+      return true;
+    } catch (error) {
+      this.incrementCircuitFailure();
+      console.error(`Error recording failure metric: ${error.message}`);
+      return false;
+    }
+  }
+  
+  /**
+   * Record worker heartbeat to track health
+   */
+  async recordHeartbeat(
+    worker: string,
+    status: 'healthy' | 'warning' | 'critical',
+    details?: Record<string, any>
+  ): Promise<boolean> {
+    if (this.isCircuitOpen()) return false;
+    
+    try {
+      const key = `metrics:heartbeat:${worker}`;
+      
+      // Record heartbeat with status
+      await this.redis.hset(
+        key,
+        {
+          last_seen: new Date().toISOString(),
+          status,
+          details: details ? JSON.stringify(details) : '{}'
+        }
+      );
+      
+      // Set expiration (15 minutes)
+      await this.redis.expire(key, 60 * 15);
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
+      return true;
+    } catch (error) {
+      this.incrementCircuitFailure();
+      console.error(`Error recording heartbeat: ${error.message}`);
+      return false;
+    }
+  }
+  
+  /**
+   * Circuit breaker implementation
+   */
+  private incrementCircuitFailure(): void {
+    if (!this.circuitBreakerEnabled) return;
+    
+    const now = Date.now();
+    
+    // Reset counter if last failure was more than 60 seconds ago
+    if (now - this.circuitBreakerState.lastFailure > 60000) {
+      this.circuitBreakerState.failures = 1;
+    } else {
+      this.circuitBreakerState.failures++;
+    }
+    
+    this.circuitBreakerState.lastFailure = now;
+    
+    // Trip circuit breaker after 5 consecutive failures
+    if (this.circuitBreakerState.failures >= 5) {
+      this.circuitBreakerState.isOpen = true;
+      
+      // Auto-reset after 30 seconds
+      setTimeout(() => {
+        console.log('Auto-resetting metrics circuit breaker');
+        this.resetCircuitBreaker();
+      }, 30000);
+      
+      console.warn('Metrics circuit breaker tripped. Will auto-reset in 30 seconds');
+    }
+  }
+  
+  private isCircuitOpen(): boolean {
+    return this.circuitBreakerEnabled && this.circuitBreakerState.isOpen;
+  }
+  
+  private resetCircuitBreaker(): void {
+    this.circuitBreakerState = {
+      failures: 0,
+      lastFailure: 0,
+      isOpen: false
+    };
+  }
 }
 
-// Singleton instance
-let deduplicationMetricsInstance: DeduplicationMetrics | null = null;
-
 /**
- * Get or create deduplication metrics instance
+ * Get a singleton instance of DeduplicationMetrics
  */
 export function getDeduplicationMetrics(redis: Redis): DeduplicationMetrics {
-  if (!deduplicationMetricsInstance && redis) {
-    deduplicationMetricsInstance = new DeduplicationMetricsImpl(redis);
-  }
-  return deduplicationMetricsInstance || new DeduplicationMetricsImpl(redis);
+  return new DeduplicationMetrics(redis);
 }

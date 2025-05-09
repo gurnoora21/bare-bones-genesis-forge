@@ -20,8 +20,19 @@ export interface DeduplicationOptions {
   logDetails?: boolean;
 }
 
+export interface DeduplicationContext {
+  correlationId?: string;
+  operation?: string;
+  source?: string;
+}
+
 export class DeduplicationService {
   private redis: Redis;
+  private circuitBreakerState = {
+    failures: 0,
+    lastFailure: 0,
+    isOpen: false
+  };
   
   constructor(redis: Redis) {
     this.redis = redis;
@@ -33,12 +44,23 @@ export class DeduplicationService {
   async isDuplicate(
     namespace: string,
     key: string,
-    options: DeduplicationOptions = {}
+    options: DeduplicationOptions = {},
+    context: DeduplicationContext = {}
   ): Promise<boolean> {
     const {
       ttlSeconds = getEnvironmentTTL(),
       logDetails = false
     } = options;
+    
+    const correlationId = context.correlationId || 'untracked';
+    
+    // If circuit breaker is open, default to non-duplicate
+    if (this.isCircuitOpen()) {
+      if (logDetails) {
+        console.warn(`[${correlationId}] Deduplication check skipped: circuit breaker open`);
+      }
+      return false;
+    }
     
     try {
       // Create a namespaced key for Redis
@@ -48,12 +70,17 @@ export class DeduplicationService {
       const exists = await this.redis.exists(dedupKey);
       
       if (logDetails) {
-        console.log(`Deduplication check for ${namespace}:${key} - Result: ${exists === 1 ? 'Duplicate' : 'New'}`);
+        console.log(`[${correlationId}] Deduplication check for ${namespace}:${key} - Result: ${exists === 1 ? 'Duplicate' : 'New'}`);
       }
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
       
       return exists === 1;
     } catch (error) {
-      console.warn(`Deduplication check failed for ${namespace}:${key}: ${error.message}`);
+      console.warn(`[${correlationId}] Deduplication check failed for ${namespace}:${key}: ${error.message}`);
+      this.incrementCircuitFailure();
+      
       // Default to non-duplicate when Redis fails
       return false;
     }
@@ -65,28 +92,47 @@ export class DeduplicationService {
   async markAsProcessed(
     namespace: string,
     key: string,
-    ttlSeconds?: number
+    ttlSeconds?: number,
+    context: DeduplicationContext = {}
   ): Promise<void> {
     const effectiveTtl = ttlSeconds || getEnvironmentTTL();
+    const correlationId = context.correlationId || 'untracked';
+    
+    // If circuit breaker is open, don't try to interact with Redis
+    if (this.isCircuitOpen()) {
+      console.warn(`[${correlationId}] Skip markAsProcessed: circuit breaker open`);
+      return;
+    }
     
     try {
       // Create a namespaced key for Redis
       const dedupKey = this.createDeduplicationKey(namespace, key);
       
       // Store the processing timestamp with TTL
+      const processedData = {
+        timestamp: new Date().toISOString(),
+        correlationId: context.correlationId,
+        operation: context.operation,
+        source: context.source || 'unknown'
+      };
+      
       const result = await this.redis.set(
         dedupKey,
-        new Date().toISOString(),
+        JSON.stringify(processedData),
         {
           ex: effectiveTtl
         }
       );
       
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
       if (result !== "OK") {
-        console.warn(`Failed to mark ${namespace}:${key} as processed: ${result}`);
+        console.warn(`[${correlationId}] Failed to mark ${namespace}:${key} as processed: ${result}`);
       }
     } catch (error) {
-      console.warn(`Error marking as processed: ${error.message}`);
+      console.warn(`[${correlationId}] Error marking as processed: ${error.message}`);
+      this.incrementCircuitFailure();
     }
   }
   
@@ -161,10 +207,16 @@ export class DeduplicationService {
             keysToDelete = keys;
           }
           
-          // Delete the selected keys
+          // Delete the selected keys in batches
           if (keysToDelete.length > 0) {
-            const deleteCount = await this.redis.del(...keysToDelete);
-            totalDeleted += deleteCount;
+            // Process in smaller chunks to prevent huge Redis commands
+            for (let i = 0; i < keysToDelete.length; i += 50) {
+              const batch = keysToDelete.slice(i, i + 50);
+              if (batch.length > 0) {
+                const deleteCount = await this.redis.del(...batch);
+                totalDeleted += deleteCount;
+              }
+            }
           }
         }
       } while (cursor !== '0');
@@ -172,8 +224,50 @@ export class DeduplicationService {
       return totalDeleted;
     } catch (error) {
       console.error(`Error clearing deduplication keys: ${error.message}`);
+      this.incrementCircuitFailure();
       return 0;
     }
+  }
+  
+  /**
+   * Circuit breaker implementation
+   */
+  private incrementCircuitFailure(): void {
+    const now = Date.now();
+    
+    // Reset counter if last failure was more than 60 seconds ago
+    if (now - this.circuitBreakerState.lastFailure > 60000) {
+      this.circuitBreakerState.failures = 1;
+    } else {
+      this.circuitBreakerState.failures++;
+    }
+    
+    this.circuitBreakerState.lastFailure = now;
+    
+    // Trip circuit breaker after 5 consecutive failures
+    if (this.circuitBreakerState.failures >= 5 && !this.circuitBreakerState.isOpen) {
+      this.circuitBreakerState.isOpen = true;
+      
+      // Schedule auto-reset after 30 seconds
+      setTimeout(() => {
+        console.log('Auto-resetting Redis circuit breaker');
+        this.resetCircuitBreaker();
+      }, 30000);
+      
+      console.warn(`Redis circuit breaker tripped. Will auto-reset in 30 seconds`);
+    }
+  }
+  
+  private isCircuitOpen(): boolean {
+    return this.circuitBreakerState.isOpen;
+  }
+  
+  private resetCircuitBreaker(): void {
+    this.circuitBreakerState = {
+      failures: 0,
+      lastFailure: 0,
+      isOpen: false
+    };
   }
 }
 
