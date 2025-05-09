@@ -1,18 +1,13 @@
 
-// Queue Monitoring Service
-// Detects stuck messages, inconsistencies, and provides queue health metrics
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { getEnvironmentTTL } from "../_shared/stateManager.ts";
-import { logWorkerIssue } from "../_shared/queueHelper.ts";
+import { generateCorrelationId } from "../_shared/stateManager.ts";
+import { CoordinatedStateManager, getStateManager } from "../_shared/coordinatedStateManager.ts";
 
-// CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
 };
 
 serve(async (req) => {
@@ -26,256 +21,233 @@ serve(async (req) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
   
-  // Initialize Redis for locking
-  const redis = new Redis({
-    url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
-    token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
-  });
+  // Parse request body
+  let params = { threshold_minutes: 10, auto_fix: false };
+  try {
+    const requestBody = await req.json();
+    params = { ...params, ...requestBody };
+  } catch (e) {
+    // Use default values if parsing fails
+  }
+  
+  // Generate a unique correlation ID for this monitor run
+  const monitorId = generateCorrelationId('monitor');
   
   try {
-    console.log("Running queue monitor...");
-    
-    // Parse request body for parameters
-    const body = await req.json().catch(() => ({}));
-    const thresholdMinutes = body.threshold_minutes || 10;
-    const autoFix = body.auto_fix === true;
-    const correlationId = body.correlation_id || 
-      `monitor_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    
-    // Use a lock to ensure only one queue monitor runs at a time
-    const lockKey = "lock:queue_monitor";
-    const lockResult = await redis.set(lockKey, correlationId, { 
-      ex: 300,  // 5 minute expiry
-      nx: true  // Only set if not exists
+    // Check if another monitor is already running
+    const redis = new Redis({
+      url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+      token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
     });
     
+    const monitorLockKey = "queue_monitor:running";
+    const lockResult = await redis.set(monitorLockKey, monitorId, { nx: true, ex: 120 });
+    
     if (lockResult !== "OK") {
-      console.log(`[${correlationId}] Another queue monitor is already running, exiting`);
+      console.log(`[${monitorId}] Another queue monitor is already running, exiting`);
       return new Response(JSON.stringify({ 
-        status: "skipped",
-        reason: "already_running",
-        correlationId
-      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        success: true, 
+        message: "Another monitor is already running" 
+      }), { 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
     }
     
-    // Define queues to monitor - get from the database
-    const { data: queueTables, error: tablesError } = await supabase.rpc(
-      'get_all_queue_tables'
-    );
+    console.log(`Running queue monitor...`);
     
-    if (tablesError) {
-      console.error(`[${correlationId}] Error getting queue tables: ${tablesError.message}`);
-      return new Response(JSON.stringify({ 
-        status: "error",
-        error: tablesError.message,
-        correlationId 
-      }), { 
+    // Get all queue names first
+    const { data: queueTables, error: queueError } = await supabase.rpc('get_all_queue_tables');
+    
+    if (queueError) {
+      console.error(`[${monitorId}] Error getting queue tables:`, queueError.message);
+      return new Response(JSON.stringify({ error: queueError.message }), { 
         status: 500, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
     
-    const queueNames = queueTables.map((q: any) => q.queue_name);
-    console.log(`[${correlationId}] Monitoring queues:`, queueNames);
+    if (!queueTables || queueTables.length === 0) {
+      console.log(`[${monitorId}] No queue tables found`);
+      return new Response(JSON.stringify({ 
+        success: true, 
+        message: "No queue tables found" 
+      }), { 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
     
-    const results: Record<string, any> = {};
-    let totalStuckMessages = 0;
-    let totalFixedMessages = 0;
-    
-    // Check each queue for stuck messages
-    for (const queueName of queueNames) {
+    // Process each queue table
+    const results = [];
+    for (const queueTable of queueTables) {
       try {
-        console.log(`[${correlationId}] Checking queue ${queueName} for stuck messages...`);
+        const queueName = queueTable.queue_name;
+        console.log(`[${monitorId}] Checking queue: ${queueName}`);
         
-        // List stuck messages (those with visibility timeout > threshold minutes)
-        const { data: stuckMessages, error: listError } = await supabase.rpc(
+        // Get stuck messages
+        const { data: stuckMessages, error: stuckError } = await supabase.rpc(
           'list_stuck_messages',
           { 
             queue_name: queueName, 
-            min_minutes_locked: thresholdMinutes
+            min_minutes_locked: params.threshold_minutes 
           }
         );
         
-        if (listError) {
-          console.error(`[${correlationId}] Error listing stuck messages for ${queueName}:`, listError);
-          results[queueName] = {
-            error: listError.message,
-            checked: true,
-            fixed: false
-          };
+        if (stuckError) {
+          console.error(`[${monitorId}] Error listing stuck messages for ${queueName}:`, stuckError.message);
+          results.push({
+            queue: queueName,
+            success: false,
+            error: stuckError.message
+          });
           continue;
         }
         
         if (!stuckMessages || stuckMessages.length === 0) {
-          console.log(`[${correlationId}] No stuck messages found in ${queueName}`);
-          results[queueName] = {
-            status: "ok",
-            stuck_messages: 0
-          };
+          console.log(`[${monitorId}] No stuck messages in queue: ${queueName}`);
+          results.push({
+            queue: queueName,
+            success: true,
+            stuckMessages: 0
+          });
           continue;
         }
         
-        console.log(`[${correlationId}] Found ${stuckMessages.length} stuck messages in ${queueName}`);
-        totalStuckMessages += stuckMessages.length;
+        console.log(`[${monitorId}] Found ${stuckMessages.length} stuck messages in queue: ${queueName}`);
         
-        // Fix stuck messages if autofix is enabled
-        if (autoFix) {
-          console.log(`[${correlationId}] Auto-fixing stuck messages in ${queueName}...`);
+        // Automatically fix stuck messages if requested
+        if (params.auto_fix) {
+          let fixedCount = 0;
           
-          // Reset visibility timeout for these messages
-          const { data: resetResult, error: resetError } = await supabase.rpc(
-            'reset_stuck_messages',
-            { 
-              queue_name: queueName, 
-              min_minutes_locked: thresholdMinutes
-            }
-          );
-          
-          if (resetError) {
-            console.error(`[${correlationId}] Error resetting stuck messages for ${queueName}:`, resetError);
-            results[queueName] = {
-              error: resetError.message,
-              checked: true,
-              fixed: false,
-              stuck_messages: stuckMessages.length
-            };
-          } else {
-            const fixedCount = resetResult || 0;
-            totalFixedMessages += fixedCount;
+          try {
+            // Use reset_stuck_messages function
+            const { data: resetResult, error: resetError } = await supabase.rpc(
+              'reset_stuck_messages',
+              { 
+                queue_name: queueName, 
+                min_minutes_locked: params.threshold_minutes 
+              }
+            );
             
-            console.log(`[${correlationId}] Fixed ${fixedCount} of ${stuckMessages.length} stuck messages in ${queueName}`);
-            results[queueName] = {
-              status: "fixed",
-              stuck_messages: stuckMessages.length,
-              fixed_messages: fixedCount
-            };
+            if (resetError) {
+              console.error(`[${monitorId}] Error resetting stuck messages for ${queueName}:`, resetError.message);
+            } else {
+              fixedCount = resetResult || 0;
+              console.log(`[${monitorId}] Reset ${fixedCount} stuck messages in queue: ${queueName}`);
+            }
+          } catch (resetError) {
+            console.error(`[${monitorId}] Exception resetting stuck messages:`, resetError);
           }
+          
+          results.push({
+            queue: queueName,
+            success: true,
+            stuckMessages: stuckMessages.length,
+            fixed: fixedCount,
+            messages: stuckMessages.slice(0, 10).map(m => ({
+              id: m.id,
+              minutes_locked: m.minutes_locked
+            }))
+          });
         } else {
-          // Just report the stuck messages without fixing
-          results[queueName] = {
-            status: "reported",
-            stuck_messages: stuckMessages.length
-          };
+          // Just report the stuck messages
+          results.push({
+            queue: queueName,
+            success: true,
+            stuckMessages: stuckMessages.length,
+            messages: stuckMessages.slice(0, 10).map(m => ({
+              id: m.id,
+              minutes_locked: m.minutes_locked
+            }))
+          });
         }
-        
-        // Record the issue if we found stuck messages
-        await logWorkerIssue(
-          supabase,
-          "queueMonitor",
-          "stuck_messages",
-          `Found ${stuckMessages.length} stuck messages in ${queueName}${autoFix ? `, fixed ${results[queueName].fixed_messages || 0}` : ''}`,
-          { 
-            queue_name: queueName,
-            stuck_count: stuckMessages.length,
-            fixed_count: autoFix ? (results[queueName].fixed_messages || 0) : 0,
-            correlation_id: correlationId,
-            threshold_minutes: thresholdMinutes
-          }
-        );
       } catch (queueError) {
-        console.error(`[${correlationId}] Error monitoring queue ${queueName}:`, queueError);
-        results[queueName] = {
-          error: queueError.message,
-          checked: true,
-          fixed: false
-        };
+        console.error(`[${monitorId}] Error processing queue ${queueTable.queue_name}:`, queueError);
+        results.push({
+          queue: queueTable.queue_name,
+          success: false,
+          error: queueError.message
+        });
       }
     }
     
-    // Check for inconsistencies if auto-fix is enabled
-    let inconsistencyResults = {
-      checked: false,
-      found: 0,
-      fixed: 0
-    };
+    // Also check for inconsistent states between Redis and DB
+    try {
+      console.log(`[${monitorId}] Checking for inconsistent states...`);
+      
+      const stateManager = getStateManager(supabase, redis) as CoordinatedStateManager;
+      const fixedCount = await stateManager.reconcileInconsistentStates(undefined, params.threshold_minutes);
+      
+      console.log(`[${monitorId}] Fixed ${fixedCount} inconsistent states`);
+      
+      results.push({
+        type: 'state_reconciliation',
+        success: true,
+        inconsistentStatesFixed: fixedCount
+      });
+    } catch (stateError) {
+      console.error(`[${monitorId}] Error reconciling states:`, stateError);
+      results.push({
+        type: 'state_reconciliation',
+        success: false,
+        error: stateError.message
+      });
+    }
     
-    if (autoFix) {
-      try {
-        // Call manageRedis function to check inconsistencies
-        const { data: inconsistencyData, error: inconsistencyError } = await supabase.functions.invoke('manageRedis', {
-          body: {
-            operation: 'check-inconsistencies',
-            entityType: null, // All entity types
-            minutes: thresholdMinutes,
-            fix: true // Fix inconsistencies
-          }
+    // Clean up stuck processing states
+    try {
+      console.log(`[${monitorId}] Cleaning up stuck processing states...`);
+      
+      const { data: cleanupResult, error: cleanupError } = await supabase.rpc('cleanup_stuck_processing_states');
+      
+      if (cleanupError) {
+        console.error(`[${monitorId}] Error cleaning up stuck processing states:`, cleanupError.message);
+        results.push({
+          type: 'processing_states_cleanup',
+          success: false,
+          error: cleanupError.message
         });
-        
-        if (inconsistencyError) {
-          console.error(`[${correlationId}] Error checking inconsistencies:`, inconsistencyError);
-        } else if (inconsistencyData) {
-          inconsistencyResults = {
-            checked: true,
-            found: inconsistencyData.inconsistenciesFound || 0,
-            fixed: inconsistencyData.inconsistenciesFixed || 0
-          };
-          
-          console.log(`[${correlationId}] Found ${inconsistencyResults.found} inconsistencies, fixed ${inconsistencyResults.fixed}`);
-        }
-      } catch (inconsistencyError) {
-        console.error(`[${correlationId}] Exception checking inconsistencies:`, inconsistencyError);
+      } else {
+        console.log(`[${monitorId}] Cleaned up ${cleanupResult} stuck processing states`);
+        results.push({
+          type: 'processing_states_cleanup',
+          success: true,
+          cleanedStates: cleanupResult
+        });
       }
+    } catch (cleanupError) {
+      console.error(`[${monitorId}] Exception cleaning up stuck processing states:`, cleanupError);
+      results.push({
+        type: 'processing_states_cleanup',
+        success: false,
+        error: cleanupError.message
+      });
     }
     
     // Release the lock when done
-    await redis.del(lockKey);
-    
-    // Save monitoring results to metrics
     try {
-      await supabase.from('queue_metrics').insert({
-        queue_name: 'all',
-        operation: 'queue_monitor',
-        started_at: new Date().toISOString(),
-        finished_at: new Date().toISOString(),
-        processed_count: totalStuckMessages,
-        success_count: totalFixedMessages,
-        details: {
-          threshold_minutes: thresholdMinutes,
-          auto_fix: autoFix,
-          correlation_id: correlationId,
-          results,
-          inconsistency_results: inconsistencyResults
-        }
-      });
-    } catch (metricsError) {
-      console.warn(`[${correlationId}] Failed to save metrics:`, metricsError);
-    }
-    
-    return new Response(JSON.stringify({
-      status: "completed",
-      total_stuck_messages: totalStuckMessages,
-      total_fixed_messages: totalFixedMessages,
-      inconsistencies: inconsistencyResults,
-      autofix_applied: autoFix,
-      threshold_minutes: thresholdMinutes,
-      results,
-      correlation_id: correlationId,
-      timestamp: new Date().toISOString()
-    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  } catch (error) {
-    console.error("Error in queue monitor:", error);
-    
-    // Try to release the lock even on error
-    try {
-      await redis.del("lock:queue_monitor");
+      const currentLock = await redis.get(monitorLockKey);
+      if (currentLock === monitorId) {
+        await redis.del(monitorLockKey);
+      }
     } catch (e) {
-      console.error("Error releasing lock:", e);
+      console.warn(`[${monitorId}] Error releasing monitor lock:`, e);
     }
-    
-    await logWorkerIssue(
-      supabase,
-      "queueMonitor", 
-      "fatal_error", 
-      `Fatal error in queue monitor: ${error.message}`, 
-      { error: error.stack }
-    );
     
     return new Response(JSON.stringify({ 
-      status: "error", 
-      error: error.message 
+      success: true, 
+      monitorId,
+      results
+    }), { 
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    });
+    
+  } catch (error) {
+    console.error(`[${monitorId}] Unexpected error in queue monitor:`, error);
+    return new Response(JSON.stringify({ 
+      error: error.message
     }), { 
       status: 500, 
-      headers: corsHeaders 
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
     });
   }
 });

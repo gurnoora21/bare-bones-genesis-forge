@@ -6,11 +6,11 @@ import {
   deleteMessageWithRetries, 
   logWorkerIssue,
   checkTrackProcessed,
-  processQueueMessageSafely,
-  acquireProcessingLock,
-  safeMessageIdString
+  processQueueMessageSafely
 } from "../_shared/queueHelper.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { getStateManager } from "../_shared/coordinatedStateManager.ts";
+import { EntityType, generateCorrelationId } from "../_shared/stateManager.ts";
 
 // Initialize Redis client for distributed locking and caching
 const redis = new Redis({
@@ -23,6 +23,12 @@ interface ProducerIdentificationMsg {
   trackName: string;
   albumId: string;
   artistId: string;
+}
+
+interface ProducerCandidate {
+  name: string;
+  confidence: number;
+  source: string;
 }
 
 const corsHeaders = {
@@ -81,6 +87,9 @@ serve(async (req) => {
 
     // Initialize the Genius client
     const geniusClient = new GeniusClient();
+    
+    // Generate batch correlation ID
+    const batchCorrelationId = generateCorrelationId('producer_batch');
 
     // Process messages with background tasks
     EdgeRuntime.waitUntil((async () => {
@@ -155,7 +164,10 @@ serve(async (req) => {
               );
             }
             
-            console.log(`Processing producer identification for track: ${msg.trackName} (${msg.trackId}) with message ID: ${messageId}`);
+            // Generate message correlation ID
+            const correlationId = `${batchCorrelationId}:${msg.trackId}`;
+            
+            console.log(`[${correlationId}] Processing producer identification for track: ${msg.trackName} (${msg.trackId}) with message ID: ${messageId}`);
             
             // Create a unique idempotency key for this track's producer identification
             const idempotencyKey = `track_producers:${msg.trackId}`;
@@ -165,33 +177,48 @@ serve(async (req) => {
               supabase,
               "producer_identification",
               messageId,
-              async () => await identifyProducers(supabase, geniusClient, msg, redis),
+              async () => await identifyProducers(supabase, geniusClient, msg, redis, correlationId),
               idempotencyKey,
               async () => await checkTrackProcessed(redis, msg.trackId, "producer_identification"),
               { 
-                maxRetries: 2, 
-                circuitBreaker: true,
+                maxRetries: 2,
+                timeoutMs: 25000, // 25 seconds timeout
                 deduplication: {
                   enabled: true,
                   redis,
-                  ttlSeconds: 3600, // 1 hour
+                  ttlSeconds: 86400, // 24 hours
                   strictMatching: false // Use business identifier matching
+                },
+                stateManagement: {
+                  enabled: true,
+                  entityType: EntityType.TRACK,
+                  entityId: msg.trackId
+                },
+                deadLetter: {
+                  enabled: true,
+                  queue: "producer_identification_dlq"
+                },
+                correlationId,
+                retryStrategy: {
+                  baseDelayMs: 500,
+                  maxDelayMs: 5000,
+                  jitterFactor: 0.25
                 }
               }
             );
             
-            if (result) {
-              console.log(`Successfully processed producer identification message ${messageId}`);
+            if (result.success) {
+              console.log(`[${correlationId}] Successfully processed producer identification message ${messageId}`);
               
               // Check if it was a deduplication
-              if (typeof result === 'object' && result.deduplication) {
+              if (result.deduplication) {
                 dedupedCount++;
-                console.log(`Message ${messageId} was handled by deduplication`);
+                console.log(`[${correlationId}] Message ${messageId} was handled by deduplication`);
               } else {
                 successCount++;
               }
             } else {
-              console.warn(`Message ${messageId} was not successfully processed`);
+              console.warn(`[${correlationId}] Message ${messageId} was not successfully processed: ${result.error || 'Unknown error'}`);
               errorCount++;
             }
             
@@ -199,7 +226,10 @@ serve(async (req) => {
               messageId,
               trackId: msg.trackId,
               trackName: msg.trackName,
-              success: result
+              success: result.success,
+              deduplication: result.deduplication,
+              processingTimeMs: result.processingTimeMs,
+              error: result.error
             });
           } catch (messageError) {
             console.error(`Error processing producer message:`, messageError);
@@ -238,14 +268,15 @@ serve(async (req) => {
             error_count: errorCount,
             details: { 
               results: processingResults,
-              deduplicated_count: dedupedCount
+              deduplicated_count: dedupedCount,
+              batch_correlation_id: batchCorrelationId
             }
           });
         } catch (metricsError) {
           console.error("Failed to record metrics:", metricsError);
         }
         
-        console.log(`Completed producer identification background processing: ${successCount} successful, ${errorCount} failed, ${dedupedCount} deduplicated`);
+        console.log(`[${batchCorrelationId}] Completed producer identification background processing: ${successCount} successful, ${errorCount} failed, ${dedupedCount} deduplicated`);
       }
     })());
     
@@ -265,37 +296,43 @@ serve(async (req) => {
   }
 });
 
-// Keep existing implementation of identifyProducers function
+// Function to identify producers with proper locking and state management
 async function identifyProducers(
   supabase: any, 
   geniusClient: any,
   msg: ProducerIdentificationMsg,
-  redis: Redis
+  redis: Redis,
+  correlationId: string
 ) {
   const { trackId, trackName, albumId, artistId } = msg;
   
   try {
-    // Acquire lock for this track to prevent concurrent processing
-    const hasLock = await acquireProcessingLock('track_producers', trackId);
+    console.log(`[${correlationId}] Processing track ${trackName} (${trackId})`);
+    
+    // Acquire lock for this track using the state manager
+    const stateManager = getStateManager(supabase, redis);
+    const hasLock = await stateManager.acquireProcessingLock(
+      EntityType.TRACK,
+      trackId,
+      {
+        correlationId,
+        heartbeatIntervalSeconds: 15 // Send heartbeat every 15 seconds
+      }
+    );
     
     if (!hasLock) {
-      console.log(`Another process is handling producers for track ${trackName} (${trackId}), skipping`);
+      console.log(`[${correlationId}] Another process is handling producers for track ${trackName} (${trackId}), skipping`);
       return { skipped: true, reason: "concurrent_processing" };
     }
     
-    // Mark as being processed in Redis
-    try {
-      const processingKey = `processing:track_producers:${trackId}`;
-      await redis.set(processingKey, 'true', { ex: 300 }); // 5 minute TTL
-    } catch (redisError) {
-      console.warn("Failed to set processing flag in Redis:", redisError);
-    }
-    
     // Quick double-check if track is already processed
-    // FIX: Updated to pass redis client and proper queue name
     const alreadyProcessed = await checkTrackProcessed(redis, trackId, "producer_identification");
     if (alreadyProcessed) {
-      console.log(`Track ${trackName} (${trackId}) already has producers, skipping`);
+      console.log(`[${correlationId}] Track ${trackName} (${trackId}) already has producers, skipping`);
+      
+      // Release the lock since we're skipping
+      await stateManager.releaseLock(EntityType.TRACK, trackId);
+      
       return { skipped: true, reason: "already_processed" };
     }
     
@@ -308,7 +345,7 @@ async function identifyProducers(
 
     if (trackError || !trackData) {
       const errMsg = `Track not found with ID: ${trackId}`;
-      console.error(errMsg);
+      console.error(`[${correlationId}] ${errMsg}`);
       throw new Error(errMsg);
     }
 
@@ -321,7 +358,7 @@ async function identifyProducers(
 
     if (artistError || !artistData) {
       const errMsg = `Artist not found with ID: ${artistId}`;
-      console.error(errMsg);
+      console.error(`[${correlationId}] ${errMsg}`);
       throw new Error(errMsg);
     }
 
@@ -374,7 +411,7 @@ async function identifyProducers(
           });
         }
       } catch (error) {
-        console.warn('Error extracting Spotify producers:', error);
+        console.warn(`[${correlationId}] Error extracting Spotify producers:`, error);
       }
     }
     
@@ -387,26 +424,34 @@ async function identifyProducers(
       try {
         const cachedData = await redis.get(geniusKey);
         if (cachedData) {
-          songDetails = JSON.parse(cachedData);
-          console.log(`Using cached Genius data for ${trackName}`);
+          songDetails = JSON.parse(cachedData as string);
+          console.log(`[${correlationId}] Using cached Genius data for ${trackName}`);
         }
       } catch (redisError) {
-        console.warn(`Redis cache get failed for Genius data:`, redisError);
+        console.warn(`[${correlationId}] Redis cache get failed for Genius data:`, redisError);
       }
       
       if (!songDetails) {
-        // First, search for the song on Genius
-        const searchResult = await geniusClient.search(trackName, artistData.name);
+        // First, search for the song on Genius with timeout
+        const searchPromise = geniusClient.search(trackName, artistData.name);
+        const searchResult = await Promise.race([
+          searchPromise,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Genius search timeout")), 10000))
+        ]);
         
         if (searchResult) {
-          // Get song details
-          songDetails = await geniusClient.getSong(searchResult.id);
+          // Get song details with timeout
+          const detailsPromise = geniusClient.getSong(searchResult.id);
+          songDetails = await Promise.race([
+            detailsPromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Genius song details timeout")), 10000))
+          ]);
           
           // Cache the result
           try {
             await redis.set(geniusKey, JSON.stringify(songDetails), { ex: 86400 }); // 24 hour TTL
           } catch (redisError) {
-            console.warn(`Failed to cache Genius data:`, redisError);
+            console.warn(`[${correlationId}] Failed to cache Genius data:`, redisError);
           }
         }
       }
@@ -425,12 +470,13 @@ async function identifyProducers(
         });
       }
     } catch (error) {
-      console.warn(`Genius search failed for ${trackName}:`, error);
+      console.warn(`[${correlationId}] Genius search failed for ${trackName}:`, error);
+      // Non-critical error - continue with just Spotify data
     }
 
     // Deduplicate producers
     const uniqueProducers = deduplicateProducers(producers);
-    console.log(`Found ${uniqueProducers.length} producers for track "${trackName}"`);
+    console.log(`[${correlationId}] Found ${uniqueProducers.length} producers for track "${trackName}"`);
     
     // No producers found is not an error - it just means the track has no identified producers
     if (uniqueProducers.length === 0) {
@@ -447,8 +493,15 @@ async function identifyProducers(
         const processedKey = `processed:track_producers:${trackId}`;
         await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
       } catch (redisError) {
-        console.warn("Failed to set processed flag in Redis:", redisError);
+        console.warn(`[${correlationId}] Failed to set processed flag in Redis:`, redisError);
       }
+      
+      // Mark as completed in state manager
+      await stateManager.markAsCompleted(EntityType.TRACK, trackId, {
+        completedAt: new Date().toISOString(),
+        correlationId,
+        noProducersFound: true
+      });
       
       return { processed: 0, noProducersFound: true };
     }
@@ -462,7 +515,7 @@ async function identifyProducers(
         const normalizedName = normalizeProducerName(producer.name);
         
         if (!normalizedName) {
-          console.warn(`Normalized name is empty for producer ${producer.name}, skipping`);
+          console.warn(`[${correlationId}] Normalized name is empty for producer ${producer.name}, skipping`);
           continue;
         }
         
@@ -474,7 +527,8 @@ async function identifyProducers(
             normalized_name: normalizedName,
             metadata: {
               source: producer.source,
-              updated_at: new Date().toISOString()
+              updated_at: new Date().toISOString(),
+              correlation_id: correlationId
             }
           }, {
             onConflict: 'normalized_name'
@@ -483,13 +537,13 @@ async function identifyProducers(
           .single();
 
         if (error) {
-          console.error(`Error upserting producer ${producer.name}:`, error);
+          console.error(`[${correlationId}] Error upserting producer ${producer.name}:`, error);
           continue;
         }
         
         // Make sure producer exists and has an id
         if (!dbProducer || !dbProducer.id) {
-          console.error(`Missing producer data for ${producer.name}`);
+          console.error(`[${correlationId}] Missing producer data for ${producer.name}`);
           continue;
         }
         
@@ -500,7 +554,7 @@ async function identifyProducers(
         try {
           alreadyLinked = await redis.exists(producerTrackKey) === 1;
         } catch (redisError) {
-          console.warn(`Redis check failed for producer-track link:`, redisError);
+          console.warn(`[${correlationId}] Redis check failed for producer-track link:`, redisError);
         }
         
         if (!alreadyLinked) {
@@ -517,17 +571,17 @@ async function identifyProducers(
             });
           
           if (linkError) {
-            console.error(`Error linking producer ${producer.name} to track:`, linkError);
+            console.error(`[${correlationId}] Error linking producer ${producer.name} to track:`, linkError);
             continue;
           }
           
-          console.log(`Linked producer ${producer.name} to track "${trackName}"`);
+          console.log(`[${correlationId}] Linked producer ${producer.name} to track "${trackName}"`);
           
           // Mark this association in Redis
           try {
             await redis.set(producerTrackKey, 'true', { ex: 86400 }); // 24 hour TTL
           } catch (redisError) {
-            console.warn(`Failed to mark producer-track link in Redis:`, redisError);
+            console.warn(`[${correlationId}] Failed to mark producer-track link in Redis:`, redisError);
           }
           
           successfulProducers.push({
@@ -536,7 +590,7 @@ async function identifyProducers(
             confidence: producer.confidence
           });
         } else {
-          console.log(`Producer ${producer.name} already linked to track "${trackName}", skipping`);
+          console.log(`[${correlationId}] Producer ${producer.name} already linked to track "${trackName}", skipping`);
         }
 
         // If producer hasn't been enriched yet, enqueue social enrichment
@@ -548,7 +602,7 @@ async function identifyProducers(
           try {
             enrichmentEnqueued = await redis.exists(enrichmentKey) === 1;
           } catch (redisError) {
-            console.warn(`Redis check failed for social enrichment:`, redisError);
+            console.warn(`[${correlationId}] Redis check failed for social enrichment:`, redisError);
           }
           
           if (!enrichmentEnqueued) {
@@ -563,23 +617,23 @@ async function identifyProducers(
                 }
               });
               
-              console.log(`Enqueued social enrichment for producer ${producer.name}`);
+              console.log(`[${correlationId}] Enqueued social enrichment for producer ${producer.name}`);
               
               // Mark as enqueued in Redis
               try {
                 await redis.set(enrichmentKey, 'true', { ex: 86400 }); // 24 hour TTL
               } catch (redisError) {
-                console.warn(`Failed to mark social enrichment as enqueued:`, redisError);
+                console.warn(`[${correlationId}] Failed to mark social enrichment as enqueued:`, redisError);
               }
             } catch (enqueueError) {
-              console.error(`Error enqueueing social enrichment for ${producer.name}:`, enqueueError);
+              console.error(`[${correlationId}] Error enqueueing social enrichment for ${producer.name}:`, enqueueError);
             }
           } else {
-            console.log(`Social enrichment already enqueued for ${producer.name}, skipping`);
+            console.log(`[${correlationId}] Social enrichment already enqueued for ${producer.name}, skipping`);
           }
         }
       } catch (producerError) {
-        console.error(`Error processing producer ${producer.name}:`, producerError);
+        console.error(`[${correlationId}] Error processing producer ${producer.name}:`, producerError);
       }
     }
     
@@ -588,30 +642,32 @@ async function identifyProducers(
       const processedKey = `processed:track_producers:${trackId}`;
       await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
     } catch (redisError) {
-      console.warn("Failed to set processed flag in Redis:", redisError);
+      console.warn(`[${correlationId}] Failed to set processed flag in Redis:`, redisError);
     }
     
-    // Remove processing flag
-    try {
-      const processingKey = `processing:track_producers:${trackId}`;
-      await redis.del(processingKey);
-    } catch (redisError) {
-      console.warn("Failed to remove processing flag:", redisError);
-    }
+    // Mark as completed in state manager
+    await stateManager.markAsCompleted(EntityType.TRACK, trackId, {
+      processedAt: new Date().toISOString(),
+      producerCount: successfulProducers.length,
+      correlationId
+    });
     
     return { 
       processed: successfulProducers.length,
       producers: successfulProducers
     };
   } catch (error) {
-    console.error(`Failed to identify producers for track ${trackName}:`, error);
+    console.error(`[${correlationId}] Failed to identify producers for track ${trackName}:`, error);
     
-    // Remove processing flag on error
+    // Mark as failed in state manager
     try {
-      const processingKey = `processing:track_producers:${trackId}`;
-      await redis.del(processingKey);
-    } catch (redisError) {
-      console.warn("Failed to remove processing flag:", redisError);
+      const stateManager = getStateManager(supabase, redis);
+      await stateManager.markAsFailed(EntityType.TRACK, trackId, error.message, {
+        failedAt: new Date().toISOString(),
+        correlationId
+      });
+    } catch (stateError) {
+      console.error(`[${correlationId}] Error updating failed state:`, stateError);
     }
     
     throw error;

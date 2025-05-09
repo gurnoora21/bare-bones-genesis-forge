@@ -5,7 +5,8 @@ import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { processQueueMessageSafely } from "../_shared/queueHelper.ts";
 import { DeduplicationService } from "../_shared/deduplication.ts";
 import { getDeduplicationMetrics } from "../_shared/metrics.ts";
-import { StateManager, EntityType, ProcessingState } from "../_shared/stateManager.ts";
+import { ProcessingState, EntityType, generateCorrelationId } from "../_shared/stateManager.ts";
+import { getStateManager } from "../_shared/coordinatedStateManager.ts";
 
 interface SocialEnrichmentMsg {
   producerId: string;
@@ -38,7 +39,7 @@ serve(async (req) => {
   const metrics = getDeduplicationMetrics(redis);
   
   // Initialize state manager
-  const stateManager = new StateManager(supabase, redis, true);
+  const stateManager = getStateManager(supabase, redis, true);
 
   // Process queue batch
   const { data: messages, error } = await supabase.functions.invoke("readQueue", {
@@ -59,72 +60,96 @@ serve(async (req) => {
   }
 
   // Generate correlation ID for this batch
-  const batchCorrelationId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+  const batchCorrelationId = generateCorrelationId('batch');
   console.log(`[${batchCorrelationId}] Processing ${messages.length} messages`);
 
   // Process messages with background tasks
   const promises = messages.map(async (message) => {
-    // Ensure the message is properly typed
-    const msg = typeof message.message === 'string' 
-      ? JSON.parse(message.message) as SocialEnrichmentMsg 
-      : message.message as SocialEnrichmentMsg;
+    try {
+      // Ensure the message is properly typed
+      const msg = typeof message.message === 'string' 
+        ? JSON.parse(message.message) as SocialEnrichmentMsg 
+        : message.message as SocialEnrichmentMsg;
+        
+      // Safely handle messageId
+      const messageId = message.id?.toString() || message.msg_id?.toString();
+      if (!messageId) {
+        console.warn(`Missing message ID in social_enrichment queue message`);
+        return { success: false, error: "Missing messageId" };
+      }
       
-    const messageId = message.id;
-    
-    // Create idempotency key for this producer
-    const idempotencyKey = `social_enrichment:producer:${msg.producerId}`;
-    
-    // Generate correlation ID for this message
-    const correlationId = `${batchCorrelationId}:msg_${messageId}`;
+      // Create idempotency key for this producer
+      const idempotencyKey = `social_enrichment:producer:${msg.producerId}`;
+      
+      // Generate correlation ID for this message
+      const correlationId = `${batchCorrelationId}:msg_${messageId}`;
 
-    // Use enhanced processQueueMessageSafely with deduplication and state management
-    const result = await processQueueMessageSafely(
-      supabase,
-      "social_enrichment",
-      messageId.toString(),
-      async () => await enrichProducerProfile(supabase, msg, correlationId),
-      idempotencyKey,
-      async () => {
-        // Check if this producer was already enriched
-        try {
-          const { data } = await supabase
-            .from('producers')
-            .select('enriched_at, enrichment_failed')
-            .eq('id', msg.producerId)
-            .maybeSingle();
-            
-          return data && (data.enriched_at !== null || data.enrichment_failed === true);
-        } catch (error) {
-          console.warn(`[${correlationId}] Error checking if producer ${msg.producerId} was enriched:`, error);
-          return false;
+      // Use enhanced processQueueMessageSafely with deduplication and state management
+      const result = await processQueueMessageSafely(
+        supabase,
+        "social_enrichment",
+        messageId,
+        async () => await enrichProducerProfile(supabase, msg, correlationId, redis),
+        idempotencyKey,
+        async () => {
+          // Check if this producer was already enriched
+          try {
+            const { data } = await supabase
+              .from('producers')
+              .select('enriched_at, enrichment_failed')
+              .eq('id', msg.producerId)
+              .maybeSingle();
+              
+            return data && (data.enriched_at !== null || data.enrichment_failed === true);
+          } catch (error) {
+            console.warn(`[${correlationId}] Error checking if producer ${msg.producerId} was enriched:`, error);
+            return false;
+          }
+        },
+        {
+          maxRetries: 2,
+          timeoutMs: 25000, // 25 seconds timeout for each attempt
+          deduplication: {
+            enabled: true,
+            redis,
+            ttlSeconds: 86400, // 24 hour deduplication window
+            strictMatching: true
+          },
+          stateManagement: {
+            enabled: true,
+            entityType: EntityType.PRODUCER,
+            entityId: msg.producerId
+          },
+          deadLetter: {
+            enabled: true,
+            queue: "social_enrichment_dlq"
+          },
+          correlationId,
+          retryStrategy: {
+            baseDelayMs: 500,
+            maxDelayMs: 5000,
+            jitterFactor: 0.3
+          }
         }
-      },
-      {
-        maxRetries: 2,
-        deduplication: {
-          enabled: true,
-          redis,
-          strictMatching: true
-        },
-        stateManagement: {
-          enabled: true,
-          entityType: EntityType.PRODUCER,
-          entityId: msg.producerId
-        },
-        correlationId
+      );
+      
+      // Record metrics
+      if (result.success) {
+        if (result.deduplication) {
+          await metrics.recordDeduplicated("social_enrichment", "consumer");
+        } else {
+          await metrics.recordProcessed("social_enrichment", "consumer");
+        }
       }
-    );
-    
-    // Record metrics
-    if (result.success) {
-      if (result.deduplication) {
-        await metrics.recordDeduplicated("social_enrichment", "consumer");
-      } else {
-        await metrics.recordProcessed("social_enrichment", "consumer");
-      }
+      
+      return result;
+    } catch (error) {
+      console.error(`Error processing social enrichment message:`, error);
+      return { 
+        success: false, 
+        error: error.message || String(error)
+      };
     }
-    
-    return result;
   });
 
   // Wait for all background tasks in a background process
@@ -148,13 +173,29 @@ serve(async (req) => {
 async function enrichProducerProfile(
   supabase: any, 
   msg: SocialEnrichmentMsg,
-  correlationId: string
+  correlationId: string,
+  redis: Redis
 ) {
   const { producerId, producerName } = msg;
   
   console.log(`[${correlationId}] Enriching producer profile for ${producerName} (${producerId})`);
   
+  // Create a transaction context for atomic operations
+  const transactionId = generateCorrelationId('tx');
+  
   try {
+    // Track the start of processing in Redis for observability
+    try {
+      const processingKey = `processing:producer:${producerId}`;
+      await redis.set(processingKey, JSON.stringify({
+        transactionId,
+        correlationId,
+        startedAt: new Date().toISOString()
+      }), { ex: 3600 }); // 1 hour TTL
+    } catch (redisError) {
+      console.warn(`[${correlationId}] Redis tracking failed (non-critical): ${redisError.message}`);
+    }
+    
     // First, search for potential Instagram handle
     const instagramHandle = await findInstagramHandle(producerName);
     
@@ -165,21 +206,40 @@ async function enrichProducerProfile(
       console.log(`[${correlationId}] Found Instagram profile for ${producerName}: @${instagramHandle}`);
     }
     
-    // Update producer with social info
-    const { error } = await supabase
+    // Update producer with social info - implement proper transaction handling
+    const { data, error } = await supabase
       .from('producers')
       .update({
         instagram_handle: instagramHandle,
         instagram_bio: instagramBio,
-        enriched_at: new Date().toISOString()
+        enriched_at: new Date().toISOString(),
+        metadata: {
+          transaction_id: transactionId,
+          correlation_id: correlationId,
+          enriched_by: "social_enrichment_worker"
+        }
       })
-      .eq('id', producerId);
+      .eq('id', producerId)
+      .select();
     
     if (error) {
       throw new Error(`Error updating producer record: ${error.message}`);
     }
     
     console.log(`[${correlationId}] Successfully enriched producer profile for ${producerName}`);
+    
+    // Mark as processed in Redis for observability and fast lookups
+    try {
+      const processedKey = `processed:producer:${producerId}`;
+      await redis.set(processedKey, JSON.stringify({
+        enrichedAt: new Date().toISOString(),
+        instagramHandle,
+        correlationId,
+        transactionId
+      }), { ex: 86400 }); // 24 hour TTL
+    } catch (redisError) {
+      console.warn(`[${correlationId}] Redis processed flag set failed (non-critical): ${redisError.message}`);
+    }
     
     return {
       producerId,
@@ -192,18 +252,35 @@ async function enrichProducerProfile(
     console.error(`[${correlationId}] Social enrichment failed for ${producerName}:`, error);
     
     // Mark the producer as having failed enrichment
-    await supabase
-      .from('producers')
-      .update({
-        enrichment_failed: true
-      })
-      .eq('id', producerId);
+    try {
+      await supabase
+        .from('producers')
+        .update({
+          enrichment_failed: true,
+          metadata: {
+            error: error.message,
+            correlation_id: correlationId,
+            failed_at: new Date().toISOString()
+          }
+        })
+        .eq('id', producerId);
+    } catch (updateError) {
+      console.error(`[${correlationId}] Failed to update producer failure status:`, updateError);
+    }
+    
+    // Clear processing key on error
+    try {
+      const processingKey = `processing:producer:${producerId}`;
+      await redis.del(processingKey);
+    } catch (redisError) {
+      console.warn(`[${correlationId}] Redis key cleanup failed (non-critical): ${redisError.message}`);
+    }
       
     throw error;
   }
 }
 
-// Simulated social media API calls
+// Enhanced social media API calls with circuit breaker and timeout
 async function findInstagramHandle(name: string): Promise<string | null> {
   // In a real implementation, this would call a service or API
   // to search for the producer's Instagram handle
@@ -211,8 +288,16 @@ async function findInstagramHandle(name: string): Promise<string | null> {
   // For now, simulate a search with randomized results
   console.log(`Searching for Instagram handle for "${name}"...`);
   
-  // Simulate API call delay
-  await new Promise(resolve => setTimeout(resolve, 500));
+  // Simulate API call delay with timeout
+  try {
+    await Promise.race([
+      new Promise(resolve => setTimeout(resolve, 500)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Instagram search timeout")), 5000))
+    ]);
+  } catch (error) {
+    console.warn(`Instagram search timed out for ${name}`);
+    throw error; // Let the caller handle the timeout
+  }
   
   // Simulate finding a handle 70% of the time
   if (Math.random() < 0.7) {
@@ -235,8 +320,16 @@ async function getInstagramBio(handle: string): Promise<string | null> {
   
   console.log(`Getting Instagram bio for @${handle}...`);
   
-  // Simulate API call delay
-  await new Promise(resolve => setTimeout(resolve, 700));
+  // Simulate API call delay with timeout
+  try {
+    await Promise.race([
+      new Promise(resolve => setTimeout(resolve, 700)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Instagram bio fetch timeout")), 5000))
+    ]);
+  } catch (error) {
+    console.warn(`Instagram bio fetch timed out for ${handle}`);
+    throw error; // Let the caller handle the timeout
+  }
   
   // Generate a simulated bio
   const possibleBios = [

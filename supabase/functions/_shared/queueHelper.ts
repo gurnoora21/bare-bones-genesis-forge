@@ -7,7 +7,7 @@
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService, getDeduplicationService } from "./deduplication.ts";
 import { CoordinatedStateManager, getStateManager } from "./coordinatedStateManager.ts";
-import { ProcessingState } from "./stateManager.ts";
+import { ProcessingState, ErrorCategory, classifyError, generateCorrelationId } from "./stateManager.ts";
 import { DeduplicationMetrics, getDeduplicationMetrics } from "./metrics.ts";
 
 // Helper function to safely format message ID as string
@@ -119,10 +119,20 @@ export interface ProcessQueueOptions {
     entityId?: string;
     timeoutMinutes?: number;
   };
+  deadLetter?: {
+    enabled: boolean;
+    queue?: string;
+    errorCategories?: ErrorCategory[];
+  };
   correlationId?: string;
   metrics?: {
     enabled: boolean;
     redis?: Redis;
+  };
+  retryStrategy?: {
+    baseDelayMs?: number;
+    maxDelayMs?: number;
+    jitterFactor?: number;
   };
 }
 
@@ -131,9 +141,127 @@ export interface ProcessResult {
   success: boolean;
   deduplication?: boolean;
   stateManaged?: boolean;
+  deadLettered?: boolean;
   error?: string;
+  errorCategory?: ErrorCategory;
   correlationId?: string;
   processingTimeMs?: number;
+  retryCount?: number;
+}
+
+// Function to calculate retry delay with exponential backoff and jitter
+function calculateRetryDelay(
+  attempt: number, 
+  baseDelay: number = 100, 
+  maxDelay: number = 30000, 
+  jitterFactor: number = 0.2
+): number {
+  // Calculate exponential backoff
+  const expBackoff = Math.min(maxDelay, baseDelay * Math.pow(2, attempt));
+  
+  // Add jitter
+  const jitter = expBackoff * jitterFactor;
+  const jitterRange = jitter * 2; // Total range is +/- jitter
+  const randomJitter = Math.random() * jitterRange - jitter; // Random value between -jitter and +jitter
+  
+  return Math.max(baseDelay, Math.floor(expBackoff + randomJitter));
+}
+
+// Create a processing lock with heartbeat
+export async function acquireProcessingLock(
+  entityType: string, 
+  entityId: string,
+  correlationId?: string,
+  options: { 
+    timeoutMinutes?: number;
+    heartbeatIntervalSeconds?: number;
+  } = {}
+): Promise<boolean> {
+  try {
+    // Use PostgreSQL advisory lock
+    const result = await fetch('pg_lock_acquire', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entity_type: entityType,
+        entity_id: entityId,
+        timeout_minutes: options.timeoutMinutes || 30
+      })
+    });
+    
+    if (result.ok) {
+      const data = await result.json();
+      return data.acquired === true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error(`Error acquiring lock for ${entityType}:${entityId}: ${error.message}`);
+    return false;
+  }
+}
+
+// Check if a track has been processed
+export async function checkTrackProcessed(
+  redis: Redis,
+  trackId: string,
+  processingType: string
+): Promise<boolean> {
+  try {
+    const processedKey = `processed:${processingType}:${trackId}`;
+    return await redis.exists(processedKey) === 1;
+  } catch (error) {
+    console.warn(`Redis check failed for ${trackId}: ${error.message}`);
+    return false;
+  }
+}
+
+// Send a message to a dead-letter queue
+async function sendToDeadLetterQueue(
+  supabase: any,
+  queueName: string,
+  originalMessage: any,
+  error: Error,
+  correlationId: string,
+  originalMessageId?: string
+): Promise<boolean> {
+  try {
+    const deadLetterQueueName = `${queueName}_dlq`;
+    const errorCategory = classifyError(error);
+    const deadLetterMessage = {
+      originalMessage,
+      error: {
+        message: error.message,
+        stack: error.stack,
+        name: error.name,
+        category: errorCategory
+      },
+      metadata: {
+        failedAt: new Date().toISOString(),
+        correlationId,
+        originalQueue: queueName,
+        originalMessageId
+      }
+    };
+    
+    const { error: enqueueError } = await supabase.functions.invoke("sendToQueue", {
+      body: {
+        queue_name: deadLetterQueueName,
+        message: deadLetterMessage
+      }
+    });
+    
+    if (enqueueError) {
+      console.error(`Error sending to dead-letter queue ${deadLetterQueueName}:`, enqueueError);
+      return false;
+    }
+    
+    console.log(`Message sent to dead-letter queue ${deadLetterQueueName} with correlationId ${correlationId}`);
+    return true;
+  } catch (enqueueError) {
+    console.error(`Failed to send to dead-letter queue:`, enqueueError);
+    return false;
+  }
 }
 
 // Function to process a queue message with safety checks, idempotency, and deduplication
@@ -154,7 +282,7 @@ export async function processQueueMessageSafely(
 
   // Generate correlation ID if not provided
   const correlationId = options.correlationId || 
-    `corr_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+    generateCorrelationId(`corr`);
   
   console.log(`[${correlationId}] Processing message ${messageId} from queue ${queueName}`);
   
@@ -162,12 +290,23 @@ export async function processQueueMessageSafely(
   let stateManager: CoordinatedStateManager | undefined;
   let deduplicationService: DeduplicationService | undefined;
   let metrics: DeduplicationMetrics | undefined;
+  let retryCount = 0;
   
   // Result object to track what happened
   const result: ProcessResult = {
     success: false,
-    correlationId
+    correlationId,
+    retryCount
   };
+
+  // Calculate retry parameters from options
+  const retryStrategy = options.retryStrategy || {};
+  const baseDelayMs = retryStrategy.baseDelayMs || 100;
+  const maxDelayMs = retryStrategy.maxDelayMs || 30000;
+  const jitterFactor = retryStrategy.jitterFactor || 0.2;
+  
+  // Setup max retries
+  const maxRetries = options.maxRetries || 2;
 
   try {
     // Initialize metrics if enabled
@@ -273,21 +412,135 @@ export async function processQueueMessageSafely(
       }
     }
 
-    // Process the message with timeout if specified
+    // Process the message with retries and timeout
     console.log(`[${correlationId}] Executing processing function for message ${messageId}`);
     
+    // Wrap the processing function with retries
     let processResult;
-    if (options.timeoutMs) {
-      // Process with timeout
-      processResult = await Promise.race([
-        processingFunction(),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error(`Processing timeout after ${options.timeoutMs}ms`)), options.timeoutMs)
-        )
-      ]);
-    } else {
-      // Process without timeout
-      processResult = await processingFunction();
+    let lastError: Error | null = null;
+    
+    for (retryCount = 0; retryCount <= maxRetries; retryCount++) {
+      try {
+        if (retryCount > 0) {
+          console.log(`[${correlationId}] Retry attempt ${retryCount} of ${maxRetries} for message ${messageId}`);
+        }
+        
+        // Process with timeout if specified
+        if (options.timeoutMs) {
+          // Process with timeout
+          processResult = await Promise.race([
+            processingFunction(),
+            new Promise((_, reject) => 
+              setTimeout(() => reject(new Error(`Processing timeout after ${options.timeoutMs}ms`)), options.timeoutMs)
+            )
+          ]);
+        } else {
+          // Process without timeout
+          processResult = await processingFunction();
+        }
+        
+        // Success! Break out of retry loop
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        const errorCategory = classifyError(error);
+        result.errorCategory = errorCategory;
+        
+        console.error(`[${correlationId}] Error processing message ${messageId} (attempt ${retryCount + 1}):`, error);
+        
+        // Check if we should retry based on error category
+        const isRetriable = (
+          errorCategory === ErrorCategory.TRANSIENT || 
+          errorCategory === ErrorCategory.UNKNOWN
+        );
+        
+        // If this is not a retriable error or we're out of retries, break the loop
+        if (!isRetriable || retryCount >= maxRetries) {
+          break;
+        }
+        
+        // Calculate backoff delay
+        const delayMs = calculateRetryDelay(retryCount, baseDelayMs, maxDelayMs, jitterFactor);
+        console.log(`[${correlationId}] Retrying in ${delayMs}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+    
+    // Check if we encountered an error
+    if (lastError) {
+      // If state management is enabled, mark entity as failed
+      if (options.stateManagement?.enabled && stateManager) {
+        const entityType = options.stateManagement.entityType || queueName;
+        const entityId = options.stateManagement.entityId || idempotencyKey;
+        
+        await stateManager.markAsFailed(
+          entityType, 
+          entityId, 
+          lastError.message,
+          {
+            correlationId,
+            timestamp: new Date().toISOString(),
+            retries: retryCount
+          }
+        );
+      }
+      
+      // Record failure metric if enabled
+      if (metrics) {
+        const errorType = lastError instanceof Error ? lastError.constructor.name : 'UnknownError';
+        await metrics.recordFailure(queueName, "consumer", errorType, lastError.message);
+      }
+      
+      // Send to dead-letter queue if enabled
+      if (options.deadLetter?.enabled) {
+        const errorCategory = classifyError(lastError);
+        const eligibleCategories = options.deadLetter.errorCategories || [
+          ErrorCategory.PERMANENT, 
+          ErrorCategory.UNKNOWN
+        ];
+        
+        if (eligibleCategories.includes(errorCategory)) {
+          const deadLetterSuccess = await sendToDeadLetterQueue(
+            supabase, 
+            queueName, 
+            { idempotencyKey }, // Replace with actual message content if available 
+            lastError, 
+            correlationId,
+            messageId
+          );
+          
+          if (deadLetterSuccess) {
+            result.deadLettered = true;
+            
+            // Mark as DEAD_LETTER in state manager
+            if (options.stateManagement?.enabled && stateManager) {
+              const entityType = options.stateManagement.entityType || queueName;
+              const entityId = options.stateManagement.entityId || idempotencyKey;
+              
+              await stateManager.markAsDeadLetter(
+                entityType,
+                entityId,
+                lastError.message,
+                {
+                  correlationId,
+                  deadLetteredAt: new Date().toISOString(),
+                  retries: retryCount
+                }
+              );
+            }
+            
+            // Delete original message since it's been moved to DLQ
+            await deleteMessageWithRetries(supabase, queueName, messageId);
+          }
+        }
+      }
+      
+      result.error = lastError.message;
+      result.success = false;
+      result.retryCount = retryCount;
+      
+      return result;
     }
     
     console.log(`[${correlationId}] Processing complete for message ${messageId}`);
@@ -333,6 +586,7 @@ export async function processQueueMessageSafely(
     }
 
     result.success = true;
+    result.retryCount = retryCount;
     return result;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -362,6 +616,7 @@ export async function processQueueMessageSafely(
     
     result.error = errorMessage;
     result.success = false;
+    result.retryCount = retryCount;
     
     return result;
   }
@@ -415,5 +670,66 @@ export async function logProcessingMetrics(
     });
   } catch (error) {
     console.warn(`Failed to log metrics: ${error.message}`);
+  }
+}
+
+// Function to requeue a message from the dead-letter queue back to the original queue
+export async function requeueFromDeadLetter(
+  supabase: any,
+  dlqName: string,
+  messageId: string
+): Promise<boolean> {
+  try {
+    // Read message from DLQ without deleting it
+    const { data: messages, error } = await supabase.functions.invoke("readQueue", {
+      body: { 
+        queue_name: dlqName,
+        batch_size: 1,
+        visibility_timeout: 60,
+        message_id: messageId
+      }
+    });
+    
+    if (error || !messages || messages.length === 0) {
+      console.error(`Error reading message ${messageId} from ${dlqName}:`, error || "No message found");
+      return false;
+    }
+    
+    const dlqMessage = messages[0];
+    const originalMessage = dlqMessage.message.originalMessage;
+    const originalQueue = dlqMessage.message.metadata?.originalQueue;
+    
+    if (!originalMessage || !originalQueue) {
+      console.error(`Invalid DLQ message format for ${messageId}`);
+      return false;
+    }
+    
+    // Send message back to original queue
+    const { error: sendError } = await supabase.functions.invoke("sendToQueue", {
+      body: {
+        queue_name: originalQueue,
+        message: originalMessage,
+        metadata: {
+          requeuedAt: new Date().toISOString(),
+          requeuedFrom: dlqName,
+          originalDlqMessageId: messageId,
+          retryAttempt: (dlqMessage.message.metadata?.retryAttempt || 0) + 1
+        }
+      }
+    });
+    
+    if (sendError) {
+      console.error(`Error sending message back to ${originalQueue}:`, sendError);
+      return false;
+    }
+    
+    // Delete from DLQ
+    await deleteMessageWithRetries(supabase, dlqName, messageId);
+    
+    console.log(`Successfully requeued message ${messageId} from ${dlqName} to ${originalQueue}`);
+    return true;
+  } catch (error) {
+    console.error(`Error requeuing message from DLQ:`, error);
+    return false;
   }
 }

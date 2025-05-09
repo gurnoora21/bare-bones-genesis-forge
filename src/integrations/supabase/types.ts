@@ -419,11 +419,18 @@ export type Database = {
     }
     Functions: {
       acquire_processing_lock: {
-        Args: {
-          p_entity_type: string
-          p_entity_id: string
-          p_timeout_minutes?: number
-        }
+        Args:
+          | {
+              p_entity_type: string
+              p_entity_id: string
+              p_timeout_minutes?: number
+            }
+          | {
+              p_entity_type: string
+              p_entity_id: string
+              p_timeout_minutes?: number
+              p_correlation_id?: string
+            }
         Returns: boolean
       }
       check_worker_crons: {
@@ -439,6 +446,10 @@ export type Database = {
           active: boolean
           next_run: string
         }[]
+      }
+      cleanup_stuck_processing_states: {
+        Args: Record<PropertyKey, never>
+        Returns: number
       }
       confirm_message_deletion: {
         Args: { queue_name: string; message_id: string }
@@ -460,6 +471,26 @@ export type Database = {
         }
         Returns: boolean
       }
+      find_inconsistent_states: {
+        Args: { p_entity_type?: string; p_older_than_minutes?: number }
+        Returns: {
+          entity_type: string
+          entity_id: string
+          db_state: string
+          redis_state: string
+          last_processed_at: string
+          minutes_since_update: number
+        }[]
+      }
+      get_all_queue_tables: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          schema_name: string
+          table_name: string
+          queue_name: string
+          record_count: number
+        }[]
+      }
       get_producer_collaborations: {
         Args: { producer_id: string }
         Returns: {
@@ -470,6 +501,10 @@ export type Database = {
       }
       get_queue_table_name_safe: {
         Args: { p_queue_name: string }
+        Returns: string
+      }
+      get_setting: {
+        Args: { p_key: string }
         Returns: string
       }
       manual_trigger_worker: {
@@ -507,6 +542,29 @@ export type Database = {
       raw_sql_query: {
         Args: { sql_query: string; params?: Json }
         Returns: Json
+      }
+      release_processing_lock: {
+        Args: { p_entity_type: string; p_entity_id: string }
+        Returns: boolean
+      }
+      reset_entity_processing_state: {
+        Args: {
+          p_entity_type?: string
+          p_older_than_minutes?: number
+          p_target_states?: string[]
+        }
+        Returns: {
+          attempts: number | null
+          created_at: string | null
+          entity_id: string
+          entity_type: string
+          id: string
+          last_error: string | null
+          last_processed_at: string | null
+          metadata: Json | null
+          state: string
+          updated_at: string | null
+        }[]
       }
       reset_stuck_message: {
         Args: { queue_name: string; message_id: string }
