@@ -131,10 +131,47 @@ export type Database = {
           },
         ]
       }
+      processing_locks: {
+        Row: {
+          acquired_at: string
+          correlation_id: string | null
+          entity_id: string
+          entity_type: string
+          id: string
+          last_heartbeat: string
+          metadata: Json | null
+          ttl_seconds: number
+          worker_id: string
+        }
+        Insert: {
+          acquired_at?: string
+          correlation_id?: string | null
+          entity_id: string
+          entity_type: string
+          id?: string
+          last_heartbeat?: string
+          metadata?: Json | null
+          ttl_seconds?: number
+          worker_id: string
+        }
+        Update: {
+          acquired_at?: string
+          correlation_id?: string | null
+          entity_id?: string
+          entity_type?: string
+          id?: string
+          last_heartbeat?: string
+          metadata?: Json | null
+          ttl_seconds?: number
+          worker_id?: string
+        }
+        Relationships: []
+      }
       processing_status: {
         Row: {
           attempts: number | null
           created_at: string | null
+          dead_lettered: boolean | null
           entity_id: string
           entity_type: string
           id: string
@@ -147,6 +184,7 @@ export type Database = {
         Insert: {
           attempts?: number | null
           created_at?: string | null
+          dead_lettered?: boolean | null
           entity_id: string
           entity_type: string
           id?: string
@@ -159,6 +197,7 @@ export type Database = {
         Update: {
           attempts?: number | null
           created_at?: string | null
+          dead_lettered?: boolean | null
           entity_id?: string
           entity_type?: string
           id?: string
@@ -447,6 +486,25 @@ export type Database = {
           next_run: string
         }[]
       }
+      claim_stale_lock: {
+        Args: {
+          p_entity_type: string
+          p_entity_id: string
+          p_new_worker_id: string
+          p_correlation_id?: string
+          p_stale_threshold_seconds?: number
+        }
+        Returns: Json
+      }
+      cleanup_stale_locks: {
+        Args: { p_stale_threshold_seconds?: number }
+        Returns: {
+          entity_type: string
+          entity_id: string
+          worker_id: string
+          stale_seconds: number
+        }[]
+      }
       cleanup_stuck_processing_states: {
         Args: Record<PropertyKey, never>
         Returns: number
@@ -469,6 +527,10 @@ export type Database = {
           p_message_id: string
           p_is_numeric?: boolean
         }
+        Returns: boolean
+      }
+      ensure_message_deleted: {
+        Args: { queue_name: string; message_id: string; max_attempts?: number }
         Returns: boolean
       }
       find_inconsistent_states: {
@@ -543,6 +605,14 @@ export type Database = {
         Args: { sql_query: string; params?: Json }
         Returns: Json
       }
+      release_lock: {
+        Args: {
+          p_entity_type: string
+          p_entity_id: string
+          p_worker_id?: string
+        }
+        Returns: boolean
+      }
       release_processing_lock: {
         Args: { p_entity_type: string; p_entity_id: string }
         Returns: boolean
@@ -556,6 +626,7 @@ export type Database = {
         Returns: {
           attempts: number | null
           created_at: string | null
+          dead_lettered: boolean | null
           entity_id: string
           entity_type: string
           id: string
@@ -588,6 +659,15 @@ export type Database = {
       start_bulk_artist_discovery: {
         Args: { genre?: string; min_popularity?: number; limit_count?: number }
         Returns: string[]
+      }
+      update_lock_heartbeat: {
+        Args: {
+          p_entity_type: string
+          p_entity_id: string
+          p_worker_id: string
+          p_correlation_id?: string
+        }
+        Returns: boolean
       }
     }
     Enums: {
