@@ -1,3 +1,4 @@
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { StateTransitionResult, ProcessingState } from "./stateManager.ts";
@@ -120,10 +121,7 @@ export async function processQueueMessageSafely(
   
   // Initialize deduplication service if enabled
   const deduplicationService = deduplication.enabled && deduplication.redis
-    ? new DeduplicationService(deduplication.redis, {
-      ttlSeconds: deduplication.ttlSeconds,
-      strictMatching: deduplication.strictMatching
-    })
+    ? new DeduplicationService(deduplication.redis)
     : null;
   
   while (attempt <= maxRetries) {
@@ -140,14 +138,18 @@ export async function processQueueMessageSafely(
       
       // Check for deduplication
       if (deduplicationService) {
-        const deduplicated = await deduplicationService.checkAndRegister(idempotencyKey);
-        if (deduplicated) {
+        // Use the correct method: isDuplicate instead of checkAndRegister
+        const isDuplicate = await deduplicationService.isDuplicate(queueName, idempotencyKey);
+        if (isDuplicate) {
           console.log(`Message ${messageId} (key: ${idempotencyKey}) deduplicated, skipping`);
           
           // Delete message from queue to prevent reprocessing
           await deleteMessageWithRetries(supabase, queueName, messageId);
           
           return { deduplication: true, skipped: true, reason: "deduplicated" };
+        } else {
+          // Mark as processed once we confirm it's not a duplicate
+          await deduplicationService.markAsProcessed(queueName, idempotencyKey);
         }
       }
       
