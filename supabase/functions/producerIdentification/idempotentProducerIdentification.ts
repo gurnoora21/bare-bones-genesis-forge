@@ -8,9 +8,14 @@ import { getGeniusClient } from "../_shared/enhancedGeniusClient.ts";
 // Message structure for producer identification
 interface ProducerIdentificationMsg {
   trackId: string;
-  trackName: string;
-  artistName: string;
+  trackName?: string;     // Made optional
+  artistName?: string;    // Made optional
   idempotencyKey?: string;
+  // Also support alternative field names that might be in use
+  track_id?: string;
+  track_name?: string;
+  artist_name?: string;
+  artist_id?: string;     // Added potential field
 }
 
 // Worker implementation for producer identification
@@ -30,24 +35,62 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
    * Extract entity info from message for state tracking
    */
   protected extractEntityInfo(message: ProducerIdentificationMsg): { entityType: string; entityId: string } | null {
-    if (!message || !message.trackId) {
+    // Get trackId from any available field
+    const trackId = message?.trackId || message?.track_id;
+    
+    if (!trackId) {
+      console.warn("Cannot extract entity info: no track ID found in message", message);
       return null;
     }
     
     return {
       entityType: EntityType.TRACK,
-      entityId: message.trackId
+      entityId: trackId
     };
+  }
+  
+  /**
+   * Normalize message fields to ensure consistent access patterns
+   */
+  private normalizeMessage(message: ProducerIdentificationMsg): ProducerIdentificationMsg {
+    if (!message) return message;
+    
+    // Ensure trackId is available
+    if (!message.trackId && message.track_id) {
+      message.trackId = message.track_id;
+    }
+    
+    // Ensure trackName is available
+    if (!message.trackName && message.track_name) {
+      message.trackName = message.track_name;
+    }
+    
+    // Ensure artistName is available
+    if (!message.artistName && message.artist_name) {
+      message.artistName = message.artist_name;
+    }
+    
+    return message;
   }
   
   /**
    * Validate incoming message structure
    */
-  protected validateMessage(message: ProducerIdentificationMsg): boolean {
-    if (!message) return false;
-    if (!message.trackId || typeof message.trackId !== 'string') return false;
-    if (!message.trackName || typeof message.trackName !== 'string') return false;
-    if (!message.artistName || typeof message.artistName !== 'string') return false;
+  protected validateMessage(originalMessage: ProducerIdentificationMsg): boolean {
+    if (!originalMessage) {
+      console.warn("Message validation failed: message is null or undefined");
+      return false;
+    }
+    
+    // Normalize the message to ensure all needed fields are consistently available
+    const message = this.normalizeMessage(originalMessage);
+    
+    // The only truly required field is trackId
+    const trackId = message.trackId;
+    if (!trackId || typeof trackId !== 'string') {
+      console.warn("Message validation failed: missing or invalid trackId", { message });
+      return false;
+    }
     
     return true;
   }
@@ -56,59 +99,143 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
    * Create idempotency key from message
    */
   protected createIdempotencyKey(message: ProducerIdentificationMsg): string {
+    // Use existing idempotency key if provided
     if (message.idempotencyKey) {
       return message.idempotencyKey;
     }
     
-    return `track:${message.trackId}:producer-identification`;
+    // Get trackId from normalized message
+    const trackId = message.trackId || message.track_id;
+    
+    if (!trackId) {
+      // Fallback using message attributes as a string to create a consistent key
+      const msgStr = JSON.stringify(message);
+      return `producer-identification:${msgStr.length}:${msgStr.substring(0, 40)}`;
+    }
+    
+    return `track:${trackId}:producer-identification`;
   }
   
   /**
    * Process the message to identify producers
    */
   protected async processMessage(
-    msg: ProducerIdentificationMsg,
+    originalMsg: ProducerIdentificationMsg,
     context: WorkerContext
   ): Promise<ProcessingResult> {
     const { correlationId } = context;
-    const { trackId, trackName, artistName } = msg;
     
-    console.log(`[${correlationId}] Identifying producers for track "${trackName}" by ${artistName}`);
+    // Normalize message to ensure consistent field access
+    const msg = this.normalizeMessage(originalMsg);
+    const trackId = msg.trackId;
+    const trackName = msg.trackName;
+    const artistName = msg.artistName;
     
+    console.log(`[${correlationId}] Processing producer identification for track ID: ${trackId}`);
+    
+    if (!trackName || !artistName) {
+      console.log(`[${correlationId}] Track name or artist name is missing, fetching from database`);
+      
+      try {
+        // Get track information from database if trackName or artistName is missing
+        const { data: track, error: trackError } = await this.supabase
+          .from('tracks')
+          .select('id, name, album_id')
+          .eq('id', trackId)
+          .maybeSingle();
+        
+        if (trackError) {
+          throw createEnhancedError(
+            `Failed to fetch track from database: ${trackError.message}`,
+            ErrorSource.DATABASE,
+            ErrorCategory.TRANSIENT_SERVICE
+          );
+        }
+        
+        if (!track) {
+          throw createEnhancedError(
+            `Track with ID ${trackId} not found in database`,
+            ErrorSource.DATABASE,
+            ErrorCategory.PERMANENT_NOT_FOUND
+          );
+        }
+        
+        // If we're missing artist information, query the album to get the artist
+        if (!artistName && track.album_id) {
+          console.log(`[${correlationId}] Getting artist from track's album ${track.album_id}`);
+          
+          const { data: album, error: albumError } = await this.supabase
+            .from('albums')
+            .select('artist_id')
+            .eq('id', track.album_id)
+            .maybeSingle();
+          
+          if (albumError) {
+            throw createEnhancedError(
+              `Failed to fetch album from database: ${albumError.message}`,
+              ErrorSource.DATABASE,
+              ErrorCategory.TRANSIENT_SERVICE
+            );
+          }
+          
+          if (album && album.artist_id) {
+            const { data: artist, error: artistError } = await this.supabase
+              .from('artists')
+              .select('name')
+              .eq('id', album.artist_id)
+              .maybeSingle();
+            
+            if (!artistError && artist) {
+              msg.artistName = artist.name;
+            }
+          }
+        }
+        
+        // Use track name from database if missing in message
+        if (!msg.trackName && track) {
+          msg.trackName = track.name;
+        }
+        
+        // If we still don't have everything we need, log and abort
+        if (!msg.trackName || !msg.artistName) {
+          console.warn(`[${correlationId}] Insufficient data to proceed with producer identification`);
+          console.warn(`[${correlationId}] trackId: ${trackId}, trackName: ${msg.trackName}, artistName: ${msg.artistName}`);
+          
+          return {
+            success: false,
+            error: createEnhancedError(
+              "Missing required data for producer identification",
+              ErrorSource.VALIDATION,
+              ErrorCategory.PERMANENT_INVALID_INPUT
+            ),
+            metadata: { 
+              trackId,
+              incomplete: true,
+              message: "Track name or artist name could not be determined" 
+            }
+          };
+        }
+      } catch (error) {
+        console.error(`[${correlationId}] Error fetching track data:`, error);
+        return {
+          success: false,
+          error
+        };
+      }
+    }
+    
+    // Now proceed with producer identification using the complete data
     try {
-      // Get track information from database to double-check
-      const { data: track, error: trackError } = await this.supabase
-        .from('tracks')
-        .select('id, name')
-        .eq('id', trackId)
-        .maybeSingle();
-      
-      if (trackError) {
-        throw createEnhancedError(
-          `Failed to fetch track from database: ${trackError.message}`,
-          ErrorSource.DATABASE,
-          ErrorCategory.TRANSIENT_SERVICE
-        );
-      }
-      
-      if (!track) {
-        throw createEnhancedError(
-          `Track with ID ${trackId} not found in database`,
-          ErrorSource.DATABASE,
-          ErrorCategory.PERMANENT_NOT_FOUND
-        );
-      }
-      
       // Initialize Genius client
       const geniusClient = getGeniusClient();
       
-      // Step 1: Search for the song on Genius
-      console.log(`[${correlationId}] Searching Genius for "${trackName}" by ${artistName}`);
+      // Search for the song on Genius
+      console.log(`[${correlationId}] Searching Genius for "${msg.trackName}" by ${msg.artistName}`);
       
-      const song = await geniusClient.search(trackName, artistName);
+      const song = await geniusClient.search(msg.trackName!, msg.artistName!);
       
       if (!song) {
-        console.log(`[${correlationId}] No song found on Genius for "${trackName}" by ${artistName}`);
+        console.log(`[${correlationId}] No song found on Genius for "${msg.trackName}" by ${msg.artistName}`);
         return {
           success: true,
           metadata: { trackId, found: false }
@@ -117,7 +244,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       
       console.log(`[${correlationId}] Found song on Genius: "${song.title}" (ID: ${song.id})`);
       
-      // Step 2: Get detailed song information
+      // Get detailed song information
       const songDetails = await geniusClient.getSong(song.id);
       
       if (!songDetails) {
@@ -128,10 +255,10 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         );
       }
       
-      // Step 3: Extract producers from song details
+      // Extract producers from song details
       const producers = geniusClient.extractProducers(songDetails);
       
-      console.log(`[${correlationId}] Found ${producers.length} producers for "${trackName}"`);
+      console.log(`[${correlationId}] Found ${producers.length} producers for "${msg.trackName}"`);
       
       if (producers.length === 0) {
         return {
@@ -140,7 +267,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         };
       }
       
-      // Step 4: Process each producer within the same transaction
+      // Process each producer within the same transaction
       const producerResults = [];
       
       for (const producer of producers) {
@@ -228,7 +355,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         success: true,
         metadata: {
           trackId,
-          trackName,
+          trackName: msg.trackName,
           found: true,
           producersFound: producerResults.length,
           producers: producerResults
