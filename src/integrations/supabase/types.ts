@@ -605,6 +605,16 @@ export type Database = {
         Args: { sql_query: string; params?: Json }
         Returns: Json
       }
+      record_problematic_message: {
+        Args: {
+          p_queue_name: string
+          p_message_id: string
+          p_message_body: Json
+          p_error_type: string
+          p_error_details?: string
+        }
+        Returns: undefined
+      }
       release_lock: {
         Args: {
           p_entity_type: string
@@ -667,6 +677,10 @@ export type Database = {
           p_worker_id: string
           p_correlation_id?: string
         }
+        Returns: boolean
+      }
+      validate_producer_identification_message: {
+        Args: { message: Json }
         Returns: boolean
       }
     }

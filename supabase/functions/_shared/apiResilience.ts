@@ -1,4 +1,3 @@
-
 /**
  * API resilience system with enhanced rate limiting and circuit breakers
  * Provides protection against API quota exhaustion and service outages
@@ -218,24 +217,15 @@ export class AdaptiveTokenBucket {
       return false;
     }
     
-    // Consume tokens
-    const success = await this.redis.eval(
-      `
-      local tokens = tonumber(redis.call("get", KEYS[1]) or "0")
-      local requested = tonumber(ARGV[1])
-      
-      if tokens >= requested then
-        redis.call("decrby", KEYS[1], requested)
-        return 1
-      else
-        return 0
-      end
-      `,
-      [this.key],
-      [tokens.toString()]
-    );
-    
-    return success === 1;
+    // Consume tokens - FIX: Replace eval with direct DECRBY
+    try {
+      // Instead of using eval which isn't available, use direct DECRBY 
+      await this.redis.decrby(this.key, tokens);
+      return true;
+    } catch (error) {
+      console.error(`Error consuming tokens: ${error.message}`);
+      return false;
+    }
   }
 
   /**
