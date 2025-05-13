@@ -109,28 +109,54 @@ async function resetStuckMessages(supabase: any): Promise<number> {
         'social_enrichment'
       ];
       
-      const queueManager = getQueueManager(supabase);
       let totalReset = 0;
       
       for (const queueName of defaultQueues) {
-        const resetCount = await queueManager.resetAllStuckMessages(queueName, 10);
-        totalReset += resetCount;
-        if (resetCount > 0) {
-          console.log(`Reset ${resetCount} stuck messages in ${queueName}`);
+        try {
+          // Use the proper reset_stuck_messages function we just created
+          const { data: resetCount, error: resetError } = await supabase.rpc(
+            'reset_stuck_messages',
+            {
+              queue_name: queueName,
+              min_minutes_locked: 10
+            }
+          );
+          
+          if (resetError) {
+            console.error(`Error resetting stuck messages for ${queueName}:`, resetError);
+          } else if (resetCount > 0) {
+            console.log(`Reset ${resetCount} stuck messages in ${queueName}`);
+            totalReset += resetCount;
+          }
+        } catch (resetErr) {
+          console.error(`Exception resetting stuck messages for ${queueName}:`, resetErr);
         }
       }
       
       return totalReset;
     } else {
       // Use dynamic queue list from database
-      const queueManager = getQueueManager(supabase);
       let totalReset = 0;
       
       for (const { queue_name } of queues) {
-        const resetCount = await queueManager.resetAllStuckMessages(queue_name, 10);
-        totalReset += resetCount;
-        if (resetCount > 0) {
-          console.log(`Reset ${resetCount} stuck messages in ${queue_name}`);
+        try {
+          // Use the proper reset_stuck_messages function we just created
+          const { data: resetCount, error: resetError } = await supabase.rpc(
+            'reset_stuck_messages',
+            {
+              queue_name: queue_name,
+              min_minutes_locked: 10
+            }
+          );
+          
+          if (resetError) {
+            console.error(`Error resetting stuck messages for ${queue_name}:`, resetError);
+          } else if (resetCount > 0) {
+            console.log(`Reset ${resetCount} stuck messages in ${queue_name}`);
+            totalReset += resetCount;
+          }
+        } catch (resetErr) {
+          console.error(`Exception resetting stuck messages for ${queue_name}:`, resetErr);
         }
       }
       

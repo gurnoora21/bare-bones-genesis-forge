@@ -89,6 +89,27 @@ export type Database = {
         }
         Relationships: []
       }
+      monitoring_events: {
+        Row: {
+          created_at: string | null
+          details: Json | null
+          event_type: string
+          id: string
+        }
+        Insert: {
+          created_at?: string | null
+          details?: Json | null
+          event_type: string
+          id?: string
+        }
+        Update: {
+          created_at?: string | null
+          details?: Json | null
+          event_type?: string
+          id?: string
+        }
+        Relationships: []
+      }
       normalized_tracks: {
         Row: {
           artist_id: string
@@ -485,6 +506,16 @@ export type Database = {
         }
         Relationships: []
       }
+      queue_monitoring_view: {
+        Row: {
+          last_check_time: string | null
+          messages_fixed: number | null
+          queue_name: string | null
+          stuck_messages: number | null
+          total_messages: number | null
+        }
+        Relationships: []
+      }
     }
     Functions: {
       acquire_processing_lock: {
@@ -613,6 +644,10 @@ export type Database = {
         Args: { p_key: string }
         Returns: string
       }
+      get_system_health: {
+        Args: Record<PropertyKey, never>
+        Returns: Json
+      }
       maintenance_clear_stale_entities: {
         Args: Record<PropertyKey, never>
         Returns: {
@@ -709,6 +744,10 @@ export type Database = {
         }
         Returns: Json
       }
+      purge_old_monitoring_events: {
+        Args: { retention_days?: number }
+        Returns: number
+      }
       raw_sql_query: {
         Args: { sql_query: string; params?: Json }
         Returns: Json
@@ -767,6 +806,10 @@ export type Database = {
       reset_stuck_message: {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
+      }
+      reset_stuck_messages: {
+        Args: { queue_name: string; min_minutes_locked?: number }
+        Returns: number
       }
       search_producers: {
         Args: { search_term: string }
