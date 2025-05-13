@@ -108,13 +108,14 @@ export class RedisStateManager {
         return true;
       }
       
+      // FIX: Improved stale lock detection and recovery
       // Check if we can "steal" a stale lock by checking its heartbeat
       const existingLockData = await this.redis.get(lockKey);
       if (existingLockData) {
         try {
           const parsedLock = JSON.parse(existingLockData as string);
           const acquiredAt = new Date(parsedLock.acquiredAt);
-          const staleCutoff = new Date(Date.now() - (timeoutMinutes * 60 * 1000));
+          const staleCutoff = new Date(Date.now() - (timeoutMinutes * 60 * 1000) / 2); // Reduce stale threshold by half
           
           // If the lock is stale (older than timeout with no heartbeat)
           if (acquiredAt < staleCutoff) {

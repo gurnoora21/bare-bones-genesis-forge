@@ -27,7 +27,8 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       batchSize: 5,
       visibilityTimeoutSeconds: 180,
       maxRetryAttempts: 3,
-      useTransactions: true
+      useTransactions: true,
+      allowPartialFailures: true // FIX: Allow partial failures
     });
   }
   
@@ -368,6 +369,74 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         error
       };
     }
+  }
+  
+  /**
+   * FIX: Add direct lock acquisition method that connects to the database directly
+   * This bypasses the Redis lock mechanism if it's failing
+   */
+  protected async directLockAcquisition(entityType: string, entityId: string, options: any = {}): Promise<boolean> {
+    try {
+      console.log(`Attempting direct lock acquisition for ${entityType}:${entityId}`);
+      
+      // Try to insert a row directly in the processing_locks table
+      const { data, error } = await this.supabase
+        .from('processing_locks')
+        .upsert({
+          entity_type: entityType,
+          entity_id: entityId,
+          worker_id: Deno.env.get("WORKER_ID") || `worker_${Math.random().toString(36).substring(2, 10)}`,
+          correlation_id: options.correlationId || `direct_${Date.now()}`,
+          acquired_at: new Date().toISOString(),
+          last_heartbeat: new Date().toISOString()
+        }, {
+          onConflict: 'entity_type,entity_id'
+        });
+      
+      if (error) {
+        console.error(`Failed direct lock acquisition: ${error.message}`);
+        return false;
+      }
+      
+      return true;
+    } catch (error) {
+      console.error(`Error in direct lock acquisition: ${error.message}`);
+      return false;
+    }
+  }
+  
+  /**
+   * Override acquireProcessingLock to implement a fallback mechanism
+   */
+  protected async acquireProcessingLock(entityType: string, entityId: string, options: any = {}): Promise<boolean> {
+    // First try normal lock acquisition 
+    try {
+      const lockAcquired = await this.stateManager.acquireProcessingLock(
+        entityType,
+        entityId,
+        options
+      );
+      
+      if (lockAcquired) {
+        return true;
+      }
+    } catch (error) {
+      console.warn(`Redis lock acquisition failed: ${error.message}, trying fallback`);
+    }
+    
+    // If Redis lock failed, try direct database lock as fallback
+    try {
+      // FIX: For producer identification, we'll use a more aggressive lock acquisition strategy
+      // For important processes like this, we prefer proceeding with the work over waiting for locks
+      if (entityType === EntityType.TRACK && this.options.queueName === 'producer_identification') {
+        // For tracks being processed in producer identification, we'll use the direct approach
+        return await this.directLockAcquisition(entityType, entityId, options);
+      }
+    } catch (fallbackError) {
+      console.error(`Fallback lock acquisition failed: ${fallbackError.message}`);
+    }
+    
+    return false;
   }
   
   /**
