@@ -1,7 +1,7 @@
 
 /**
  * Database State Manager
- * Implements the database side of our dual-system approach
+ * Implements the database side of our state management approach
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
@@ -29,6 +29,8 @@ export class DbStateManager {
   
   /**
    * Attempts to acquire a processing lock in database
+   * This updates the processing_status table but not the actual advisory lock
+   * Used for visibility and tracking purposes
    */
   async acquireProcessingLock(
     entityType: string,
@@ -52,7 +54,7 @@ export class DbStateManager {
     
     while (attemptCount <= retries) {
       try {
-        // Try to acquire lock through database function
+        // Try to update processing status
         const { data, error } = await this.supabase.rpc(
           'acquire_processing_lock',
           {
@@ -99,6 +101,30 @@ export class DbStateManager {
     
     return false;
   }
+
+  /**
+   * Get entity state from database
+   */
+  async getEntityState(entityType: string, entityId: string): Promise<ProcessingState | null> {
+    try {
+      const { data, error } = await this.supabase
+        .from('processing_status')
+        .select('state')
+        .eq('entity_type', entityType)
+        .eq('entity_id', entityId)
+        .maybeSingle();
+      
+      if (error) {
+        console.error(`Error getting entity state: ${error.message}`);
+        return null;
+      }
+      
+      return data && data.state ? data.state as ProcessingState : null;
+    } catch (error) {
+      console.error(`Failed to get entity state: ${error.message}`);
+      return null;
+    }
+  }
   
   /**
    * Updates entity state in database
@@ -125,17 +151,23 @@ export class DbStateManager {
         updated_at: new Date().toISOString()
       };
       
+      // Get current state first to return for change tracking
+      const currentState = await this.getEntityState(entityType, entityId);
+      
       // Update database state
       const { data, error } = await this.supabase
         .from('processing_status')
-        .update({
+        .upsert({
+          entity_type: entityType,
+          entity_id: entityId,
           state: state,
           last_processed_at: new Date().toISOString(),
           last_error: errorMessage,
           metadata: enhancedMetadata,
           updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'entity_type,entity_id'
         })
-        .match({ entity_type: entityType, entity_id: entityId })
         .select('state');
       
       if (error) {
@@ -150,12 +182,9 @@ export class DbStateManager {
       // Reset circuit breaker on success
       this.resetCircuitBreaker();
       
-      // Get previous state for returning
-      const previousState = data && data.length > 0 ? data[0].state as ProcessingState : undefined;
-      
       return {
         success: true,
-        previousState,
+        previousState: currentState || undefined,
         newState: state,
         source: 'database'
       };
@@ -254,7 +283,7 @@ export class DbStateManager {
   }
   
   /**
-   * Releases a processing lock
+   * Releases a processing lock (updates database state only)
    */
   async releaseLock(
     entityType: string,
@@ -288,6 +317,88 @@ export class DbStateManager {
       console.error(`Failed to release processing lock: ${error.message}`);
       this.incrementCircuitFailure();
       return false;
+    }
+  }
+  
+  /**
+   * Find inconsistent or stale states in the database
+   */
+  async findInconsistentStates(
+    entityType?: string,
+    olderThanMinutes: number = 60
+  ) {
+    // Check if circuit breaker is open
+    if (this.isCircuitOpen()) {
+      return [];
+    }
+    
+    try {
+      const { data, error } = await this.supabase.rpc(
+        'find_inconsistent_states',
+        {
+          p_entity_type: entityType || null,
+          p_older_than_minutes: olderThanMinutes
+        }
+      );
+      
+      if (error) {
+        console.error(`Error finding inconsistent states: ${error.message}`);
+        this.incrementCircuitFailure();
+        return [];
+      }
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
+      return data || [];
+    } catch (error) {
+      console.error(`Failed to find inconsistent states: ${error.message}`);
+      this.incrementCircuitFailure();
+      return [];
+    }
+  }
+  
+  /**
+   * Reset stuck processing states
+   */
+  async resetStuckProcessingStates(olderThanMinutes: number = 60) {
+    // Check if circuit breaker is open
+    if (this.isCircuitOpen()) {
+      return { success: false, error: "Database circuit breaker open" };
+    }
+    
+    try {
+      const { data, error } = await this.supabase
+        .from('processing_status')
+        .update({
+          state: ProcessingState.PENDING,
+          metadata: {
+            auto_reset: {
+              reset_at: new Date().toISOString(),
+              reason: 'Stuck in IN_PROGRESS state'
+            }
+          },
+          updated_at: new Date().toISOString(),
+          last_processed_at: new Date().toISOString()
+        })
+        .eq('state', ProcessingState.IN_PROGRESS)
+        .lt('last_processed_at', new Date(Date.now() - (olderThanMinutes * 60 * 1000)).toISOString())
+        .select();
+      
+      if (error) {
+        console.error(`Error resetting stuck states: ${error.message}`);
+        this.incrementCircuitFailure();
+        return { success: false, error: error.message };
+      }
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
+      return { success: true, data };
+    } catch (error) {
+      console.error(`Failed to reset stuck states: ${error.message}`);
+      this.incrementCircuitFailure();
+      return { success: false, error: error.message };
     }
   }
   

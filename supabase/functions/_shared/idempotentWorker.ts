@@ -1,758 +1,236 @@
+
 /**
- * Idempotent Worker Base Class
- * 
- * Provides standardized structure for implementing idempotent workers
- * with safe retries and proper transaction management.
+ * Idempotent Worker Base Implementation
+ * Base class for workers that need to process messages idempotently
+ * Now uses PostgreSQL advisory locks for reliable distributed locking
  */
-
-import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { TransactionManager, getTransactionManager } from "./transactionManager.ts";
-import { EnhancedDeduplicationService, getEnhancedDeduplication } from "./enhancedDeduplication.ts";
-import { getEnhancedStateManager } from "./enhancedStateManager.ts";
-import { ProcessingState, EntityType, StateTransitionResult } from "./stateManager.ts";
-import { createEnhancedError, ErrorCategory, ErrorSource } from "./errorHandling.ts";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { EnhancedStateManager, getStateManager } from "./enhancedStateManager.ts";
 
-export interface IdempotentWorkerOptions {
-  queueName: string;
-  deadLetterQueueName?: string;
+export interface ProcessOptions {
   batchSize?: number;
+  timeoutSeconds?: number;
+  processorName: string;
   visibilityTimeoutSeconds?: number;
-  maxRetryAttempts?: number;
-  useTransactions?: boolean;
-  allowPartialFailures?: boolean;
-  recordProcessingMetrics?: boolean;
 }
 
-export interface WorkerContext {
-  correlationId: string;
-  batchId: string;
-  messageId: string;
-  attempt?: number;
-}
-
-export interface ProcessingResult {
-  success: boolean;
-  isDuplicate?: boolean;
-  error?: Error;
-  metadata?: Record<string, any>;
-}
-
-export abstract class IdempotentWorker<TMessage, TResult> {
+export class IdempotentWorker<T = any> {
   protected supabase: any;
-  protected redis: Redis;
-  protected deduplication: EnhancedDeduplicationService;
-  protected stateManager: any;
-  protected transactionManager: TransactionManager;
-  protected options: IdempotentWorkerOptions;
-  
-  constructor(options: IdempotentWorkerOptions) {
-    this.options = {
-      batchSize: 5,
-      visibilityTimeoutSeconds: 180,
-      maxRetryAttempts: 3,
-      useTransactions: true,
-      allowPartialFailures: false,
-      recordProcessingMetrics: true,
-      ...options
-    };
+  protected queue: string;
+  protected redis: Redis | null = null;
+  protected stateManager: EnhancedStateManager;
+  protected workerId: string;
+
+  constructor(queue: string, supabase?: any, redis?: Redis) {
+    this.queue = queue;
     
-    // Initialize clients
-    this.supabase = createClient(
-      Deno.env.get("SUPABASE_URL") || "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
+    if (supabase) {
+      this.supabase = supabase;
+    } else {
+      this.supabase = createClient(
+        Deno.env.get("SUPABASE_URL") || "",
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
+      );
+    }
+    
+    this.redis = redis || null;
+    
+    // Initialize state manager with Redis used only for caching
+    // PostgreSQL advisory locks are the source of truth
+    this.stateManager = getStateManager(
+      this.supabase, 
+      this.redis,
+      // Use Redis only for caching, not for locking
+      this.redis ? true : false
     );
     
-    this.redis = new Redis({
-      url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
-      token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
-    });
-    
-    // Initialize helpers
-    this.deduplication = getEnhancedDeduplication(this.redis, this.supabase);
-    this.stateManager = getEnhancedStateManager(this.supabase, this.redis, true);
-    this.transactionManager = getTransactionManager(this.supabase);
+    // Generate a unique worker ID for this instance
+    this.workerId = `worker_${this.queue}_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
   }
-  
+
   /**
-   * Main processing entry point - called when the worker is invoked
+   * Safely process a batch of messages from the queue with idempotency
    */
-  async process(request: Request): Promise<Response> {
-    // Generate batch ID for correlation
+  async processBatch(options: ProcessOptions): Promise<{ 
+    processed: number, 
+    errors: number, 
+    messages: any[] 
+  }> {
+    const {
+      batchSize = 5,
+      timeoutSeconds = 60,
+      processorName = 'generic',
+      visibilityTimeoutSeconds = 30
+    } = options;
+    
     const batchId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-    console.log(`[${batchId}] Starting ${this.options.queueName} worker`);
+    console.log(`[${batchId}] Starting ${processorName} worker`);
     
     try {
-      // Read messages from queue
-      const { data: messages, error } = await this.supabase.rpc('pg_dequeue', { 
-        queue_name: this.options.queueName,
-        batch_size: this.options.batchSize, 
-        visibility_timeout: this.options.visibilityTimeoutSeconds
+      // 1. Read messages from the queue
+      const { data: messages, error } = await this.supabase.rpc('pg_dequeue', {
+        queue_name: this.queue,
+        batch_size: batchSize,
+        visibility_timeout: visibilityTimeoutSeconds
       });
       
       if (error) {
-        console.error(`[${batchId}] Error reading from queue:`, error);
-        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+        console.error(`[${batchId}] Error reading from queue: ${error.message}`);
+        return { processed: 0, errors: 1, messages: [] };
       }
       
-      // Parse and validate messages
-      const parsedMessages = this.parseMessages(messages, batchId);
-      
+      const parsedMessages = JSON.parse(messages || '[]');
       console.log(`[${batchId}] Retrieved ${parsedMessages.length} messages from queue`);
       
-      if (!parsedMessages || parsedMessages.length === 0) {
-        return new Response(
-          JSON.stringify({ processed: 0, message: "No messages to process" }),
-          { status: 200 }
-        );
+      if (!parsedMessages.length) {
+        return { processed: 0, errors: 0, messages: [] };
       }
       
-      // Create response for immediate return
-      const response = new Response(
-        JSON.stringify({ 
-          processing: true, 
-          message_count: parsedMessages.length,
-          batch_id: batchId
-        }),
-        { status: 200 }
-      );
+      // 2. Process each message
+      let processed = 0;
+      let errors = 0;
+      const results = [];
       
-      // Process messages in background
-      EdgeRuntime.waitUntil(this.processBatch(parsedMessages, batchId));
-      
-      return response;
-    } catch (mainError) {
-      console.error(`[${batchId}] Critical error in worker:`, mainError);
-      
-      // Record error if metrics are enabled
-      if (this.options.recordProcessingMetrics) {
+      for (const message of parsedMessages) {
         try {
-          await this.supabase.from('worker_issues').insert({
-            worker_name: this.options.queueName,
-            issue_type: 'fatal_error',
-            message: mainError.message,
-            details: { error: mainError.message, stack: mainError.stack }
-          });
-        } catch (metricsError) {
-          console.error(`[${batchId}] Failed to record error metrics:`, metricsError);
-        }
-      }
-      
-      return new Response(JSON.stringify({ error: mainError.message }), { 
-        status: 500
-      });
-    }
-  }
-  
-  /**
-   * Process a batch of messages with proper error handling and idempotency
-   */
-  private async processBatch(messages: Array<{id: string, message: TMessage}>, batchId: string): Promise<void> {
-    // Track batch statistics
-    let successCount = 0;
-    let duplicateCount = 0;
-    let errorCount = 0;
-    let deadLetteredCount = 0;
-    
-    // Process each message
-    for (const message of messages) {
-      const messageId = message.id?.toString();
-      const correlationId = `${batchId}:msg_${messageId}`;
-      
-      console.log(`[${correlationId}] Processing message ${messageId}`);
-      
-      try {
-        // Validate message
-        if (!this.validateMessage(message.message)) {
-          console.error(`[${correlationId}] Message validation failed`);
-          await this.handleInvalidMessage(message, correlationId);
-          errorCount++;
-          continue;
-        }
-        
-        // Extract entity information
-        const entityInfo = this.extractEntityInfo(message.message);
-        const entityType = entityInfo?.entityType;
-        const entityId = entityInfo?.entityId;
-        
-        if (entityType && entityId) {
-          // Check if already processed first using deduplication service
-          const dedupContext = {
-            correlationId,
-            entityType,
-            entityId,
-            operation: this.options.queueName
-          };
+          const messageId = message.id;
+          console.log(`[${batchId}] Processing message ${messageId}`);
           
-          const dedupKey = `${entityType}:${entityId}:${this.options.queueName}`;
-          const dedupResult = await this.deduplication.checkDuplicate(
-            dedupKey,
-            { namespace: this.options.queueName },
-            dedupContext
-          );
-          
-          if (dedupResult.isDuplicate) {
-            console.log(`[${correlationId}] Duplicate detected from ${dedupResult.source}, skipping`);
-            
-            // Delete message from queue
-            await this.deleteMessage(messageId);
-            
-            duplicateCount++;
+          // Parse the message body
+          let body: any;
+          try {
+            body = typeof message.message === 'string' 
+              ? JSON.parse(message.message) 
+              : message.message;
+          } catch (parseError) {
+            console.error(`[${batchId}] Failed to parse message body: ${parseError.message}`);
+            await this.handleFailedMessage(messageId, "Invalid message format", message);
+            errors++;
             continue;
           }
           
-          // Try to acquire processing lock
+          // Extract idempotency key or generate one
+          const idempotencyKey = body._idempotencyKey || 
+            `${this.queue}:${JSON.stringify(body)}`;
+          
+          // 3. Acquire advisory lock to ensure exclusive processing
           const lockAcquired = await this.stateManager.acquireProcessingLock(
-            entityType,
-            entityId,
+            this.queue, 
+            idempotencyKey,
             {
-              correlationId,
-              heartbeatIntervalSeconds: 15
+              timeoutSeconds: 1, // Non-blocking
+              correlationId: `${batchId}_${messageId}`
             }
           );
           
           if (!lockAcquired) {
-            console.log(`[${correlationId}] Could not acquire lock for ${entityType}:${entityId}, skipping`);
-            errorCount++;
+            console.warn(`[${batchId}] Already processing ${idempotencyKey}, skipping`);
+            // Message is already being processed, leave it in the queue
             continue;
           }
           
-          // Process the message with transaction if enabled
+          // 4. Process the message with timeout protection
           try {
-            let result: ProcessingResult;
+            // Set up a timeout promise
+            const timeoutPromise = new Promise((_, reject) => {
+              setTimeout(() => reject(new Error(`Processing timed out after ${timeoutSeconds}s`)), 
+                timeoutSeconds * 1000);
+            });
             
-            if (this.options.useTransactions) {
-              // Process with transaction
-              result = await this.transactionManager.transaction(
-                async (client: any, txId: string) => {
-                  return await this.processMessage(message.message, {
-                    correlationId,
-                    batchId,
-                    messageId,
-                    attempt: 1
-                  });
-                },
-                { correlationId }
-              );
-            } else {
-              // Process without transaction
-              result = await this.processMessage(message.message, {
-                correlationId,
-                batchId,
-                messageId,
-                attempt: 1
-              });
-            }
+            // Process with timeout
+            const result = await Promise.race([
+              this.processMessage(body),
+              timeoutPromise
+            ]);
             
-            if (result.success) {
-              // Mark as completed in state manager
-              await this.stateManager.markAsCompleted(entityType, entityId, {
-                correlationId,
-                completedBy: this.options.queueName,
-                result: result.metadata
-              });
-              
-              // Mark as processed in deduplication service
-              await this.deduplication.markProcessed(
-                dedupKey,
-                { namespace: this.options.queueName, recordResult: true },
-                dedupContext,
-                result.metadata
-              );
-              
-              // Delete message from queue
-              await this.deleteMessage(messageId);
-              
-              successCount++;
-            } else {
-              // Handle process failure
-              if (result.error) {
-                await this.handleProcessingError(
-                  message, 
-                  result.error, 
-                  correlationId,
-                  entityType,
-                  entityId
-                );
-              }
-              errorCount++;
-            }
-          } catch (processError) {
-            console.error(`[${correlationId}] Error processing ${entityType}:${entityId}:`, processError);
+            // 5. If successful, delete the message and release lock
+            await this.supabase.rpc('pg_delete_message', {
+              queue_name: this.queue,
+              message_id: messageId
+            });
             
-            // Handle processing error
-            await this.handleProcessingError(
-              message, 
-              processError, 
-              correlationId,
-              entityType,
-              entityId
-            );
-            
-            errorCount++;
-          }
-        } else {
-          // No entity info - use simpler processing
-          try {
-            // Generate idempotency key from message content
-            const idempotencyKey = this.createIdempotencyKey(message.message);
-            
-            // Check if already processed
-            const dedupResult = await this.deduplication.checkDuplicate(
+            await this.stateManager.markAsCompleted(
+              this.queue, 
               idempotencyKey,
-              { namespace: this.options.queueName },
-              { correlationId, operation: this.options.queueName }
-            );
-            
-            if (dedupResult.isDuplicate) {
-              console.log(`[${correlationId}] Duplicate detected from ${dedupResult.source}, skipping`);
-              
-              // Delete message from queue
-              await this.deleteMessage(messageId);
-              
-              duplicateCount++;
-              continue;
-            }
-            
-            // Process the message
-            let result: ProcessingResult;
-            
-            if (this.options.useTransactions) {
-              // Process with transaction
-              result = await this.transactionManager.transaction(
-                async (client: any, txId: string) => {
-                  return await this.processMessage(message.message, {
-                    correlationId,
-                    batchId,
-                    messageId,
-                    attempt: 1
-                  });
-                },
-                { correlationId }
-              );
-            } else {
-              // Process without transaction
-              result = await this.processMessage(message.message, {
-                correlationId,
-                batchId,
-                messageId,
-                attempt: 1
-              });
-            }
-            
-            if (result.success) {
-              // Mark as processed in deduplication service
-              await this.deduplication.markProcessed(
-                idempotencyKey,
-                { namespace: this.options.queueName, recordResult: true },
-                { correlationId, operation: this.options.queueName },
-                result.metadata
-              );
-              
-              // Delete message from queue
-              await this.deleteMessage(messageId);
-              
-              successCount++;
-            } else {
-              // Handle process failure
-              if (result.error) {
-                await this.handleProcessingError(
-                  message, 
-                  result.error, 
-                  correlationId
-                );
+              { 
+                worker_id: this.workerId,
+                message_id: messageId 
               }
-              errorCount++;
-            }
+            );
+            
+            processed++;
+            results.push({ messageId, success: true, result });
+            console.log(`[${batchId}] Successfully processed message ${messageId}`);
           } catch (processError) {
-            console.error(`[${correlationId}] Error processing message:`, processError);
-            
             // Handle processing error
-            await this.handleProcessingError(
-              message, 
-              processError, 
-              correlationId
+            console.error(`[${batchId}] Error processing message ${messageId}: ${processError.message}`);
+            
+            // Mark as failed but leave in the queue to retry
+            await this.stateManager.markAsFailed(
+              this.queue,
+              idempotencyKey,
+              processError.message,
+              { 
+                worker_id: this.workerId,
+                message_id: messageId,
+                error_stack: processError.stack
+              }
             );
             
-            errorCount++;
+            errors++;
+            results.push({ 
+              messageId, 
+              success: false, 
+              error: processError.message 
+            });
           }
+        } catch (error) {
+          console.error(`[${batchId}] Unexpected error handling message: ${error.message}`);
+          errors++;
         }
-      } catch (messageError) {
-        console.error(`[${correlationId}] Uncaught error processing message:`, messageError);
-        
-        try {
-          // Send to dead letter queue as fallback
-          if (this.options.deadLetterQueueName) {
-            await this.sendToDeadLetterQueue(
-              message,
-              messageError,
-              correlationId,
-              "uncaught_error"
-            );
-            
-            // Delete from original queue
-            await this.deleteMessage(messageId);
-            
-            deadLetteredCount++;
-          }
-        } catch (dlqError) {
-          console.error(`[${correlationId}] Failed to send to dead letter queue:`, dlqError);
-        }
-        
-        errorCount++;
       }
-    }
-    
-    // Log batch results
-    console.log(
-      `[${batchId}] Batch processing complete: ` +
-      `${successCount} successful, ${errorCount} failed, ` +
-      `${duplicateCount} duplicates, ${deadLetteredCount} dead-lettered`
-    );
-    
-    // Record metrics if enabled
-    if (this.options.recordProcessingMetrics) {
-      try {
-        await this.supabase.from('queue_metrics').insert({
-          queue_name: this.options.queueName,
-          operation: "batch_processing",
-          started_at: new Date().toISOString(),
-          finished_at: new Date().toISOString(),
-          processed_count: messages.length,
-          success_count: successCount,
-          error_count: errorCount,
-          details: { 
-            duplicates: duplicateCount,
-            dead_lettered: deadLetteredCount,
-            batch_id: batchId
-          }
-        });
-      } catch (metricsError) {
-        console.error(`[${batchId}] Failed to record metrics:`, metricsError);
-      }
-    }
-  }
-  
-  /**
-   * Override this method to implement message validation logic
-   */
-  protected validateMessage(message: TMessage): boolean {
-    return true;
-  }
-  
-  /**
-   * Override this method to implement entity extraction
-   */
-  protected extractEntityInfo(message: TMessage): { entityType: string; entityId: string } | null {
-    return null;
-  }
-  
-  /**
-   * Override this method to implement message processing
-   */
-  protected abstract processMessage(
-    message: TMessage, 
-    context: WorkerContext
-  ): Promise<ProcessingResult>;
-  
-  /**
-   * Override this to create custom idempotency keys
-   */
-  protected createIdempotencyKey(message: TMessage): string {
-    return `message:${JSON.stringify(message)}`;
-  }
-  
-  /**
-   * Handle invalid message (format, validation)
-   */
-  private async handleInvalidMessage(
-    message: {id: string, message: TMessage},
-    correlationId: string
-  ): Promise<void> {
-    // Send to dead letter queue
-    if (this.options.deadLetterQueueName) {
-      const validationError = createEnhancedError(
-        "Message validation failed",
-        ErrorSource.WORKER,
-        ErrorCategory.PERMANENT_VALIDATION
-      );
       
-      await this.sendToDeadLetterQueue(
-        message,
-        validationError,
-        correlationId,
-        "validation_error"
-      );
-      
-      // Delete from original queue
-      await this.deleteMessage(message.id.toString());
+      return { processed, errors, messages: results };
+    } catch (batchError) {
+      console.error(`[${batchId}] Batch processing error: ${batchError.message}`);
+      return { processed: 0, errors: 1, messages: [] };
     }
   }
   
   /**
-   * Handle processing error
+   * To be implemented by subclasses
    */
-  private async handleProcessingError(
-    message: {id: string, message: TMessage},
-    error: Error,
-    correlationId: string,
-    entityType?: string,
-    entityId?: string
+  // @ts-ignore: Abstract method
+  async processMessage(message: T): Promise<any> {
+    throw new Error("Method not implemented");
+  }
+  
+  /**
+   * Handle a failed message
+   */
+  private async handleFailedMessage(
+    messageId: string, 
+    errorMessage: string, 
+    rawMessage: any
   ): Promise<void> {
-    // Determine if this is a permanent or transient error
-    const isRetriable = !this.isPermanentError(error);
-    
-    if (entityType && entityId) {
-      if (isRetriable) {
-        // Mark as failed (retriable)
-        await this.stateManager.markAsFailed(entityType, entityId, error.message, {
-          correlationId,
-          error: error.message,
-          retriable: true
-        });
-        
-        console.log(`[${correlationId}] Retriable error for ${entityType}:${entityId}, will be reprocessed later`);
-      } else {
-        // Mark as dead letter
-        await this.stateManager.markAsDeadLetter(entityType, entityId, error.message, {
-          correlationId,
-          error: error.message
-        });
-        
-        // Send to dead letter queue
-        if (this.options.deadLetterQueueName) {
-          await this.sendToDeadLetterQueue(
-            message,
-            error,
-            correlationId,
-            "permanent_error"
-          );
-          
-          // Delete from original queue
-          await this.deleteMessage(message.id.toString());
-        }
-      }
-    } else {
-      // No entity tracking - always send to DLQ for non-retriable errors
-      if (!isRetriable && this.options.deadLetterQueueName) {
-        await this.sendToDeadLetterQueue(
-          message,
-          error,
-          correlationId,
-          "permanent_error"
-        );
-        
-        // Delete from original queue
-        await this.deleteMessage(message.id.toString());
-      }
-    }
-  }
-  
-  /**
-   * Determine if an error is permanent (non-retriable)
-   */
-  protected isPermanentError(error: Error): boolean {
-    // Check for enhanced error with category
-    if ('category' in error) {
-      const category = (error as any).category;
-      return category === ErrorCategory.PERMANENT_VALIDATION ||
-             category === ErrorCategory.PERMANENT_NOT_FOUND ||
-             category === ErrorCategory.PERMANENT_AUTH ||
-             category === ErrorCategory.PERMANENT_BAD_REQUEST;
-    }
-    
-    // Check common error patterns
-    const errorMessage = error.message.toLowerCase();
-    return errorMessage.includes('not found') ||
-           errorMessage.includes('invalid format') ||
-           errorMessage.includes('validation failed') ||
-           errorMessage.includes('permission denied') ||
-           errorMessage.includes('unauthorized') ||
-           errorMessage.includes('bad request');
-  }
-  
-  /**
-   * Delete a message from the queue
-   */
-  protected async deleteMessage(messageId: string): Promise<boolean> {
     try {
-      const { error } = await this.supabase.rpc(
-        'pg_delete_message',
-        { queue_name: this.options.queueName, message_id: messageId }
-      );
-      
-      if (error) {
-        console.error(`Error deleting message ${messageId}:`, error);
-        return false;
-      }
-      
-      return true;
-    } catch (deleteError) {
-      console.error(`Failed to delete message ${messageId}:`, deleteError);
-      return false;
-    }
-  }
-  
-  /**
-   * Send a message to the dead letter queue
-   */
-  protected async sendToDeadLetterQueue(
-    originalMessage: {id: string, message: TMessage},
-    error: Error,
-    correlationId: string,
-    reason: string
-  ): Promise<void> {
-    if (!this.options.deadLetterQueueName) {
-      return;
-    }
-    
-    try {
-      // Create dead letter record
-      const deadLetterMessage = {
-        original_message: originalMessage.message,
-        original_message_id: originalMessage.id,
-        original_queue: this.options.queueName,
-        error: error.message,
-        stack: error.stack,
-        reason,
-        correlation_id: correlationId,
-        sent_to_dlq_at: new Date().toISOString()
-      };
-      
-      // Send to dead letter queue
-      await this.supabase.rpc('pg_enqueue', {
-        queue_name: this.options.deadLetterQueueName,
-        message_body: deadLetterMessage
+      // Record the problematic message
+      await this.supabase.rpc('record_problematic_message', {
+        p_queue_name: this.queue,
+        p_message_id: messageId,
+        p_message_body: rawMessage,
+        p_error_type: 'parsing_error',
+        p_error_details: errorMessage
       });
       
-      console.log(`[${correlationId}] Message sent to dead letter queue: ${reason}`);
-    } catch (dlqError) {
-      console.error(`[${correlationId}] Error sending to dead letter queue:`, dlqError);
-    }
-  }
-  
-  /**
-   * Acquire a processing lock using the lock manager
-   */
-  protected async acquireProcessingLock(entityType: string, entityId: string, options: any = {}): Promise<boolean> {
-    try {
-      // Use the lockManager edge function
-      const { data, error } = await this.supabase.functions.invoke("lockManager", {
-        body: {
-          operation: "acquire",
-          entityType,
-          entityId,
-          options: {
-            timeoutMinutes: options.timeoutMinutes || 30,
-            ttlSeconds: options.ttlSeconds || 1800,
-            workerId: this.getWorkerId(),
-            correlationId: this.correlationId
-          }
-        }
+      // Delete the message from the queue
+      await this.supabase.rpc('pg_delete_message', {
+        queue_name: this.queue,
+        message_id: messageId
       });
-      
-      if (error) {
-        this.logger.error(`Error acquiring lock for ${entityType}:${entityId}:`, error);
-        return false;
-      }
-      
-      if (data && data.acquired) {
-        this.logger.info(`[${this.correlationId}] Successfully acquired lock for ${entityType}:${entityId} via ${data.method}`);
-        return true;
-      } else {
-        const reason = data?.reason || "Unknown reason";
-        this.logger.info(`[${this.correlationId}] Failed to acquire lock for ${entityType}:${entityId}: ${reason}`);
-        return false;
-      }
     } catch (error) {
-      this.logger.error(`[${this.correlationId}] Exception acquiring lock for ${entityType}:${entityId}:`, error);
-      return false;
-    }
-  }
-  
-  /**
-   * Release a processing lock using the lock manager
-   */
-  protected async releaseProcessingLock(entityType: string, entityId: string): Promise<boolean> {
-    try {
-      // Use the lockManager edge function
-      const { data, error } = await this.supabase.functions.invoke("lockManager", {
-        body: {
-          operation: "release",
-          entityType,
-          entityId,
-          options: {
-            workerId: this.getWorkerId(),
-            correlationId: this.correlationId
-          }
-        }
-      });
-      
-      if (error) {
-        this.logger.error(`[${this.correlationId}] Error releasing lock for ${entityType}:${entityId}:`, error);
-        return false;
-      }
-      
-      if (data && data.released) {
-        this.logger.info(`[${this.correlationId}] Successfully released lock for ${entityType}:${entityId}`);
-        return true;
-      } else {
-        const errors = data?.errors ? JSON.stringify(data.errors) : "Unknown reason";
-        this.logger.info(`[${this.correlationId}] Failed to release lock for ${entityType}:${entityId}: ${errors}`);
-        return false;
-      }
-    } catch (error) {
-      this.logger.error(`[${this.correlationId}] Exception releasing lock for ${entityType}:${entityId}:`, error);
-      return false;
-    }
-  }
-  
-  /**
-   * Parse and validate messages from queue
-   */
-  private parseMessages(queueData: any, batchId: string): Array<{id: string, message: TMessage}> {
-    let parsedMessages: Array<{id: string, message: TMessage}> = [];
-    
-    try {
-      // Handle either string or object formats
-      if (typeof queueData === 'string') {
-        parsedMessages = JSON.parse(queueData);
-      } else if (Array.isArray(queueData)) {
-        parsedMessages = queueData;
-      } else if (queueData) {
-        parsedMessages = [queueData];
-      }
-      
-      // Process each message to ensure proper format
-      parsedMessages = parsedMessages.map((message: any) => {
-        try {
-          // Ensure message has id and body
-          const messageId = message.id?.toString() || message.msg_id?.toString();
-          let payload = message.message;
-          
-          // Parse message if it's a string
-          if (typeof payload === 'string') {
-            try {
-              payload = JSON.parse(payload);
-            } catch (parseError) {
-              console.warn(`[${batchId}] Could not parse message as JSON`, parseError);
-            }
-          }
-          
-          return {
-            id: messageId,
-            message: payload as TMessage
-          };
-        } catch (messageError) {
-          console.error(`[${batchId}] Error processing message format:`, messageError);
-          return null;
-        }
-      }).filter(msg => msg !== null) as Array<{id: string, message: TMessage}>;
-      
-      return parsedMessages;
-    } catch (parseError) {
-      console.error(`[${batchId}] Error parsing queue data:`, parseError);
-      return [];
+      console.error(`Failed to handle problematic message: ${error.message}`);
     }
   }
 }
