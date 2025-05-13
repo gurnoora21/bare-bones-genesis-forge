@@ -19,52 +19,90 @@ Deno.serve(async (_req) => {
   try {
     console.log("Starting scheduled stale entity cleanup");
     
-    // Run database cleanup function
+    // Use the new dedicated helper function for cleanup
     const { data: dbResult, error: dbError } = await supabase.rpc(
-      'maintenance_clear_stale_entities'
+      'cleanup_stale_entities',
+      { p_stale_threshold_minutes: 60 }
     );
     
     if (dbError) {
       console.error("Error in database cleanup:", dbError);
+      throw new Error(`Database error: ${dbError.message}`);
     } else {
-      console.log("Database cleanup results:", dbResult || "No stale entities found");
+      console.log("Database cleanup results:", dbResult || "No operation performed");
     }
     
-    // Run Redis cleanup
-    const stateManager = getStateManager(supabase);
-    const redisResult = await stateManager.cleanupStaleEntities(60); // 60 minutes threshold
-    
-    console.log("Redis cleanup results:", redisResult);
+    // Run Redis cleanup separately 
+    let redisResult = { success: false, message: "Redis cleanup not attempted" };
+    try {
+      const stateManager = getStateManager(supabase);
+      redisResult = await stateManager.cleanupStaleEntities(60); // 60 minutes threshold
+      console.log("Redis cleanup results:", redisResult);
+    } catch (redisError) {
+      console.error("Error in Redis cleanup (non-critical):", redisError);
+      redisResult = { 
+        success: false, 
+        error: redisError.message,
+        message: "Redis cleanup failed but continuing"
+      };
+    }
     
     // Check for any entities marked as IN_PROGRESS but might be stuck in limbo
-    const { data: limboEntities, error: findError } = await supabase
-      .from('processing_status')
-      .select('*')
-      .eq('state', 'IN_PROGRESS')
-      .lt('last_processed_at', new Date(Date.now() - 60 * 60 * 1000).toISOString()) // 60 minutes
-      .limit(100);
+    // Use try-catch to prevent failures here from stopping the function
+    let limboEntities = [];
+    let limboProcessed = 0;
     
-    if (findError) {
-      console.error("Error finding limbo entities:", findError);
-    } else if (limboEntities && limboEntities.length > 0) {
-      console.log(`Found ${limboEntities.length} entities in limbo`);
+    try {
+      const { data: foundEntities, error: findError } = await supabase
+        .from('processing_status')
+        .select('*')
+        .eq('state', 'IN_PROGRESS')
+        .lt('last_processed_at', new Date(Date.now() - 60 * 60 * 1000).toISOString()) // 60 minutes
+        .limit(100);
       
-      // Process each limbo entity (reset to PENDING)
-      for (const entity of limboEntities) {
-        console.log(`Resetting limbo entity: ${entity.entity_type}:${entity.entity_id}`);
+      if (findError) {
+        console.error("Error finding limbo entities:", findError);
+      } else if (foundEntities && foundEntities.length > 0) {
+        console.log(`Found ${foundEntities.length} entities in limbo`);
+        limboEntities = foundEntities;
         
-        // Force reset to PENDING
-        try {
-          await supabase.rpc('force_release_entity_lock', {
-            p_entity_type: entity.entity_type,
-            p_entity_id: entity.entity_id
-          });
-        } catch (resetError) {
-          console.error(`Error resetting entity ${entity.entity_type}:${entity.entity_id}:`, resetError);
+        // Process each limbo entity (reset to PENDING)
+        for (const entity of foundEntities) {
+          try {
+            console.log(`Resetting limbo entity: ${entity.entity_type}:${entity.entity_id}`);
+            
+            // Force reset to PENDING
+            await supabase.rpc('force_release_entity_lock', {
+              p_entity_type: entity.entity_type,
+              p_entity_id: entity.entity_id
+            });
+            
+            limboProcessed++;
+          } catch (resetError) {
+            console.error(`Error resetting entity ${entity.entity_type}:${entity.entity_id}:`, resetError);
+          }
         }
+      } else {
+        console.log("No entities found in limbo");
       }
-    } else {
-      console.log("No entities found in limbo");
+    } catch (limboError) {
+      console.error("Error in limbo entity processing:", limboError);
+    }
+    
+    // Log the run to monitoring_events for tracking
+    try {
+      await supabase.from('monitoring_events').insert({
+        event_type: 'stale_cleanup',
+        details: {
+          db_cleanup: dbResult,
+          redis_cleanup: redisResult,
+          limbo_entities: limboEntities.length,
+          limbo_processed: limboProcessed,
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (logError) {
+      console.error("Failed to log cleanup event:", logError);
     }
     
     return new Response(
@@ -72,7 +110,8 @@ Deno.serve(async (_req) => {
         success: true,
         dbResult,
         redisResult,
-        limboEntitiesProcessed: limboEntities?.length || 0,
+        limboEntitiesProcessed: limboProcessed,
+        limboEntitiesFound: limboEntities.length,
         timestamp: new Date().toISOString()
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -80,8 +119,24 @@ Deno.serve(async (_req) => {
   } catch (error) {
     console.error("Error in scheduled cleanup:", error);
     
+    // Try to log the failure
+    try {
+      await supabase.from('monitoring_events').insert({
+        event_type: 'stale_cleanup_error',
+        details: {
+          error: error.message,
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (logError) {
+      console.error("Failed to log error event:", logError);
+    }
+    
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        timestamp: new Date().toISOString()
+      }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
     );
   }
