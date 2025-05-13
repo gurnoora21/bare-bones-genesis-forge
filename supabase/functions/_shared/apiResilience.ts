@@ -43,6 +43,13 @@ export enum ResilienceType {
   TIMEOUT = 'TIMEOUT'
 }
 
+// Service health status enum
+export enum ServiceStatus {
+  HEALTHY = 'HEALTHY',
+  DEGRADED = 'DEGRADED',
+  UNAVAILABLE = 'UNAVAILABLE'
+}
+
 // In-memory token bucket for rate limiting
 export class LocalTokenBucket {
   private tokens: number;
@@ -383,6 +390,76 @@ export class ApiResilienceManager {
       ),
     ]);
   }
+  
+  // Add a method to get API health status
+  async getServiceHealth(): Promise<{ status: ServiceStatus, details?: any }> {
+    let status = ServiceStatus.HEALTHY;
+    const details = {
+      circuitBreakerState: this.circuitBreaker ? this.circuitBreaker.getState() : 'NOT_CONFIGURED',
+      rateLimit: this.rateLimiter instanceof AdaptiveTokenBucket ? 
+        await this.rateLimiter.getCurrentLimit() : 
+        (this.rateLimiter ? 'USING_LOCAL_BUCKET' : 'NOT_CONFIGURED')
+    };
+    
+    // Check if circuit breaker is open
+    if (this.circuitBreaker && this.circuitBreaker.getState() === CircuitState.OPEN) {
+      status = ServiceStatus.UNAVAILABLE;
+    }
+    
+    // Check if we're rate limited
+    if (this.rateLimiter instanceof AdaptiveTokenBucket) {
+      try {
+        const tokens = await this.rateLimiter.getTokens();
+        if (tokens < 1) {
+          status = status === ServiceStatus.UNAVAILABLE ? 
+            ServiceStatus.UNAVAILABLE : ServiceStatus.DEGRADED;
+        }
+      } catch (error) {
+        console.warn("Error checking rate limiter status:", error);
+      }
+    }
+    
+    return { status, details };
+  }
+  
+  // Add method to execute API call with specialized response handling
+  async executeApiCall<T>(
+    endpoint: string,
+    apiCallFn: () => Promise<Response>,
+    options: {
+      correlationId?: string;
+      processResponse?: (response: Response) => Promise<T>;
+      fallbackFn?: () => Promise<T>;
+    } = {}
+  ): Promise<T> {
+    const { 
+      correlationId = `api_${Date.now()}`,
+      processResponse = async (r) => await r.json() as T,
+      fallbackFn
+    } = options;
+    
+    try {
+      return await this.execute(async () => {
+        console.log(`[${correlationId}] Making API call to ${endpoint}`);
+        const response = await apiCallFn();
+        return await processResponse(response);
+      });
+    } catch (error) {
+      console.error(`[${correlationId}] API call failed: ${error.message}`);
+      
+      // Try using fallback if available
+      if (fallbackFn) {
+        try {
+          console.log(`[${correlationId}] Attempting to use fallback for ${endpoint}`);
+          return await fallbackFn();
+        } catch (fallbackError) {
+          console.error(`[${correlationId}] Fallback also failed: ${fallbackError.message}`);
+        }
+      }
+      
+      throw error;
+    }
+  }
 }
 
 // Resilience factory method
@@ -393,4 +470,43 @@ export function getApiResilienceManager(
   options?: ResilienceOptions
 ): ApiResilienceManager {
   return new ApiResilienceManager(service, namespace, redis, options);
+}
+
+// Add specialized Genius API resilience manager factory
+export function getGeniusApiResilienceManager(): ApiResilienceManager {
+  // Import Redis from our shared module to use for rate limiting
+  let redis;
+  try {
+    const { getRedis } = require("./upstashRedis.ts");
+    redis = getRedis();
+  } catch (error) {
+    console.warn("Failed to initialize Redis for Genius API resilience:", error.message);
+  }
+  
+  // Configure resilience options specifically for Genius API
+  const geniusResilienceOptions: ResilienceOptions = {
+    timeout: 10000, // 10-second timeout for Genius API calls
+    retries: 2,     // Retry failed requests twice
+    exponentialBackoff: true,
+    jitter: true,
+    circuitBreakerOptions: {
+      failureThreshold: 5,      // Open after 5 consecutive failures
+      resetTimeout: 60000,      // Try again after 1 minute
+      halfOpenSuccessThreshold: 2  // Close after 2 successful requests
+    },
+    rateLimitOptions: {
+      tokensPerSecond: 0.2,  // About 5 requests per second for Genius API
+      bucketSize: 10,       // Allow burst of up to 10 requests
+      adaptiveFactor: 0.8,  // Aggressively adjust rate limit on failures
+      adaptiveWindow: 120   // Check for adjustments every 2 minutes
+    }
+  };
+  
+  // Create and return the manager
+  return getApiResilienceManager(
+    "genius-api",
+    "default",
+    redis,
+    geniusResilienceOptions
+  );
 }

@@ -544,6 +544,10 @@ export type Database = {
           minutes_since_update: number
         }[]
       }
+      force_release_entity_lock: {
+        Args: { p_entity_type: string; p_entity_id: string }
+        Returns: Json
+      }
       get_all_queue_tables: {
         Args: Record<PropertyKey, never>
         Returns: {
@@ -568,6 +572,15 @@ export type Database = {
       get_setting: {
         Args: { p_key: string }
         Returns: string
+      }
+      maintenance_clear_stale_entities: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          entity_type: string
+          entity_id: string
+          state: string
+          action: string
+        }[]
       }
       manual_trigger_worker: {
         Args: { worker_name: string }
