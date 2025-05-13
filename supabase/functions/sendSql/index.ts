@@ -30,7 +30,7 @@ serve(async (req) => {
     // Execute the SQL query
     const { data, error } = await supabase.rpc('raw_sql_query', {
       sql_query,
-      params: params
+      params
     });
     
     if (error) {
