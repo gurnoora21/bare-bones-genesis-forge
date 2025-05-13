@@ -1,10 +1,13 @@
 
 /**
  * Enhanced Genius API Client with resilience patterns
+ * Uses the new rate limiter implementation
  */
 
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { ApiResilienceManager, ServiceHealth } from "./apiResilienceManager.ts";
+import { getEnhancedRateLimiter, EnhancedRateLimiter } from "./enhancedRateLimiter.ts";
+import { RATE_LIMITERS } from "./rateLimiter.ts";
 
 export interface GeniusSearchResult {
   hits: Array<{
@@ -59,12 +62,14 @@ export class EnhancedGeniusClient {
   private apiBase: string = "https://api.genius.com";
   private redis: Redis;
   private resilienceManager: ApiResilienceManager;
+  private rateLimiter: EnhancedRateLimiter;
   private serviceName = "genius-api";
   
   constructor(accessToken: string, redis: Redis, resilienceManager: ApiResilienceManager) {
     this.accessToken = accessToken;
     this.redis = redis;
     this.resilienceManager = resilienceManager;
+    this.rateLimiter = getEnhancedRateLimiter(redis);
   }
   
   /**
@@ -81,9 +86,24 @@ export class EnhancedGeniusClient {
     }
     
     // Not in cache, make API call with resilience patterns
+    // Use both the resilience manager and the rate limiter
     const result = await this.resilienceManager.executeApiCall<GeniusSearchResult>(
       this.serviceName,
       async () => {
+        // Apply rate limiting
+        const limiterResponse = await this.rateLimiter.limit({
+          ...RATE_LIMITERS.GENIUS.DEFAULT,
+          identifier: `genius:search`
+        });
+        
+        // If rate limited, wait as recommended
+        if (!limiterResponse.success) {
+          console.log(`Rate limited by Genius API, waiting ${limiterResponse.retryAfter || 1000}ms`);
+          await new Promise(resolve => setTimeout(resolve, limiterResponse.retryAfter || 1000));
+          throw new Error("Rate limit exceeded, retrying after delay");
+        }
+        
+        // Make the API call
         const response = await fetch(
           `${this.apiBase}/search?q=${encodeURIComponent(query)}`,
           {
@@ -109,7 +129,7 @@ export class EnhancedGeniusClient {
       },
       {
         rateLimit: { requestsPerMinute: 5 }, // Genius rate limit is ~5 req/sec
-        maxRetries: 2
+        maxRetries: 3
       }
     );
     
@@ -132,43 +152,48 @@ export class EnhancedGeniusClient {
       return JSON.parse(cached as string);
     }
     
-    // Not in cache, make API call with resilience patterns
-    const result = await this.resilienceManager.executeApiCall<GeniusSongData>(
-      this.serviceName,
-      async () => {
-        const response = await fetch(
-          `${this.apiBase}/songs/${songId}`,
-          {
-            headers: {
-              'Authorization': `Bearer ${this.accessToken}`,
-              'Accept': 'application/json'
+    // Use the rate limiter to ensure we don't exceed limits
+    return await this.rateLimiter.execute({
+      ...RATE_LIMITERS.GENIUS.DEFAULT,
+      identifier: `genius:song`,
+    }, async () => {
+      // Make API call with resilience patterns
+      const result = await this.resilienceManager.executeApiCall<GeniusSongData>(
+        this.serviceName,
+        async () => {
+          const response = await fetch(
+            `${this.apiBase}/songs/${songId}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${this.accessToken}`,
+                'Accept': 'application/json'
+              }
             }
+          );
+          
+          // Handle rate limiting explicitly
+          if (response.status === 429) {
+            const retryAfter = response.headers.get('retry-after');
+            throw new Error(`Genius API rate limit exceeded. Retry after ${retryAfter || 'unknown'} seconds`);
           }
-        );
-        
-        // Handle rate limiting explicitly
-        if (response.status === 429) {
-          const retryAfter = response.headers.get('retry-after');
-          throw new Error(`Genius API rate limit exceeded. Retry after ${retryAfter || 'unknown'} seconds`);
+          
+          if (!response.ok) {
+            throw new Error(`Genius API song error: ${response.status} ${response.statusText}`);
+          }
+          
+          const data = await response.json();
+          return data.response as GeniusSongData;
+        },
+        {
+          maxRetries: 3
         }
-        
-        if (!response.ok) {
-          throw new Error(`Genius API song error: ${response.status} ${response.statusText}`);
-        }
-        
-        const data = await response.json();
-        return data.response as GeniusSongData;
-      },
-      {
-        rateLimit: { requestsPerMinute: 5 },
-        maxRetries: 2
-      }
-    );
-    
-    // Cache the result for 30 days (song details rarely change)
-    await this.redis.set(cacheKey, JSON.stringify(result), { ex: 2592000 });
-    
-    return result;
+      );
+      
+      // Cache the result for 30 days (song details rarely change)
+      await this.redis.set(cacheKey, JSON.stringify(result), { ex: 2592000 });
+      
+      return result;
+    });
   }
   
   /**

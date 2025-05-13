@@ -1,39 +1,23 @@
+
 /**
- * Optimized rate limiter using local token bucket with Redis sync
- * to reduce Redis commands by 70-80%
+ * Optimized rate limiter using the official Upstash Ratelimit library
+ * with local memory caching to minimize Redis calls
  */
 
 import { getRedis } from "./upstashRedis.ts";
-import { LocalTokenBucket } from "./localTokenBucket.ts";
+import { EnhancedRateLimiter, getEnhancedRateLimiter, RateLimiterOptions } from "./enhancedRateLimiter.ts";
 import { MemoryCache } from "./memoryCache.ts";
 
-export interface RateLimiterOptions {
-  // API identifier (spotify, genius, etc)
-  api: string;
-  
-  // Endpoint identifier (e.g., 'search', 'artists', etc.)
-  endpoint?: string;
-  
-  // Number of requests allowed per interval
-  tokensPerInterval: number;
-  
-  // Interval in seconds
-  interval: number;
-  
-  // Number of tokens to consume (default: 1)
-  cost?: number;
-  
-  // Maximum retry attempts
-  maxRetries?: number;
-  
-  // Base delay for exponential backoff (ms)
-  baseDelay?: number;
-}
+export { RateLimiterOptions } from "./enhancedRateLimiter.ts";
 
 export class RateLimiter {
   private redis = getRedis();
-  private buckets: Map<string, LocalTokenBucket> = new Map();
+  private enhancedLimiter: EnhancedRateLimiter;
   private responseCache: MemoryCache<any> = new MemoryCache(1000, 60000);
+  
+  constructor() {
+    this.enhancedLimiter = getEnhancedRateLimiter(this.redis.redis);
+  }
   
   /**
    * Execute a function with rate limiting
@@ -43,78 +27,47 @@ export class RateLimiter {
     options: RateLimiterOptions,
     fn: () => Promise<T>
   ): Promise<T> {
-    const {
-      api,
-      endpoint = "default",
-      tokensPerInterval,
-      interval,
-      cost = 1,
-      maxRetries = 5,
-      baseDelay = 1000
-    } = options;
-    
-    const bucketKey = `ratelimit:${api}:${endpoint}`;
-    let attempts = 0;
-    
-    // Get or create token bucket
-    if (!this.buckets.has(bucketKey)) {
-      this.buckets.set(bucketKey, new LocalTokenBucket({
-        tokensPerInterval,
-        interval,
-        redisKey: bucketKey,
-        syncInterval: 30000 // Sync with Redis every 30 seconds
-      }));
-    }
-    
-    const bucket = this.buckets.get(bucketKey)!;
-    
-    while (attempts < maxRetries) {
-      // Check if we're under the rate limit
-      const allowed = await bucket.consume(cost);
+    try {
+      const startTime = Date.now();
       
-      if (allowed) {
-        try {
-          // Track this API call
-          const startTime = Date.now();
-          const result = await fn();
-          
-          // Record successful API call
-          await this.redis.trackApiCall(api, endpoint, true);
-          
-          return result;
-        } catch (error) {
-          // Record failed API call
-          await this.redis.trackApiCall(api, endpoint, false);
-          
-          // Check if error is rate-limit related
-          if (error instanceof Error && 
-              (error.message.includes("429") || error.message.includes("rate limit"))) {
-            attempts++;
+      // Use the enhanced rate limiter
+      const result = await this.enhancedLimiter.execute(
+        options,
+        async () => {
+          try {
+            // Execute operation
+            const result = await fn();
             
-            // Calculate backoff with jitter
-            const jitter = Math.random() * 0.3 + 0.85; // 0.85-1.15
-            const delay = Math.floor(baseDelay * Math.pow(2, attempts) * jitter);
+            // Track successful API call
+            await this.redis.trackApiCall(
+              options.identifier.split(":")[0] || "api", 
+              options.identifier.split(":")[1] || "default",
+              true
+            );
             
-            console.log(`Rate limited by ${api} API (${endpoint}), retry ${attempts}/${maxRetries} after ${delay}ms`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-            continue;
+            return result;
+          } catch (error) {
+            // Track failed API call
+            await this.redis.trackApiCall(
+              options.identifier.split(":")[0] || "api", 
+              options.identifier.split(":")[1] || "default", 
+              false
+            );
+            throw error;
           }
-          
-          // For non-rate-limit errors, rethrow
-          throw error;
+        },
+        {
+          maxRetries: 5,
+          retryDelay: 1000,
+          retryMultiplier: 2
         }
-      } else {
-        // We're rate limited locally by our token bucket
-        attempts++;
-        
-        // Use a shorter backoff for local rate limiting
-        const delay = Math.floor(baseDelay * attempts);
-        console.log(`Local rate limit for ${api} (${endpoint}), retry ${attempts}/${maxRetries} after ${delay}ms`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
+      );
+      
+      return result;
+    } catch (error) {
+      // Rethrow with more details
+      throw new Error(`Rate limit error for ${options.identifier}: ${error.message}`);
     }
-    
-    throw new Error(`Rate limit exceeded for ${api} after ${maxRetries} attempts`);
   }
   
   /**
@@ -167,39 +120,41 @@ export function getRateLimiter(): RateLimiter {
   return limiterInstance;
 }
 
-// Preset rate limiter configurations
+// Preset rate limiter configurations using the enhanced library
 export const RATE_LIMITERS = {
   // Spotify API has a rolling 30-second window
   SPOTIFY: {
     DEFAULT: {
-      api: "spotify",
-      tokensPerInterval: 100,  // Relatively safe default limit
-      interval: 30,            // 30 seconds rolling window
-      maxRetries: 5
+      identifier: "spotify:default",
+      limit: 100,  // Relatively safe default limit
+      windowSeconds: 30, // 30 seconds rolling window
+      algorithm: "sliding",
+      analytics: false
     },
     SEARCH: {
-      api: "spotify",
-      endpoint: "search",
-      tokensPerInterval: 15,  // Lower limit for search
-      interval: 30,
-      maxRetries: 3
+      identifier: "spotify:search",
+      limit: 15,  // Lower limit for search
+      windowSeconds: 30,
+      algorithm: "sliding",
+      analytics: false
     },
     BATCH: {
-      api: "spotify",
-      endpoint: "batch",
-      tokensPerInterval: 5,   // Even lower for batch operations
-      interval: 30,
-      maxRetries: 5
+      identifier: "spotify:batch",
+      limit: 5,   // Even lower for batch operations
+      windowSeconds: 30,
+      algorithm: "token",
+      analytics: false
     }
   },
   
   // Genius API recommended max ~5 req/sec
   GENIUS: {
     DEFAULT: {
-      api: "genius",
-      tokensPerInterval: 25,   // 5 req/sec = 25 per 5 seconds
-      interval: 5,             // 5 second window
-      maxRetries: 3
+      identifier: "genius:default",
+      limit: 25,   // 5 req/sec = 25 per 5 seconds
+      windowSeconds: 5,  // 5 second window
+      algorithm: "token", // Token bucket for smoother rate
+      analytics: false
     }
   }
 };

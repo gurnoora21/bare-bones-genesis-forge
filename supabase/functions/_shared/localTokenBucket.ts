@@ -1,6 +1,8 @@
 
 /**
  * Local token bucket implementation with periodic Redis sync
+ * Serves as a memory-based rate limiter with Redis coordination
+ * for distributed environments
  */
 
 import { getRedis } from "./upstashRedis.ts";
@@ -74,7 +76,7 @@ export class LocalTokenBucket {
         
         // If Redis has state, use it
         if (tokensStr !== null && lastRefillStr !== null) {
-          const redisTokens = parseInt(tokensStr);
+          const redisTokens = parseFloat(tokensStr);
           const redisLastRefill = parseInt(lastRefillStr);
           
           // Use the most restrictive state (minimum tokens)
@@ -89,13 +91,11 @@ export class LocalTokenBucket {
           this.lastRefill = Date.now();
           
           // Update Redis with our current state
-          // FIXED: Ensure proper string formatting for tokens value
           await this.redis.pipelineExec([
             ["HMSET", this.redisKey, "tokens", String(this.tokens), "last_refill", String(Math.floor(this.lastRefill / 1000))]
           ]);
         } else {
           // Initialize Redis with our current state
-          // FIXED: Ensure proper string formatting for tokens value
           await this.redis.pipelineExec([
             ["HMSET", this.redisKey, "tokens", String(this.tokens), "last_refill", String(Math.floor(this.lastRefill / 1000))]
           ]);

@@ -8,8 +8,11 @@ import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { MemoryCache } from "./memoryCache.ts";
 
 export class EnhancedRedisClient {
-  private redis: Redis;
+  public redis: Redis;
   private memoryCache: MemoryCache<any>;
+  private connectionStatus: 'connected' | 'disconnected' | 'unknown' = 'unknown';
+  private lastConnectionCheck = 0;
+  private readonly connectionCheckInterval = 60000; // 1 minute
   
   constructor() {
     // Initialize the official Redis client
@@ -20,6 +23,29 @@ export class EnhancedRedisClient {
     
     // Initialize memory cache as fallback
     this.memoryCache = new MemoryCache(1000, 120000);
+  }
+  
+  /**
+   * Check Redis connectivity with exponential backoff retry
+   */
+  async checkConnection(): Promise<boolean> {
+    const now = Date.now();
+    if (now - this.lastConnectionCheck < this.connectionCheckInterval && this.connectionStatus !== 'unknown') {
+      return this.connectionStatus === 'connected';
+    }
+    
+    // Try to ping Redis
+    try {
+      const result = await this.redis.ping();
+      this.connectionStatus = result === "PONG" ? 'connected' : 'disconnected';
+      this.lastConnectionCheck = now;
+      return this.connectionStatus === 'connected';
+    } catch (error) {
+      console.warn(`Redis connectivity check failed:`, error);
+      this.connectionStatus = 'disconnected';
+      this.lastConnectionCheck = now;
+      return false;
+    }
   }
   
   /**
@@ -147,6 +173,58 @@ export class EnhancedRedisClient {
       return result === "PONG";
     } catch {
       return false;
+    }
+  }
+  
+  /**
+   * Check if Redis instance is healthy
+   */
+  async isHealthy(): Promise<boolean> {
+    return await this.checkConnection();
+  }
+  
+  /**
+   * Get Redis health metrics
+   */
+  async getHealth(): Promise<{
+    status: 'healthy' | 'degraded' | 'unhealthy';
+    latency?: number;
+    uptime?: number;
+    memoryUsage?: number;
+  }> {
+    try {
+      const startTime = Date.now();
+      const isConnected = await this.ping();
+      const latency = Date.now() - startTime;
+      
+      if (!isConnected) {
+        return { 
+          status: 'unhealthy',
+          latency
+        };
+      }
+      
+      // Get additional info if available
+      try {
+        const info = await this.redis.info();
+        return {
+          status: 'healthy',
+          latency,
+          uptime: info.uptime_in_seconds,
+          memoryUsage: info.used_memory_human
+        };
+      } catch {
+        // If info command fails, still return basic health
+        return {
+          status: latency > 200 ? 'degraded' : 'healthy',
+          latency
+        };
+      }
+    } catch (error) {
+      console.error("Redis health check failed:", error);
+      return {
+        status: 'unhealthy'
+      };
     }
   }
 }
