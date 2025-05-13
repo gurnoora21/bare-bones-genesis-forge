@@ -1,13 +1,19 @@
-
 /**
- * Enhanced Genius API Client with resilience patterns
- * Uses the new rate limiter implementation
+ * Enhanced Genius Client with better error handling and retry mechanisms
  */
+
+import { 
+  ErrorCategory, 
+  ErrorSource, 
+  createEnhancedError,
+  retryWithBackoff
+} from "./errorHandling.ts";
+
+import { getRateLimiter, RATE_LIMITERS } from "../_shared/rateLimiter.ts";
 
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { ApiResilienceManager, ServiceHealth } from "./apiResilienceManager.ts";
 import { getEnhancedRateLimiter, EnhancedRateLimiter } from "./enhancedRateLimiter.ts";
-import { RATE_LIMITERS } from "./rateLimiter.ts";
 
 export interface GeniusSearchResult {
   hits: Array<{

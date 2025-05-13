@@ -1,6 +1,6 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { getRateLimiter, RATE_LIMITERS } from "./rateLimiter.ts";
+import { getRateLimiter, RATE_LIMITERS } from "../_shared/rateLimiter.ts";
 
 /**
  * SpotifyClient handles authentication and API calls to the Spotify Web API,
