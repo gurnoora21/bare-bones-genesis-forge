@@ -5,10 +5,29 @@
  */
 
 import { getRedis } from "./upstashRedis.ts";
-import { EnhancedRateLimiter, getEnhancedRateLimiter, RateLimiterOptions } from "./enhancedRateLimiter.ts";
+import { EnhancedRateLimiter, getEnhancedRateLimiter } from "./enhancedRateLimiter.ts";
 import { MemoryCache } from "./memoryCache.ts";
 
-export { RateLimiterOptions } from "./enhancedRateLimiter.ts";
+// Import RateLimitAlgorithm type from enhancedRateLimiter.ts and define our own options
+import { RateLimitAlgorithm } from "./enhancedRateLimiter.ts";
+
+// Define our own RateLimiterOptions since it's not exported from enhancedRateLimiter.ts
+export interface RateLimiterOptions {
+  // Resource identifier (api name, endpoint, etc)
+  identifier: string;
+  
+  // Number of requests allowed per time window
+  limit: number;
+  
+  // Time window in seconds
+  windowSeconds: number;
+  
+  // Algorithm to use (fixed window, sliding window, token bucket)
+  algorithm?: RateLimitAlgorithm;
+  
+  // If true, store analytics data in Redis
+  analytics?: boolean;
+}
 
 export class RateLimiter {
   private redis = getRedis();
