@@ -596,6 +596,18 @@ export type Database = {
         Args: { worker_name: string }
         Returns: Json
       }
+      pg_advisory_lock_exists: {
+        Args: { p_key: string }
+        Returns: boolean
+      }
+      pg_advisory_lock_timeout: {
+        Args: { p_key: string; p_timeout_ms: number }
+        Returns: boolean
+      }
+      pg_advisory_unlock: {
+        Args: { p_key: string }
+        Returns: boolean
+      }
       pg_delete_message: {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
@@ -612,6 +624,13 @@ export type Database = {
         Args: { queue_name: string; message_body: Json }
         Returns: number
       }
+      pg_force_advisory_unlock_all: {
+        Args: { p_key: string }
+        Returns: {
+          pid: number
+          released: boolean
+        }[]
+      }
       pg_queue_status: {
         Args: { queue_name: string }
         Returns: Json
@@ -623,6 +642,10 @@ export type Database = {
       pg_send_text: {
         Args: { queue_name: string; msg_text: string }
         Returns: number[]
+      }
+      pg_try_advisory_lock: {
+        Args: { p_key: string }
+        Returns: boolean
       }
       process_album_atomic: {
         Args: {
