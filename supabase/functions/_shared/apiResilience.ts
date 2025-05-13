@@ -1,3 +1,4 @@
+
 /**
  * API resilience system with enhanced rate limiting and circuit breakers
  * Provides protection against API quota exhaustion and service outages
@@ -186,7 +187,7 @@ export class AdaptiveTokenBucket {
         return false;
       }
       
-      // FIX: Replace eval with direct DECRBY
+      // Fixed implementation: Use direct DECRBY instead of eval
       try {
         // Instead of using eval which isn't available, use direct DECRBY 
         await this.redis.decrby(this.key, tokens);
@@ -237,7 +238,7 @@ export class AdaptiveTokenBucket {
   }
 }
 
-// In-memory circuit breaker
+// In-memory circuit breaker with enhanced reset capabilities
 export class CircuitBreaker {
   private state: CircuitState = CircuitState.CLOSED;
   private failureCount: number = 0;
@@ -245,6 +246,7 @@ export class CircuitBreaker {
   private readonly failureThreshold: number;
   private readonly resetTimeout: number;
   private readonly halfOpenSuccessThreshold: number;
+  private autoResetTimer: number | null = null;
   
   constructor(options: CircuitBreakerOptions = {}) {
     this.failureThreshold = options.failureThreshold || 5;
@@ -289,12 +291,43 @@ export class CircuitBreaker {
     this.state = CircuitState.OPEN;
     this.failureCount = 0;
     console.warn('Circuit breaker opened');
+    
+    // Set auto reset timer
+    if (this.autoResetTimer) {
+      clearTimeout(this.autoResetTimer);
+    }
+    
+    // Auto reset after 3x the normal reset timeout
+    this.autoResetTimer = setTimeout(() => {
+      console.log('Auto-resetting circuit breaker after extended timeout');
+      this.reset();
+    }, this.resetTimeout * 3) as unknown as number;
   }
   
   reset(): void {
     this.state = CircuitState.CLOSED;
     this.failureCount = 0;
+    
+    if (this.autoResetTimer) {
+      clearTimeout(this.autoResetTimer);
+      this.autoResetTimer = null;
+    }
+    
     console.log('Circuit breaker reset');
+  }
+  
+  // Force reset the circuit breaker regardless of state
+  forceReset(): void {
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.lastFailureTime = 0;
+    
+    if (this.autoResetTimer) {
+      clearTimeout(this.autoResetTimer);
+      this.autoResetTimer = null;
+    }
+    
+    console.log('Circuit breaker force reset');
   }
 }
 
@@ -389,6 +422,15 @@ export class ApiResilienceManager {
         setTimeout(() => reject(new Error('Timeout exceeded')), timeout)
       ),
     ]);
+  }
+  
+  // Add a method to reset the circuit breaker
+  resetCircuitBreaker(): boolean {
+    if (this.circuitBreaker) {
+      this.circuitBreaker.forceReset();
+      return true;
+    }
+    return false;
   }
   
   // Add a method to get API health status

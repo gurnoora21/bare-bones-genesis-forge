@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { IdempotentWorker, ProcessingResult, WorkerContext } from "../_shared/idempotentWorker.ts";
 import { createEnhancedError, ErrorCategory, ErrorSource } from "../_shared/errorHandling.ts";
@@ -372,7 +371,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
   }
   
   /**
-   * FIX: Add direct lock acquisition method that connects to the database directly
+   * Enhanced direct lock acquisition method that connects to the database directly
    * This bypasses the Redis lock mechanism if it's failing
    */
   protected async directLockAcquisition(entityType: string, entityId: string, options: any = {}): Promise<boolean> {
@@ -388,13 +387,59 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
           worker_id: Deno.env.get("WORKER_ID") || `worker_${Math.random().toString(36).substring(2, 10)}`,
           correlation_id: options.correlationId || `direct_${Date.now()}`,
           acquired_at: new Date().toISOString(),
-          last_heartbeat: new Date().toISOString()
+          last_heartbeat: new Date().toISOString(),
+          metadata: {
+            direct_acquisition: true,
+            acquisition_reason: "Redis lock fallback",
+            attempt_time: new Date().toISOString()
+          }
         }, {
-          onConflict: 'entity_type,entity_id'
+          onConflict: 'entity_type,entity_id',
+          ignoreDuplicates: true // Don't update if it already exists
         });
       
       if (error) {
         console.error(`Failed direct lock acquisition: ${error.message}`);
+        
+        // Try a more aggressive approach if the regular upsert fails
+        try {
+          // First check if the lock is stale
+          const { data: staleLock } = await this.supabase
+            .from('processing_locks')
+            .select('*')
+            .eq('entity_type', entityType)
+            .eq('entity_id', entityId)
+            .single();
+          
+          if (staleLock && new Date(staleLock.last_heartbeat) < new Date(Date.now() - 5 * 60 * 1000)) {
+            // Lock exists but is stale (no heartbeat for 5+ minutes), force update it
+            const { error: updateError } = await this.supabase
+              .from('processing_locks')
+              .update({
+                worker_id: Deno.env.get("WORKER_ID") || `worker_${Math.random().toString(36).substring(2, 10)}`,
+                correlation_id: options.correlationId || `direct_${Date.now()}`,
+                acquired_at: new Date().toISOString(),
+                last_heartbeat: new Date().toISOString(),
+                metadata: {
+                  force_acquisition: true,
+                  acquisition_reason: "Stale lock takeover",
+                  previous_worker: staleLock.worker_id,
+                  previous_heartbeat: staleLock.last_heartbeat,
+                  attempt_time: new Date().toISOString()
+                }
+              })
+              .eq('entity_type', entityType)
+              .eq('entity_id', entityId);
+              
+            if (!updateError) {
+              console.log(`Successfully took over stale lock for ${entityType}:${entityId}`);
+              return true;
+            }
+          }
+        } catch (staleError) {
+          console.error(`Error checking for stale lock: ${staleError.message}`);
+        }
+        
         return false;
       }
       
@@ -434,6 +479,27 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       }
     } catch (fallbackError) {
       console.error(`Fallback lock acquisition failed: ${fallbackError.message}`);
+    }
+    
+    // Check for and claim stale locks as a last resort
+    try {
+      const { data: staleLockCheck } = await this.supabase.rpc(
+        'claim_stale_lock',
+        {
+          p_entity_type: entityType,
+          p_entity_id: entityId,
+          p_new_worker_id: Deno.env.get("WORKER_ID") || `worker_${Math.random().toString(36).substring(2, 10)}`,
+          p_correlation_id: options.correlationId || `claim_${Date.now()}`,
+          p_stale_threshold_seconds: 300 // 5 minutes
+        }
+      );
+      
+      if (staleLockCheck && staleLockCheck.claimed) {
+        console.log(`Successfully claimed stale lock for ${entityType}:${entityId}`);
+        return true;
+      }
+    } catch (claimError) {
+      console.error(`Error claiming stale lock: ${claimError.message}`);
     }
     
     return false;

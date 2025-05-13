@@ -45,6 +45,28 @@ export class RedisStateManager {
         ...circuitBreakerConfig
       };
     }
+    
+    // Auto-check health periodically
+    this.setupPeriodicHealthCheck();
+  }
+  
+  /**
+   * Set up periodic health check to auto-recover circuit breaker
+   */
+  private setupPeriodicHealthCheck(): void {
+    // Check health every minute
+    setInterval(async () => {
+      if (this.circuitBreakerState.isOpen) {
+        const healthy = await this.performHealthCheck();
+        if (healthy) {
+          this.circuitBreakerState.healthChecksPassed++;
+          if (this.circuitBreakerState.healthChecksPassed >= 2) {
+            console.log("Redis health check passed, auto-resetting circuit breaker");
+            this.resetCircuitBreaker();
+          }
+        }
+      }
+    }, 60000); // Check every minute
   }
   
   /**
@@ -436,6 +458,14 @@ export class RedisStateManager {
       console.error(`Redis health check failed: ${error.message}`);
       return false;
     }
+  }
+  
+  /**
+   * Force reset the circuit breaker
+   */
+  forceResetCircuitBreaker(): void {
+    this.resetCircuitBreaker();
+    console.log("Redis circuit breaker manually reset");
   }
   
   /**
