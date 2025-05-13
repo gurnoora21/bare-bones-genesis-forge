@@ -38,7 +38,7 @@ serve(async (req) => {
       interval: 5,
       maxRetries: 3
     }, async () => {
-      return supabase.rpc('pg_dequeue', {
+      return await supabase.rpc('pg_dequeue', {
         queue_name,
         batch_size,
         visibility_timeout
