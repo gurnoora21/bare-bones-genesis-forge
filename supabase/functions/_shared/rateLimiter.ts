@@ -134,3 +134,38 @@ export function getRateLimiter(options: Partial<RateLimiterOptions> = {}): RateL
   }
   return globalRateLimiter;
 }
+
+// Add the missing RATE_LIMITERS export that's being imported elsewhere
+export const RATE_LIMITERS = {
+  SPOTIFY: {
+    DEFAULT: {
+      api: "spotify",
+      endpoint: "default",
+      tokensPerInterval: 100,
+      interval: 30, // 100 requests per 30 seconds
+      maxRetries: 3,
+      backoffFactor: 2,
+      initialBackoffMs: 1000
+    },
+    SEARCH: {
+      api: "spotify",
+      endpoint: "search",
+      tokensPerInterval: 30,
+      interval: 30, // 30 requests per 30 seconds
+      maxRetries: 3,
+      backoffFactor: 2,
+      initialBackoffMs: 1000
+    }
+  },
+  GENIUS: {
+    DEFAULT: {
+      api: "genius",
+      endpoint: "default",
+      tokensPerInterval: 25,
+      interval: 5, // 25 requests per 5 seconds
+      maxRetries: 3,
+      backoffFactor: 2,
+      initialBackoffMs: 500
+    }
+  }
+};
