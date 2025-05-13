@@ -293,6 +293,36 @@ export type Database = {
         }
         Relationships: []
       }
+      queue_registry: {
+        Row: {
+          active: boolean | null
+          created_at: string | null
+          description: string | null
+          display_name: string | null
+          id: number
+          queue_name: string
+          updated_at: string | null
+        }
+        Insert: {
+          active?: boolean | null
+          created_at?: string | null
+          description?: string | null
+          display_name?: string | null
+          id?: number
+          queue_name: string
+          updated_at?: string | null
+        }
+        Update: {
+          active?: boolean | null
+          created_at?: string | null
+          description?: string | null
+          display_name?: string | null
+          id?: number
+          queue_name?: string
+          updated_at?: string | null
+        }
+        Relationships: []
+      }
       settings: {
         Row: {
           created_at: string | null
@@ -692,6 +722,15 @@ export type Database = {
           p_error_details?: string
         }
         Returns: undefined
+      }
+      register_queue: {
+        Args: {
+          p_queue_name: string
+          p_display_name?: string
+          p_description?: string
+          p_active?: boolean
+        }
+        Returns: boolean
       }
       release_lock: {
         Args: {
