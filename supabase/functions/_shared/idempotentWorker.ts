@@ -7,6 +7,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { EnhancedStateManager, getStateManager } from "./enhancedStateManager.ts";
+import { getTransactionManager } from "./transactionManager.ts";
+import { getIdempotencyManager } from "./idempotencyManager.ts";
 
 export interface ProcessOptions {
   batchSize?: number;
@@ -68,19 +70,21 @@ export class IdempotentWorker<T = any> {
     console.log(`[${batchId}] Starting ${processorName} worker`);
     
     try {
-      // 1. Read messages from the queue
-      const { data: messages, error } = await this.supabase.rpc('pg_dequeue', {
+      // 1. Read messages from the queue using transaction to ensure atomicity
+      const transactionManager = getTransactionManager(this.supabase);
+      
+      // Using DB function to dequeue atomically
+      const messagesResult = await transactionManager.atomicOperation('pg_dequeue', {
         queue_name: this.queue,
         batch_size: batchSize,
         visibility_timeout: visibilityTimeoutSeconds
+      }, {
+        operationId: `dequeue_${batchId}`,
+        entityType: 'queue_read',
+        entityId: this.queue
       });
       
-      if (error) {
-        console.error(`[${batchId}] Error reading from queue: ${error.message}`);
-        return { processed: 0, errors: 1, messages: [] };
-      }
-      
-      const parsedMessages = JSON.parse(messages || '[]');
+      const parsedMessages = JSON.parse(messagesResult || '[]');
       console.log(`[${batchId}] Retrieved ${parsedMessages.length} messages from queue`);
       
       if (!parsedMessages.length) {
@@ -114,75 +118,83 @@ export class IdempotentWorker<T = any> {
           const idempotencyKey = body._idempotencyKey || 
             `${this.queue}:${JSON.stringify(body)}`;
           
-          // 3. Acquire advisory lock to ensure exclusive processing
-          const lockAcquired = await this.stateManager.acquireProcessingLock(
-            this.queue, 
-            idempotencyKey,
+          // Process the message with idempotency
+          const idempotencyManager = getIdempotencyManager(this.supabase);
+          const idempotencyResult = await idempotencyManager.execute(
             {
-              timeoutSeconds: 1, // Non-blocking
-              correlationId: `${batchId}_${messageId}`
+              operationId: idempotencyKey,
+              entityType: this.queue,
+              entityId: messageId
+            },
+            async () => {
+              // 3. Acquire advisory lock to ensure exclusive processing
+              const lockAcquired = await this.stateManager.acquireProcessingLock(
+                this.queue, 
+                idempotencyKey,
+                {
+                  timeoutSeconds: 1, // Non-blocking
+                  correlationId: `${batchId}_${messageId}`
+                }
+              );
+              
+              if (!lockAcquired) {
+                console.warn(`[${batchId}] Already processing ${idempotencyKey}, skipping`);
+                throw new Error("Already being processed by another worker");
+              }
+              
+              try {
+                // 4. Process the message with timeout protection and transaction
+                return await transactionManager.transaction(
+                  async () => {
+                    // Set up a timeout promise
+                    const timeoutPromise = new Promise((_, reject) => {
+                      setTimeout(() => reject(new Error(`Processing timed out after ${timeoutSeconds}s`)), 
+                        timeoutSeconds * 1000);
+                    });
+                    
+                    // Process with timeout
+                    return await Promise.race([
+                      this.processMessage(body),
+                      timeoutPromise
+                    ]);
+                  },
+                  {
+                    timeout: timeoutSeconds * 1000,
+                    correlationId: `${batchId}_${messageId}`,
+                    retryOnConflict: true
+                  }
+                );
+              } finally {
+                // Always release the lock when done, even if there was an error
+                await this.stateManager.releaseLock(this.queue, idempotencyKey);
+              }
             }
           );
           
-          if (!lockAcquired) {
-            console.warn(`[${batchId}] Already processing ${idempotencyKey}, skipping`);
-            // Message is already being processed, leave it in the queue
-            continue;
-          }
-          
-          // 4. Process the message with timeout protection
-          try {
-            // Set up a timeout promise
-            const timeoutPromise = new Promise((_, reject) => {
-              setTimeout(() => reject(new Error(`Processing timed out after ${timeoutSeconds}s`)), 
-                timeoutSeconds * 1000);
-            });
-            
-            // Process with timeout
-            const result = await Promise.race([
-              this.processMessage(body),
-              timeoutPromise
-            ]);
-            
-            // 5. If successful, delete the message and release lock
-            await this.supabase.rpc('pg_delete_message', {
+          // 5. Handle the result
+          if (idempotencyResult.status === 'success') {
+            // Success - delete the message from the queue
+            await this.supabase.rpc('ensure_message_deleted', {
               queue_name: this.queue,
               message_id: messageId
             });
             
-            await this.stateManager.markAsCompleted(
-              this.queue, 
-              idempotencyKey,
-              { 
-                worker_id: this.workerId,
-                message_id: messageId 
-              }
-            );
-            
             processed++;
-            results.push({ messageId, success: true, result });
+            results.push({ 
+              messageId, 
+              success: true, 
+              result: idempotencyResult.result,
+              alreadyProcessed: idempotencyResult.alreadyProcessed
+            });
             console.log(`[${batchId}] Successfully processed message ${messageId}`);
-          } catch (processError) {
-            // Handle processing error
-            console.error(`[${batchId}] Error processing message ${messageId}: ${processError.message}`);
-            
-            // Mark as failed but leave in the queue to retry
-            await this.stateManager.markAsFailed(
-              this.queue,
-              idempotencyKey,
-              processError.message,
-              { 
-                worker_id: this.workerId,
-                message_id: messageId,
-                error_stack: processError.stack
-              }
-            );
-            
+          } else {
+            // Error during processing
+            console.error(`[${batchId}] Error processing message ${messageId}: ${idempotencyResult.error}`);
             errors++;
             results.push({ 
               messageId, 
               success: false, 
-              error: processError.message 
+              error: idempotencyResult.error
             });
           }
         } catch (error) {
@@ -225,9 +237,10 @@ export class IdempotentWorker<T = any> {
       });
       
       // Delete the message from the queue
-      await this.supabase.rpc('pg_delete_message', {
+      await this.supabase.rpc('ensure_message_deleted', {
         queue_name: this.queue,
-        message_id: messageId
+        message_id: messageId,
+        max_attempts: 3
       });
     } catch (error) {
       console.error(`Failed to handle problematic message: ${error.message}`);

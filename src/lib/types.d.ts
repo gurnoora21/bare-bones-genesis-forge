@@ -11,3 +11,22 @@ interface RedisLockStatus {
   method?: string;
   lockId?: string;
 }
+
+// Type definitions for Idempotency
+interface IdempotencyKey {
+  operation: string;
+  entity: string;
+  id: string;
+  timestamp?: number;
+}
+
+// Type definitions for Transaction
+interface TransactionState {
+  id: string;
+  status: 'pending' | 'committed' | 'rolledback' | 'error';
+  steps: Array<{
+    name: string;
+    status: 'pending' | 'completed' | 'failed';
+    timestamp: number;
+  }>;
+}
