@@ -1,4 +1,3 @@
-
 /**
  * Idempotent Worker Base Implementation
  * Base class for workers that need to process messages idempotently
@@ -118,7 +117,7 @@ export class IdempotentWorker<T = any> {
           const idempotencyKey = body._idempotencyKey || 
             `${this.queue}:${JSON.stringify(body)}`;
           
-          // Process the message with idempotency
+          // Process the message with idempotency and transaction safety
           const idempotencyManager = getIdempotencyManager(this.supabase);
           const idempotencyResult = await idempotencyManager.execute(
             {
@@ -127,7 +126,7 @@ export class IdempotentWorker<T = any> {
               entityId: messageId
             },
             async () => {
-              // 3. Acquire advisory lock to ensure exclusive processing
+              // Acquire lock to ensure exclusive processing
               const lockAcquired = await this.stateManager.acquireProcessingLock(
                 this.queue, 
                 idempotencyKey,
@@ -143,7 +142,7 @@ export class IdempotentWorker<T = any> {
               }
               
               try {
-                // 4. Process the message with timeout protection and transaction
+                // Process the message with timeout protection and transaction
                 return await transactionManager.transaction(
                   async () => {
                     // Set up a timeout promise
@@ -171,7 +170,7 @@ export class IdempotentWorker<T = any> {
             }
           );
           
-          // 5. Handle the result
+          // Handle the result
           if (idempotencyResult.status === 'success') {
             // Success - delete the message from the queue
             await this.supabase.rpc('ensure_message_deleted', {

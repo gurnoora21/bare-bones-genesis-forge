@@ -533,6 +533,16 @@ export type Database = {
         Args: { queue_name: string; message_id: string; max_attempts?: number }
         Returns: boolean
       }
+      execute_in_transaction: {
+        Args: {
+          p_sql: string
+          p_params?: Json
+          p_operation_id?: string
+          p_entity_type?: string
+          p_entity_id?: string
+        }
+        Returns: Json
+      }
       find_inconsistent_states: {
         Args: { p_entity_type?: string; p_older_than_minutes?: number }
         Returns: {
@@ -613,6 +623,38 @@ export type Database = {
       pg_send_text: {
         Args: { queue_name: string; msg_text: string }
         Returns: number[]
+      }
+      process_album_atomic: {
+        Args: {
+          p_album_data: Json
+          p_operation_id: string
+          p_spotify_id?: string
+        }
+        Returns: Json
+      }
+      process_artist_atomic: {
+        Args: {
+          p_artist_data: Json
+          p_operation_id: string
+          p_spotify_id?: string
+        }
+        Returns: Json
+      }
+      process_producer_atomic: {
+        Args: {
+          p_producer_data: Json
+          p_operation_id: string
+          p_normalized_name?: string
+        }
+        Returns: Json
+      }
+      process_track_atomic: {
+        Args: {
+          p_track_data: Json
+          p_operation_id: string
+          p_spotify_id?: string
+        }
+        Returns: Json
       }
       raw_sql_query: {
         Args: { sql_query: string; params?: Json }

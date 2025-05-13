@@ -1,32 +1,29 @@
 
 /**
- * Idempotency Manager for Supabase
- * Ensures operations are only executed once even if called multiple times
+ * IdempotencyManager
+ * Handles idempotent operations using Postgres to track and store operation state
  */
-
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 
 export interface IdempotencyOptions {
-  operationId?: string; // Unique identifier for this operation
-  entityType?: string;  // Type of entity being processed
-  entityId?: string;    // ID of the entity being processed
-  ttlSeconds?: number;  // How long to keep the idempotency record
+  operationId: string;
+  entityType?: string;
+  entityId?: string;
 }
 
 export interface IdempotencyResult<T = any> {
-  alreadyProcessed: boolean;  // Whether the operation was already processed
-  result?: T;                // Result from previous operation if already processed
-  status: 'success' | 'error' | 'pending'; // Status of the operation
-  metadata?: Record<string, any>; // Any additional metadata
-  error?: string;            // Error message if status is 'error'
+  status: 'success' | 'error';
+  result?: T;
+  error?: string;
+  alreadyProcessed?: boolean;
 }
 
 export class IdempotencyManager {
-  private supabase: any;
+  private supabase: SupabaseClient;
   
-  constructor(supabaseClient?: any) {
-    if (supabaseClient) {
-      this.supabase = supabaseClient;
+  constructor(supabase?: SupabaseClient) {
+    if (supabase) {
+      this.supabase = supabase;
     } else {
       this.supabase = createClient(
         Deno.env.get("SUPABASE_URL") || "",
@@ -36,154 +33,110 @@ export class IdempotencyManager {
   }
   
   /**
-   * Check if an operation has already been processed
-   */
-  async checkOperation<T = any>(options: IdempotencyOptions): Promise<IdempotencyResult<T>> {
-    const { operationId, entityType, entityId } = options;
-    
-    if (!operationId) {
-      return {
-        alreadyProcessed: false,
-        status: 'pending'
-      };
-    }
-    
-    try {
-      const { data, error } = await this.supabase.rpc(
-        'idempotency.check_operation',
-        {
-          p_operation_id: operationId,
-          p_entity_type: entityType || null,
-          p_entity_id: entityId || null
-        }
-      );
-      
-      if (error) {
-        console.error(`Error checking operation ${operationId}: ${error.message}`);
-        // If there's an error checking, we'll assume not processed for safety
-        return {
-          alreadyProcessed: false,
-          status: 'pending',
-          error: error.message
-        };
-      }
-      
-      if (data && data.exists) {
-        return {
-          alreadyProcessed: true,
-          status: data.status.toLowerCase() as 'success' | 'error',
-          result: data.result as T,
-          metadata: data.metadata as Record<string, any>
-        };
-      }
-      
-      return {
-        alreadyProcessed: false,
-        status: 'pending'
-      };
-    } catch (error) {
-      console.error(`Exception checking operation ${operationId}: ${error.message}`);
-      // If there's an exception, we'll assume not processed for safety
-      return {
-        alreadyProcessed: false,
-        status: 'pending',
-        error: error.message
-      };
-    }
-  }
-  
-  /**
-   * Mark an operation as processed with its result
-   */
-  async markProcessed<T = any>(
-    options: IdempotencyOptions,
-    result: T,
-    status: 'success' | 'error' = 'success',
-    metadata?: Record<string, any>
-  ): Promise<boolean> {
-    const { operationId, entityType, entityId } = options;
-    
-    if (!operationId) {
-      return false; // Can't mark as processed without an operation ID
-    }
-    
-    try {
-      const { data, error } = await this.supabase.rpc(
-        'idempotency.mark_processed',
-        {
-          p_operation_id: operationId,
-          p_entity_type: entityType || 'general',
-          p_entity_id: entityId || operationId,
-          p_result: result ? JSON.parse(JSON.stringify(result)) : null,
-          p_metadata: metadata ? JSON.parse(JSON.stringify(metadata)) : null,
-          p_status: status.toUpperCase()
-        }
-      );
-      
-      if (error) {
-        console.error(`Error marking operation ${operationId} as processed: ${error.message}`);
-        return false;
-      }
-      
-      return true;
-    } catch (error) {
-      console.error(`Exception marking operation ${operationId} as processed: ${error.message}`);
-      return false;
-    }
-  }
-  
-  /**
-   * Execute a function with idempotency guarantees
+   * Execute an operation with idempotency guarantees
+   * @param options Idempotency options
+   * @param operation The operation to execute
+   * @returns The result of the operation or the cached result if already executed
    */
   async execute<T = any>(
     options: IdempotencyOptions,
-    fn: () => Promise<T>
+    operation: () => Promise<T>
   ): Promise<IdempotencyResult<T>> {
-    // First check if already processed
-    const checkResult = await this.checkOperation<T>(options);
-    
-    // If already processed, return cached result
-    if (checkResult.alreadyProcessed) {
-      return checkResult;
-    }
+    const { operationId, entityType = 'general', entityId = 'none' } = options;
     
     try {
-      // Execute the function
-      const result = await fn();
+      // Check if operation already processed
+      const { data: existingOp, error: checkError } = await this.supabase
+        .rpc('check_operation', {
+          p_operation_id: operationId,
+          p_entity_type: entityType,
+          p_entity_id: entityId
+        });
       
-      // Mark as processed with success
-      await this.markProcessed(options, result);
+      if (checkError) {
+        console.error(`[IdempotencyManager] Failed to check operation: ${checkError.message}`);
+        // Continue with operation if idempotency check fails
+      } else if (existingOp && existingOp.exists) {
+        console.log(`[IdempotencyManager] Operation ${operationId} already processed, returning cached result`);
+        // Return the cached result
+        return {
+          status: existingOp.status === 'COMPLETED' ? 'success' : 'error',
+          result: existingOp.result,
+          error: existingOp.status === 'FAILED' ? existingOp.result?.error : undefined,
+          alreadyProcessed: true
+        };
+      }
+      
+      // Execute the operation
+      console.log(`[IdempotencyManager] Executing operation ${operationId}`);
+      const result = await operation();
+      
+      // Mark operation as processed
+      try {
+        await this.supabase.rpc('mark_processed', {
+          p_operation_id: operationId,
+          p_entity_type: entityType,
+          p_entity_id: entityId,
+          p_result: result !== null && typeof result === 'object' 
+            ? result 
+            : { value: result },
+          p_metadata: { processed_at: new Date().toISOString() },
+          p_status: 'COMPLETED'
+        });
+      } catch (markError) {
+        console.error(`[IdempotencyManager] Failed to mark operation as processed: ${markError.message}`, markError);
+        // Continue without idempotency marker if marking fails
+      }
       
       return {
-        alreadyProcessed: false,
         status: 'success',
-        result
+        result,
+        alreadyProcessed: false
       };
+      
     } catch (error) {
-      // Mark as processed with error
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      await this.markProcessed(
-        options,
-        { error: errorMessage },
-        'error',
-        { stack: error instanceof Error ? error.stack : undefined }
-      );
+      console.error(`[IdempotencyManager] Operation ${operationId} failed: ${error.message}`, error);
+      
+      // Attempt to mark as failed
+      try {
+        await this.supabase.rpc('mark_processed', {
+          p_operation_id: operationId,
+          p_entity_type: entityType,
+          p_entity_id: entityId,
+          p_result: { error: error.message },
+          p_metadata: { 
+            processed_at: new Date().toISOString(),
+            error_stack: error.stack
+          },
+          p_status: 'FAILED'
+        });
+      } catch (markError) {
+        console.error(`[IdempotencyManager] Failed to mark operation as failed: ${markError.message}`);
+        // Continue without idempotency marker if marking fails
+      }
       
       return {
-        alreadyProcessed: false,
         status: 'error',
-        error: errorMessage
+        error: error.message,
+        alreadyProcessed: false
       };
     }
   }
-}
-
-// Singleton instance for common use
-let idempotencyManagerInstance: IdempotencyManager | null = null;
-
-export function getIdempotencyManager(supabaseClient?: any): IdempotencyManager {
-  if (!idempotencyManagerInstance) {
-    idempotencyManagerInstance = new IdempotencyManager(supabaseClient);
+  
+  /**
+   * Get singleton instance
+   */
+  static getInstance(supabase?: SupabaseClient): IdempotencyManager {
+    if (!IdempotencyManager.instance) {
+      IdempotencyManager.instance = new IdempotencyManager(supabase);
+    }
+    return IdempotencyManager.instance;
   }
-  return idempotencyManagerInstance;
+  
+  private static instance: IdempotencyManager;
 }
+
+// Export a factory function to get the manager instance
+export const getIdempotencyManager = (supabase?: SupabaseClient): IdempotencyManager => {
+  return IdempotencyManager.getInstance(supabase);
+};
