@@ -1,303 +1,199 @@
 
 /**
- * Enhanced Genius Client with improved error handling, retry logic,
- * and better rate limiting
+ * Enhanced Genius API Client with resilience patterns
  */
-
-import { 
-  ErrorCategory, 
-  ErrorSource, 
-  createEnhancedError,
-  retryWithBackoff
-} from "./errorHandling.ts";
-
-import {
-  getGeniusApiResilienceManager,
-  ServiceStatus
-} from "./apiResilience.ts";
-
-import {
-  validateGeniusSong,
-  createValidationError
-} from "./dataValidation.ts";
 
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { getRedis } from "./upstashRedis.ts";
+import { ApiResilienceManager, ServiceHealth } from "./apiResilienceManager.ts";
 
-/**
- * Enhanced Genius client with better error handling and resilience
- */
+export interface GeniusSearchResult {
+  hits: Array<{
+    result: {
+      id: number;
+      title: string;
+      primary_artist: {
+        id: number;
+        name: string;
+      };
+      url: string;
+    }
+  }>;
+}
+
+export interface GeniusSongData {
+  song: {
+    id: number;
+    title: string;
+    url: string;
+    album?: {
+      id: number;
+      name: string;
+    };
+    writer_artists?: Array<{
+      id: number;
+      name: string;
+      url: string;
+    }>;
+    producer_artists?: Array<{
+      id: number;
+      name: string;
+      url: string;
+    }>;
+    custom_performances?: Array<{
+      label: string;
+      artists: Array<{
+        id: number;
+        name: string;
+      }>;
+    }>;
+    description_annotation?: {
+      body?: {
+        plain?: string;
+      };
+    };
+  };
+}
+
 export class EnhancedGeniusClient {
   private accessToken: string;
+  private apiBase: string = "https://api.genius.com";
   private redis: Redis;
-  private apiResilienceManager = getGeniusApiResilienceManager();
+  private resilienceManager: ApiResilienceManager;
+  private serviceName = "genius-api";
   
-  constructor() {
-    this.accessToken = Deno.env.get("GENIUS_ACCESS_TOKEN") || "";
-    this.redis = getRedis();
-    
-    if (!this.accessToken) {
-      throw createEnhancedError(
-        "Genius access token must be provided as environment variable",
-        ErrorSource.SYSTEM,
-        ErrorCategory.PERMANENT_AUTH
-      );
-    }
+  constructor(accessToken: string, redis: Redis, resilienceManager: ApiResilienceManager) {
+    this.accessToken = accessToken;
+    this.redis = redis;
+    this.resilienceManager = resilienceManager;
   }
   
   /**
-   * Make an authenticated API call with resilience and caching
+   * Search Genius for a song
    */
-  private async apiCall<T>(
-    endpoint: string,
-    apiEndpointName: string = "default",
-    options: {
-      correlationId?: string;
-    } = {}
-  ): Promise<T> {
-    const {
-      correlationId = `genius_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`
-    } = options;
+  async searchSong(query: string): Promise<GeniusSearchResult> {
+    const cacheKey = `genius:search:${encodeURIComponent(query.toLowerCase())}`;
     
-    const url = endpoint.startsWith("https://")
-      ? endpoint
-      : `https://api.genius.com${endpoint}`;
+    // Try to get from cache first
+    const cached = await this.redis.get(cacheKey);
+    if (cached) {
+      console.log(`Cache hit for Genius search: ${query}`);
+      return JSON.parse(cached as string);
+    }
     
-    // Make the API call with rate limiting and circuit breaking
-    return await this.apiResilienceManager.executeApiCall<T>(
-      apiEndpointName,
+    // Not in cache, make API call with resilience patterns
+    const result = await this.resilienceManager.executeApiCall<GeniusSearchResult>(
+      this.serviceName,
       async () => {
-        return fetch(url, {
-          headers: {
-            "Authorization": `Bearer ${this.accessToken}`,
-            "X-Correlation-ID": correlationId
+        const response = await fetch(
+          `${this.apiBase}/search?q=${encodeURIComponent(query)}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${this.accessToken}`,
+              'Accept': 'application/json'
+            }
           }
-        });
+        );
+        
+        // Handle rate limiting explicitly
+        if (response.status === 429) {
+          const retryAfter = response.headers.get('retry-after');
+          throw new Error(`Genius API rate limit exceeded. Retry after ${retryAfter || 'unknown'} seconds`);
+        }
+        
+        if (!response.ok) {
+          throw new Error(`Genius API search error: ${response.status} ${response.statusText}`);
+        }
+        
+        const data = await response.json();
+        return data.response as GeniusSearchResult;
       },
       {
-        correlationId,
-        // Process the response
-        processResponse: async (response) => {
-          if (response.status === 429) {
-            // Handle rate limiting
-            const retryAfter = response.headers.get("Retry-After") || "60";
-            throw createEnhancedError(
-              `Genius API rate limit exceeded. Retry after ${retryAfter} seconds.`,
-              ErrorSource.GENIUS_API,
-              ErrorCategory.TRANSIENT_RATE_LIMIT,
-              { retryAfter }
-            );
-          }
-          
-          if (response.status === 401) {
-            throw createEnhancedError(
-              "Genius API authorization failed",
-              ErrorSource.GENIUS_API,
-              ErrorCategory.PERMANENT_AUTH
-            );
-          }
-          
-          if (!response.ok) {
-            const text = await response.text();
-            throw createEnhancedError(
-              `Genius API error: ${response.status} ${text}`,
-              ErrorSource.GENIUS_API,
-              response.status >= 500 ? ErrorCategory.TRANSIENT_SERVICE : 
-              response.status === 404 ? ErrorCategory.PERMANENT_NOT_FOUND :
-              ErrorCategory.PERMANENT_BAD_REQUEST
-            );
-          }
-          
-          return await response.json() as T;
-        },
-        // Use a fallback cache if available
-        fallbackFn: async () => {
-          try {
-            // Check if we have a cached response
-            const cacheKey = `genius:cache:${endpoint.replace(/\//g, ":")}`;
-            const cachedData = await this.redis.get(cacheKey);
-            
-            if (cachedData) {
-              console.log(`[${correlationId}] Using cached response for ${endpoint}`);
-              return JSON.parse(cachedData as string) as T;
-            }
-          } catch (cacheError) {
-            console.warn(`[${correlationId}] Cache fallback failed:`, cacheError.message);
-          }
-          
-          throw new Error("No fallback data available");
-        }
+        rateLimit: { requestsPerMinute: 5 }, // Genius rate limit is ~5 req/sec
+        maxRetries: 2
       }
     );
+    
+    // Cache the result for 1 day
+    await this.redis.set(cacheKey, JSON.stringify(result), { ex: 86400 });
+    
+    return result;
   }
   
   /**
-   * Search for a song on Genius with retry and validation
+   * Get song details by ID
    */
-  async search(trackName: string, artistName: string): Promise<any> {
-    const query = encodeURIComponent(`${trackName} ${artistName}`);
-    const cacheKey = `genius:cache:search:${trackName.toLowerCase()}-${artistName.toLowerCase()}`;
+  async getSongById(songId: number): Promise<GeniusSongData> {
+    const cacheKey = `genius:song:${songId}`;
     
-    // Check cache first
-    try {
-      const cachedResult = await this.redis.get(cacheKey);
-      if (cachedResult) {
-        return JSON.parse(cachedResult as string);
-      }
-    } catch (cacheError) {
-      console.warn(`Cache check failed:`, cacheError.message);
+    // Try to get from cache first
+    const cached = await this.redis.get(cacheKey);
+    if (cached) {
+      console.log(`Cache hit for Genius song id: ${songId}`);
+      return JSON.parse(cached as string);
     }
     
-    // Make API call with resilience
-    const result = await this.apiCall<any>(`/search?q=${query}`, "search");
-    
-    let song = null;
-    if (result.response && result.response.hits && result.response.hits.length > 0) {
-      // Find the most relevant hit (usually the first one)
-      const hit = result.response.hits.find((h: any) => h.type === "song") || result.response.hits[0];
-      song = hit.result;
-      
-      // Cache successful result
-      try {
-        await this.redis.set(cacheKey, JSON.stringify(song), {
-          ex: 86400 // 24 hours
-        });
-      } catch (cacheError) {
-        console.warn(`Failed to cache search result:`, cacheError.message);
-      }
-    }
-    
-    return song;
-  }
-  
-  /**
-   * Get detailed song information including producer credits
-   */
-  async getSong(songId: number): Promise<any> {
-    const cacheKey = `genius:cache:song:${songId}`;
-    
-    // Check cache first
-    try {
-      const cachedResult = await this.redis.get(cacheKey);
-      if (cachedResult) {
-        return JSON.parse(cachedResult as string);
-      }
-    } catch (cacheError) {
-      console.warn(`Cache check failed:`, cacheError.message);
-    }
-    
-    // Make API call with resilience
-    const result = await this.apiCall<any>(`/songs/${songId}`, "songs");
-    
-    let song = null;
-    if (result.response && result.response.song) {
-      song = result.response.song;
-      
-      // Validate song data
-      const validation = validateGeniusSong(song);
-      if (!validation.valid) {
-        console.warn(`Invalid song data for ID ${songId}:`, validation.errors);
-      }
-      
-      // Cache successful result
-      try {
-        await this.redis.set(cacheKey, JSON.stringify(song), {
-          ex: 86400 // 24 hours
-        });
-      } catch (cacheError) {
-        console.warn(`Failed to cache song data:`, cacheError.message);
-      }
-    }
-    
-    return song;
-  }
-  
-  /**
-   * Extract producer information from song details with validation
-   */
-  extractProducers(songDetails: any): { name: string, confidence: number, source: string }[] {
-    if (!songDetails) {
-      return [];
-    }
-    
-    const producers: { name: string, confidence: number, source: string }[] = [];
-    
-    // Check for direct producer_artists field
-    if (songDetails.producer_artists && Array.isArray(songDetails.producer_artists)) {
-      songDetails.producer_artists.forEach((producer: any) => {
-        if (producer && producer.name) {
-          producers.push({
-            name: producer.name,
-            confidence: 0.95, // High confidence since these are explicitly labeled
-            source: 'genius_producer_artists'
-          });
-        }
-      });
-    }
-    
-    // Check custom performance roles
-    if (songDetails.custom_performances && Array.isArray(songDetails.custom_performances)) {
-      songDetails.custom_performances.forEach((performance: any) => {
-        if (performance.label && 
-            (performance.label.toLowerCase().includes('produc') || 
-             performance.label.toLowerCase().includes('beat'))) {
-          
-          performance.artists.forEach((artist: any) => {
-            producers.push({
-              name: artist.name,
-              confidence: 0.9,
-              source: 'genius_custom_performances'
-            });
-          });
-        }
-      });
-    }
-    
-    // Check description for producer mentions
-    if (songDetails.description && songDetails.description.html) {
-      const description = songDetails.description.html;
-      
-      // Simple producer extraction via patterns like "Produced by X" or "Producer: X"
-      const producerPatterns = [
-        /[Pp]roduced by ([^<.,]+)/g,
-        /[Pp]roducer(?:s)?:? ([^<.,]+)/g,
-        /[Bb]eat(?:s)? by ([^<.,]+)/g
-      ];
-      
-      producerPatterns.forEach(pattern => {
-        let match;
-        while ((match = pattern.exec(description)) !== null) {
-          const producer = match[1].trim();
-          // Avoid capturing too much text
-          if (producer.length < 50 && producer.split(" ").length < 6) {
-            producers.push({
-              name: producer,
-              confidence: 0.7, // Lower confidence for text extraction
-              source: 'genius_description'
-            });
+    // Not in cache, make API call with resilience patterns
+    const result = await this.resilienceManager.executeApiCall<GeniusSongData>(
+      this.serviceName,
+      async () => {
+        const response = await fetch(
+          `${this.apiBase}/songs/${songId}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${this.accessToken}`,
+              'Accept': 'application/json'
+            }
           }
+        );
+        
+        // Handle rate limiting explicitly
+        if (response.status === 429) {
+          const retryAfter = response.headers.get('retry-after');
+          throw new Error(`Genius API rate limit exceeded. Retry after ${retryAfter || 'unknown'} seconds`);
         }
-      });
-    }
+        
+        if (!response.ok) {
+          throw new Error(`Genius API song error: ${response.status} ${response.statusText}`);
+        }
+        
+        const data = await response.json();
+        return data.response as GeniusSongData;
+      },
+      {
+        rateLimit: { requestsPerMinute: 5 },
+        maxRetries: 2
+      }
+    );
     
-    return producers;
+    // Cache the result for 30 days (song details rarely change)
+    await this.redis.set(cacheKey, JSON.stringify(result), { ex: 2592000 });
+    
+    return result;
   }
   
   /**
-   * Get the service health status
+   * Get service health status
    */
-  async getServiceHealth(): Promise<ServiceStatus> {
-    const health = await this.apiResilienceManager.getServiceHealth();
+  async getServiceHealth(): Promise<ServiceHealth> {
+    const health = await this.resilienceManager.getServiceHealth(this.serviceName);
     return health.status;
+  }
+  
+  /**
+   * Reset the Genius API circuit breaker
+   */
+  async resetCircuitBreaker(): Promise<boolean> {
+    return await this.resilienceManager.resetCircuitBreaker(this.serviceName);
   }
 }
 
-// Create singleton instance
-let geniusClientInstance: EnhancedGeniusClient | null = null;
-
-export function getGeniusClient(): EnhancedGeniusClient {
-  if (!geniusClientInstance) {
-    geniusClientInstance = new EnhancedGeniusClient();
-  }
-  return geniusClientInstance;
+/**
+ * Create enhanced Genius client with resilience features
+ */
+export function createEnhancedGeniusClient(
+  accessToken: string,
+  redis: Redis,
+  resilienceManager: ApiResilienceManager
+): EnhancedGeniusClient {
+  return new EnhancedGeniusClient(accessToken, redis, resilienceManager);
 }

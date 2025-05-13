@@ -1,239 +1,335 @@
 
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+// System reset edge function to manage circuit breakers and clear stale locks
 
-// CORS headers for cross-origin requests
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { ApiResilienceManager, getApiResilienceManager } from "../_shared/apiResilienceManager.ts";
+
+// Initialize Redis client
+const redis = new Redis({
+  url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+  token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+});
+
+// Initialize Supabase client
+const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
+const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
 };
 
-/**
- * System Reset Edge Function
- * 
- * This function provides emergency reset capabilities for:
- * 1. Circuit breakers (for API resilience)
- * 2. Stuck locks (both in Redis and database)
- * 3. Processing state cleanup
- */
+// Response helper
+function createResponse(body: any, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 
+      ...corsHeaders,
+      'Content-Type': 'application/json' 
+    }
+  });
+}
+
+async function resetCircuitBreakers() {
+  try {
+    const resilienceManager = getApiResilienceManager(redis);
+    const resetServices = await resilienceManager.resetAllCircuitBreakers();
+    
+    return {
+      success: true,
+      reset_services: resetServices,
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error("Error resetting circuit breakers:", error);
+    return {
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+async function clearStaleLocks(staleThresholdMinutes = 15) {
+  try {
+    // Call the database function to clear stale locks
+    const { data, error } = await supabase.rpc('cleanup_stale_locks', {
+      p_stale_threshold_seconds: staleThresholdMinutes * 60
+    });
+    
+    if (error) {
+      throw new Error(`Database error: ${error.message}`);
+    }
+    
+    return {
+      success: true,
+      cleared_locks: data || [],
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error("Error clearing stale locks:", error);
+    return {
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+async function resetStuckEntities(staleThresholdMinutes = 30) {
+  try {
+    // Reset stuck processing states
+    const { data, error } = await supabase
+      .from('processing_status')
+      .update({
+        state: 'PENDING',
+        metadata: { reset_reason: 'manual_reset', reset_at: new Date().toISOString() }
+      })
+      .eq('state', 'IN_PROGRESS')
+      .lt('last_processed_at', new Date(Date.now() - staleThresholdMinutes * 60000).toISOString())
+      .select();
+    
+    if (error) {
+      throw new Error(`Database error: ${error.message}`);
+    }
+    
+    return {
+      success: true,
+      reset_entities: data?.length || 0,
+      entities: data || [],
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error("Error resetting stuck entities:", error);
+    return {
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+async function resetStuckMessages(queueNames: string[] = [], staleThresholdMinutes = 15) {
+  if (!queueNames || queueNames.length === 0) {
+    queueNames = [
+      'artist_discovery',
+      'album_discovery',
+      'track_discovery',
+      'producer_identification',
+      'social_enrichment'
+    ];
+  }
+  
+  const results: Record<string, any> = {};
+  
+  for (const queueName of queueNames) {
+    try {
+      // Call the database function to reset stuck messages
+      const { data, error } = await supabase.rpc('reset_stuck_messages', {
+        queue_name: queueName,
+        min_minutes_locked: staleThresholdMinutes
+      });
+      
+      if (error) {
+        results[queueName] = { 
+          success: false, 
+          error: error.message 
+        };
+      } else {
+        results[queueName] = { 
+          success: true, 
+          reset_count: data 
+        };
+      }
+    } catch (error) {
+      results[queueName] = { 
+        success: false, 
+        error: error.message 
+      };
+    }
+  }
+  
+  return {
+    success: true,
+    queue_results: results,
+    timestamp: new Date().toISOString()
+  };
+}
+
+async function resetAll(staleThresholdMinutes = 15) {
+  const results = {
+    circuit_breakers: await resetCircuitBreakers(),
+    stale_locks: await clearStaleLocks(staleThresholdMinutes),
+    stuck_entities: await resetStuckEntities(staleThresholdMinutes),
+    stuck_messages: await resetStuckMessages([], staleThresholdMinutes),
+    timestamp: new Date().toISOString()
+  };
+  
+  return {
+    success: true,
+    results
+  };
+}
+
+async function getSystemHealth() {
+  try {
+    // Get circuit breaker health
+    const resilienceManager = getApiResilienceManager(redis);
+    const serviceHealth = await resilienceManager.getAllServicesHealth();
+    
+    // Check stale locks
+    const { data: staleLocks, error: locksError } = await supabase.rpc('cleanup_stale_locks', {
+      p_stale_threshold_seconds: 3600,
+      p_return_only: true
+    });
+    
+    if (locksError) {
+      throw new Error(`Error checking stale locks: ${locksError.message}`);
+    }
+    
+    // Check stuck processing states
+    const { data: stuckEntities, error: entitiesError } = await supabase
+      .from('processing_status')
+      .select('*')
+      .eq('state', 'IN_PROGRESS')
+      .lt('last_processed_at', new Date(Date.now() - 30 * 60000).toISOString());
+    
+    if (entitiesError) {
+      throw new Error(`Error checking stuck entities: ${entitiesError.message}`);
+    }
+    
+    // Check queue health
+    const queueNames = [
+      'artist_discovery',
+      'album_discovery',
+      'track_discovery',
+      'producer_identification',
+      'social_enrichment'
+    ];
+    
+    const queueHealth: Record<string, any> = {};
+    for (const queueName of queueNames) {
+      try {
+        const { data: messages, error: messagesError } = await supabase.rpc('list_stuck_messages', {
+          queue_name: queueName,
+          min_minutes_locked: 15
+        });
+        
+        if (messagesError) {
+          queueHealth[queueName] = { 
+            error: messagesError.message 
+          };
+        } else {
+          queueHealth[queueName] = { 
+            stuck_messages: messages?.length || 0,
+            messages: messages 
+          };
+        }
+      } catch (error) {
+        queueHealth[queueName] = { 
+          error: error.message 
+        };
+      }
+    }
+    
+    return {
+      success: true,
+      api_services: serviceHealth,
+      stale_locks: staleLocks || [],
+      stale_locks_count: staleLocks?.length || 0,
+      stuck_entities: stuckEntities || [],
+      stuck_entities_count: stuckEntities?.length || 0,
+      queue_health: queueHealth,
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error("Error getting system health:", error);
+    return {
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+// Main request handler
 serve(async (req) => {
-  // Handle CORS preflight requests
+  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
   
+  const url = new URL(req.url);
+  const path = url.pathname.split('/').pop() || '';
+  
   try {
-    // Create a Supabase client
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') || '';
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
-    const supabase = createClient(supabaseUrl, supabaseKey);
-    
-    // Create Redis client for direct operations
-    const redisUrl = Deno.env.get('UPSTASH_REDIS_REST_URL');
-    const redisToken = Deno.env.get('UPSTASH_REDIS_REST_TOKEN');
-    let redis = null;
-    
-    if (redisUrl && redisToken) {
-      redis = new Redis({
-        url: redisUrl,
-        token: redisToken,
+    if (req.method === 'GET') {
+      // Health check
+      if (path === 'health') {
+        const health = await getSystemHealth();
+        return createResponse(health);
+      }
+      
+      return createResponse({ 
+        available_actions: [
+          'health', 
+          'reset-circuits', 
+          'clear-locks', 
+          'reset-entities', 
+          'reset-messages', 
+          'reset-all'
+        ] 
       });
     }
     
-    // Parse request data
-    const { action, entityType, entityId, worker, service, all } = await req.json();
-    
-    // Results object to track actions performed
-    const results = {
-      circuitBreaker: null,
-      redisLocks: null,
-      dbLocks: null,
-      processingStates: null
-    };
-    
-    // 1. Reset circuit breakers in Redis
-    if (action === 'reset-circuit-breakers' || all) {
-      try {
-        if (redis) {
-          const circuitBreakerKeys = await redis.keys('circuit:*');
-          let deletedCount = 0;
+    if (req.method === 'POST') {
+      const params = await req.json().catch(() => ({}));
+      const staleThresholdMinutes = parseInt(params.staleThresholdMinutes as string || '15');
+      
+      switch (path) {
+        case 'reset-circuits':
+          return createResponse(await resetCircuitBreakers());
           
-          if (service) {
-            // Reset only keys for a specific service
-            const serviceKeys = circuitBreakerKeys.filter(key => key.includes(`:${service}:`));
-            for (const key of serviceKeys) {
-              await redis.del(key);
-              deletedCount++;
-            }
-          } else {
-            // Reset all circuit breaker keys
-            for (const key of circuitBreakerKeys) {
-              await redis.del(key);
-              deletedCount++;
-            }
-          }
+        case 'clear-locks':
+          return createResponse(await clearStaleLocks(staleThresholdMinutes));
           
-          results.circuitBreaker = {
-            success: true,
-            reset: deletedCount,
-            message: `Reset ${deletedCount} circuit breaker(s)`
-          };
-        } else {
-          results.circuitBreaker = {
-            success: false,
-            message: "Redis client not available"
-          };
-        }
-      } catch (error) {
-        results.circuitBreaker = {
-          success: false,
-          error: error.message
-        };
+        case 'reset-entities':
+          return createResponse(await resetStuckEntities(staleThresholdMinutes));
+          
+        case 'reset-messages':
+          return createResponse(await resetStuckMessages(
+            params.queueNames as string[] || [], 
+            staleThresholdMinutes
+          ));
+          
+        case 'reset-all':
+          return createResponse(await resetAll(staleThresholdMinutes));
+          
+        default:
+          return createResponse({ 
+            error: 'Unknown action',
+            available_actions: [
+              'reset-circuits', 
+              'clear-locks', 
+              'reset-entities', 
+              'reset-messages', 
+              'reset-all'
+            ] 
+          }, 400);
       }
     }
     
-    // 2. Clean up Redis locks
-    if (action === 'clean-redis-locks' || all) {
-      try {
-        if (redis) {
-          const lockPattern = entityType ? `lock:${entityType}:*` : 'lock:*';
-          const lockKeys = await redis.keys(lockPattern);
-          let deletedCount = 0;
-          
-          if (entityId && entityType) {
-            // Delete specific lock
-            const specificKey = `lock:${entityType}:${entityId}`;
-            await redis.del(specificKey);
-            deletedCount = 1;
-          } else {
-            // Delete all matching locks
-            for (const key of lockKeys) {
-              await redis.del(key);
-              deletedCount++;
-            }
-          }
-          
-          results.redisLocks = {
-            success: true,
-            cleaned: deletedCount,
-            message: `Removed ${deletedCount} Redis lock(s)`
-          };
-        } else {
-          results.redisLocks = {
-            success: false,
-            message: "Redis client not available"
-          };
-        }
-      } catch (error) {
-        results.redisLocks = {
-          success: false,
-          error: error.message
-        };
-      }
-    }
-    
-    // 3. Clean up database locks
-    if (action === 'clean-db-locks' || all) {
-      try {
-        let query = supabase.from('processing_locks').delete();
-        
-        if (entityType) {
-          query = query.eq('entity_type', entityType);
-        }
-        
-        if (entityId) {
-          query = query.eq('entity_id', entityId);
-        }
-        
-        if (worker) {
-          query = query.eq('worker_id', worker);
-        }
-        
-        const { data, error, count } = await query.select('*');
-        
-        if (error) {
-          throw error;
-        }
-        
-        results.dbLocks = {
-          success: true,
-          cleaned: count,
-          locks: data,
-          message: `Removed ${count} database lock(s)`
-        };
-      } catch (error) {
-        results.dbLocks = {
-          success: false,
-          error: error.message
-        };
-      }
-    }
-    
-    // 4. Reset processing states
-    if (action === 'reset-processing-states' || all) {
-      try {
-        let query = supabase
-          .from('processing_status')
-          .update({
-            state: 'PENDING',
-            last_processed_at: new Date().toISOString(),
-            metadata: { reset_reason: 'manual_reset', reset_time: new Date().toISOString() }
-          });
-        
-        if (entityType) {
-          query = query.eq('entity_type', entityType);
-        }
-        
-        if (entityId) {
-          query = query.eq('entity_id', entityId);
-        } else {
-          // Only reset IN_PROGRESS states if no specific entity is targeted
-          query = query.eq('state', 'IN_PROGRESS');
-        }
-        
-        const { data, error, count } = await query.select('*');
-        
-        if (error) {
-          throw error;
-        }
-        
-        results.processingStates = {
-          success: true,
-          reset: count,
-          states: data,
-          message: `Reset ${count} processing state(s)`
-        };
-      } catch (error) {
-        results.processingStates = {
-          success: false,
-          error: error.message
-        };
-      }
-    }
-    
-    // Return the results
-    return new Response(JSON.stringify({
-      success: true,
-      action: action || 'all',
-      timestamp: new Date().toISOString(),
-      results
-    }), {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'application/json'
-      }
-    });
+    return createResponse({ error: 'Method not allowed' }, 405);
   } catch (error) {
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message
-    }), {
-      status: 500,
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'application/json'
-      }
-    });
+    console.error("Error handling request:", error);
+    return createResponse({ 
+      error: error.message || 'Unknown error',
+      timestamp: new Date().toISOString()
+    }, 500);
   }
 });
