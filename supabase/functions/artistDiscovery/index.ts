@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -484,18 +485,52 @@ async function processArtistWithoutCache(
 
   console.log(`Stored artist in database with ID: ${artist.id}`);
 
-  // Enqueue album discovery
+  // FIX: Don't stringify the message body - pass it directly as a JSONB object
+  // The pg_enqueue function expects JSONB directly
   const { data: enqueueData, error: queueError } = await supabase.rpc('pg_enqueue', {
     queue_name: 'album_discovery',
-    message_body: JSON.stringify({ 
+    message_body: { 
       artistId: artist.id, 
-      offset: 0 
-    })
+      offset: 0,
+      _idempotencyKey: `artist:${artist.id}:albums:offset:0` 
+    }
   });
 
   if (queueError) {
     console.error("Error enqueueing album discovery:", queueError);
-    throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
+    
+    // Additional logging to debug the structure
+    console.error("Failed message structure:", {
+      queue_name: 'album_discovery',
+      message_body: { 
+        artistId: artist.id, 
+        offset: 0 
+      }
+    });
+    
+    // Try an alternative approach with a direct db call
+    try {
+      console.log("Attempting direct queue function call as fallback...");
+      const { data: directData, error: directError } = await supabase.rpc(
+        'start_album_discovery',
+        { 
+          artist_id: artist.id,
+          offset_val: 0
+        }
+      );
+      
+      if (directError) {
+        console.error("Direct queue function also failed:", directError);
+        throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
+      } else {
+        console.log("Direct queue function succeeded:", directData);
+      }
+    } catch (directError) {
+      console.error("Exception in direct queue function:", directError);
+      throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
+    }
+  } else {
+    console.log(`Successfully enqueued album discovery for artist ID ${artist.id}, message ID: ${enqueueData}`);
   }
 
   console.log(`Processed artist ${artistData.name}, enqueued album discovery for artist ID ${artist.id}`);
