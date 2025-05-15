@@ -98,16 +98,18 @@ export class DeduplicationService {
       };
       
       // Always set an expiry (TTL) to prevent leaking keys
+      // Use nx: true option to ensure the key is set only if not already present
       const result = await this.redis.set(
         dedupKey,
         JSON.stringify(processedData),
         {
-          ex: ttlSeconds
+          ex: ttlSeconds,
+          nx: true  // Ensure atomic "set-if-not-exists"
         }
       );
       
       if (result !== "OK") {
-        console.warn(`[${correlationId}] Failed to mark ${namespace}:${key}${entityId ? `:${entityId}` : ''} as processed: ${result}`);
+        console.warn(`[${correlationId}] Failed to mark ${namespace}:${key}${entityId ? `:${entityId}` : ''} as processed or already marked: ${result}`);
       }
     } catch (error) {
       // Log error but don't block execution (fail open)
