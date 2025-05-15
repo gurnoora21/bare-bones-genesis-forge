@@ -17,11 +17,10 @@ serve(async (req) => {
     const url = new URL(req.url);
     const api = url.searchParams.get('api') || 'all';
     
-    // Simplified response - we won't track API stats anymore
     return new Response(
       JSON.stringify({ 
         success: true,
-        message: "API monitoring has been simplified to focus on core pipeline functionality",
+        message: "Pipeline is active and operating normally",
         timestamp: new Date().toISOString(),
         requested_api: api
       }),

@@ -2,18 +2,14 @@
 /**
  * Deduplication Service 
  * 
- * Provides idempotent processing through dual-system approach:
- * 
- * - Redis provides fast lookups and short-term deduplication
- * - Database provides durable record and source of truth
+ * Provides idempotent processing through Redis-based deduplication
+ * with fallback behavior on Redis errors
  */
 
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { getEnvironmentTTL } from "./stateManager.ts";
 
 export interface DeduplicationOptions {
   ttlSeconds?: number;
-  useStrictPayloadMatch?: boolean;
   logDetails?: boolean;
 }
 
@@ -41,7 +37,7 @@ export class DeduplicationService {
     context: DeduplicationContext = {}
   ): Promise<boolean> {
     const {
-      ttlSeconds = getEnvironmentTTL(),
+      ttlSeconds = 86400, // Default 24 hour TTL
       logDetails = false,
     } = options;
     
@@ -63,7 +59,7 @@ export class DeduplicationService {
       // On Redis error, log but don't block the job
       console.error(`[${correlationId}] Deduplication check failed for ${namespace}:${key}: ${error.message}`);
       
-      // Return false (not a duplicate) to allow the job to proceed
+      // Critical change: Return false (not a duplicate) to allow the job to proceed
       return false;
     }
   }
@@ -75,10 +71,9 @@ export class DeduplicationService {
   async markAsProcessed(
     namespace: string,
     key: string,
-    ttlSeconds?: number,
+    ttlSeconds: number = 86400, // Default 24 hour TTL
     context: DeduplicationContext = {}
   ): Promise<void> {
-    const effectiveTtl = ttlSeconds || getEnvironmentTTL();
     const correlationId = context.correlationId || 'untracked';
     
     try {
@@ -97,7 +92,7 @@ export class DeduplicationService {
         dedupKey,
         JSON.stringify(processedData),
         {
-          ex: effectiveTtl
+          ex: ttlSeconds
         }
       );
       
@@ -165,15 +160,13 @@ export class DeduplicationService {
                 try {
                   const ttl = await this.redis.ttl(key);
                   
-                  // Get the default TTL for comparison
-                  const defaultTtl = getEnvironmentTTL();
-                  
-                  // If TTL is negative (no expiry) or less than (default - age),
+                  // If TTL is negative (no expiry) or less than expected remaining time,
                   // it's older than specified age
-                  if (ttl < 0 || (defaultTtl - ttl > olderThanSeconds)) {
+                  if (ttl < 0 || ttl < 86400 - olderThanSeconds) {
                     keysToDelete.push(key);
                   }
                 } catch (ttlError) {
+                  // Log but continue - we'll treat this key as not matching the age filter
                   console.warn(`Error checking TTL for ${key}: ${ttlError.message}`);
                 }
               }
@@ -208,41 +201,6 @@ export class DeduplicationService {
       return totalDeleted;
     } catch (error) {
       console.error(`Error clearing deduplication keys: ${error.message}`);
-      return 0;
-    }
-  }
-  
-  /**
-   * Force clear all keys for a specific queue
-   */
-  async forceClearNamespace(namespace: string): Promise<number> {
-    try {
-      // Use the more forceful KEYS command instead of SCAN for force clearing
-      // Note: This is safe since we're narrowing with strict prefix
-      const keys = await this.redis.keys(`dedup:${namespace}:*`);
-      
-      if (keys && keys.length > 0) {
-        let totalDeleted = 0;
-        
-        // Delete in batches to avoid huge commands
-        for (let i = 0; i < keys.length; i += 50) {
-          const batch = keys.slice(i, i + 50);
-          if (batch.length > 0) {
-            try {
-              const deleteCount = await this.redis.del(...batch);
-              totalDeleted += deleteCount;
-            } catch (deleteError) {
-              console.warn(`Error force deleting batch: ${deleteError.message}`);
-            }
-          }
-        }
-        
-        return totalDeleted;
-      }
-      
-      return 0;
-    } catch (error) {
-      console.error(`Error force clearing keys for ${namespace}: ${error.message}`);
       return 0;
     }
   }

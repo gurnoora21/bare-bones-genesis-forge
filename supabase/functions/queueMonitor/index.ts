@@ -28,10 +28,10 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
     
     // Parse request body for threshold settings
-    const { threshold_minutes = 10, auto_fix = true } = 
+    const { threshold_minutes = 10 } = 
       req.method === 'POST' ? await req.json() : {};
     
-    // Reset stuck messages if requested
+    // Reset stuck messages
     const { data: results, error } = await supabase.rpc(
       'reset_all_stuck_messages', 
       { threshold_minutes }
@@ -47,11 +47,10 @@ serve(async (req) => {
     
     console.log(`Queue monitor executed: reset stuck messages older than ${threshold_minutes} minutes`);
     
-    // Report on results
+    // Group by queue
     const fixedMessages = results || [];
     const queueCounts = {};
     
-    // Group by queue
     fixedMessages.forEach(msg => {
       const queue = msg.queue_name;
       queueCounts[queue] = (queueCounts[queue] || 0) + 1;

@@ -1,14 +1,13 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { SpotifyClient } from "../_shared/spotifyClient.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { 
   processQueueMessageSafely, 
   deleteMessageWithRetries,
-  enqueueMessage
+  enqueueMessage,
+  logWorkerIssue
 } from "../_shared/queueHelper.ts";
-import { DeduplicationService } from "../_shared/deduplication.ts";
 
 interface AlbumDiscoveryMsg {
   artistId: string;
@@ -36,9 +35,6 @@ serve(async (req) => {
     url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
     token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
   });
-  
-  // Initialize deduplication service
-  const deduplicationService = new DeduplicationService(redis);
   
   // Create a process ID to track this invocation in logs
   const processId = crypto.randomUUID();
@@ -124,19 +120,6 @@ serve(async (req) => {
     // Process messages in background to avoid CPU timeout
     EdgeRuntime.waitUntil((async () => {
       try {
-        let spotifyClient: SpotifyClient;
-        
-        // Initialize Spotify client with automatic retries
-        try {
-          spotifyClient = new SpotifyClient();
-          log("info", "Spotify client initialized successfully");
-        } catch (spotifyError) {
-          log("error", "Failed to initialize Spotify client", { error: spotifyError.message });
-          spotifyClient = { // Minimal placeholder to avoid errors
-            getArtistAlbums: async () => { throw new Error("Spotify client not available"); }
-          } as SpotifyClient;
-        }
-        
         let successCount = 0;
         let errorCount = 0;
         let tracksQueued = 0;
@@ -178,7 +161,8 @@ serve(async (req) => {
             const idempotencyKey = `artist:${msg.artistId}:albums:offset:${msg.offset || 0}`;
             
             try {
-              // Process message - we're relying on direct processing now
+              // We'll enable deduplication at the message processing level
+              // This protects against duplicate album discovery messages
               const result = await processQueueMessageSafely(
                 supabase,
                 "album_discovery",
@@ -186,10 +170,9 @@ serve(async (req) => {
                 async () => {
                   const processed = await processAlbumDiscovery(
                     supabase, 
-                    spotifyClient, 
                     msg, 
                     log, 
-                    deduplicationService
+                    redis
                   );
                   
                   // Track how many track discovery jobs we enqueued
@@ -199,13 +182,23 @@ serve(async (req) => {
                 },
                 idempotencyKey,
                 async () => {
-                  // We'll always do album discovery since pagination might be needed
-                  return false;
+                  // Check if this album page was already processed
+                  try {
+                    const key = `processed:album:artist:${msg.artistId}:offset:${msg.offset || 0}`;
+                    const exists = await redis.exists(key);
+                    return exists === 1;
+                  } catch (redisError) {
+                    // If Redis check fails, log but allow processing
+                    log("warn", `Redis check failed for ${idempotencyKey}`, { error: redisError.message });
+                    return false;
+                  }
                 },
                 {
                   maxRetries: 3,
                   deduplication: {
-                    enabled: false // Disable deduplication as we want to process every album discovery message
+                    enabled: true,
+                    redis,
+                    ttlSeconds: 86400
                   }
                 }
               );
@@ -221,6 +214,21 @@ serve(async (req) => {
                 error: processError.message,
                 msg
               });
+              
+              // Log to worker_issues table
+              await logWorkerIssue(
+                supabase,
+                "albumDiscovery",
+                "processing_error",
+                `Error processing album discovery for artist ${msg.artistId}`,
+                {
+                  artistId: msg.artistId,
+                  offset: msg.offset || 0,
+                  error: processError.message,
+                  stack: processError.stack
+                }
+              );
+              
               errorCount++;
             }
           } catch (parseError) {
@@ -261,10 +269,9 @@ serve(async (req) => {
 
 async function processAlbumDiscovery(
   supabase: any, 
-  spotifyClient: SpotifyClient,
   msg: AlbumDiscoveryMsg,
   log: (level: string, message: string, data?: any) => void,
-  deduplicationService: DeduplicationService
+  redis: Redis
 ): Promise<any> {
   const { artistId, offset = 0 } = msg;
 
@@ -283,11 +290,36 @@ async function processAlbumDiscovery(
   log("info", `Fetching albums for artist: ${artist.name} (ID: ${artistId}, offset: ${offset})`);
 
   try {
-    // Get albums from Spotify
-    const albumsData = await spotifyClient.getArtistAlbums(artist.spotify_id, offset);
+    // Get the Spotify access token
+    const spotifyToken = await getSpotifyToken();
+
+    // Get albums from Spotify API directly
+    const url = `https://api.spotify.com/v1/artists/${artist.spotify_id}/albums?limit=50&offset=${offset}`;
+    const response = await fetch(url, {
+      headers: {
+        "Authorization": `Bearer ${spotifyToken}`,
+        "Content-Type": "application/json"
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Spotify API error: ${response.status} ${await response.text()}`);
+    }
+    
+    const albumsData = await response.json();
     
     if (!albumsData || !albumsData.items || !Array.isArray(albumsData.items)) {
       log("warn", `No albums returned from Spotify for artist ${artist.name}`, { artistId });
+      
+      // Even with no results, mark this offset as processed to avoid retries
+      try {
+        const processedKey = `processed:album:artist:${artistId}:offset:${offset}`;
+        await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+      } catch (redisError) {
+        // Non-fatal
+        log("warn", `Failed to mark empty page as processed: ${redisError.message}`);
+      }
+      
       return { processed: 0, message: "No albums found", artist: artist.name, tracksQueued: 0 };
     }
 
@@ -321,27 +353,81 @@ async function processAlbumDiscovery(
 
         if (albumError) {
           log("error", `Error storing album ${albumData.name}`, { error: albumError.message, albumData });
+          
+          // Log to worker_issues table
+          await logWorkerIssue(
+            supabase,
+            "albumDiscovery",
+            "database_error",
+            `Error storing album ${albumData.name}`,
+            {
+              artistId,
+              artistName: artist.name,
+              albumName: albumData.name,
+              albumId: albumData.id,
+              error: albumError.message
+            }
+          );
+          
           continue;
         }
 
         log("info", `Stored album in database: ${albumData.name} with ID ${album.id}`);
 
-        // Queue track discovery for this album
-        const idempotencyKey = `album:${album.id}:tracks:offset:0`;
-        
-        const trackQueueResult = await enqueueMessage(
-          supabase,
-          'track_discovery',
-          { albumId: album.id, offset: 0 },
-          idempotencyKey,
-          deduplicationService
-        );
-        
-        if (trackQueueResult) {
-          tracksQueued++;
-          log("info", `Enqueued track discovery for album ${album.id}`);
-        } else {
-          log("warn", `Failed to enqueue track discovery for album ${album.id}`);
+        // Queue track discovery for this album using direct SQL function
+        try {
+          const { data: trackMsg, error: trackError } = await supabase.rpc(
+            'start_track_discovery',
+            { album_id: album.id, offset_val: 0 }
+          );
+          
+          if (trackError) {
+            log("error", `Failed to enqueue track discovery for album ${album.id}`, { error: trackError.message });
+            
+            // Log to worker_issues table
+            await logWorkerIssue(
+              supabase,
+              "albumDiscovery",
+              "track_queue_error",
+              `Failed to enqueue track discovery for album ${albumData.name}`,
+              {
+                artistId,
+                artistName: artist.name,
+                albumId: album.id,
+                albumName: albumData.name,
+                error: trackError.message
+              }
+            );
+          } else {
+            tracksQueued++;
+            log("info", `Enqueued track discovery for album ${album.id}, message ID: ${trackMsg}`);
+            
+            // Mark track as queued in Redis to avoid duplicate processing
+            try {
+              const trackQueuedKey = `enqueued:track_discovery:album:${album.id}:offset:0`;
+              await redis.set(trackQueuedKey, 'true', { ex: 86400 }); // 24 hour TTL
+            } catch (redisError) {
+              // Non-fatal
+              log("warn", `Failed to mark track job as queued in Redis: ${redisError.message}`);
+            }
+          }
+        } catch (trackQueueError) {
+          log("error", `Exception enqueueing track discovery for album ${album.id}`, { error: trackQueueError.message });
+          
+          // Log to worker_issues table
+          await logWorkerIssue(
+            supabase,
+            "albumDiscovery",
+            "track_queue_exception",
+            `Exception enqueueing track discovery for album ${albumData.name}`,
+            {
+              artistId,
+              artistName: artist.name,
+              albumId: album.id,
+              albumName: albumData.name,
+              error: trackQueueError.message
+            }
+          );
         }
 
         savedAlbums++;
@@ -350,31 +436,105 @@ async function processAlbumDiscovery(
           error: albumError.message, 
           albumData
         });
+        
+        // Log to worker_issues table
+        await logWorkerIssue(
+          supabase,
+          "albumDiscovery",
+          "album_processing_error",
+          `Error processing album ${albumData?.name || 'unknown'}`,
+          {
+            artistId,
+            artistName: artist.name,
+            albumData,
+            error: albumError.message
+          }
+        );
       }
     }
 
     // If there are more albums to fetch, queue next batch
     if (albumsData.next) {
       const nextOffset = offset + albumsData.items.length;
+      log("info", `More albums available, enqueueing next page at offset ${nextOffset}`);
       
-      // Queue next batch of albums using our simplified helper
-      const nextBatchIdempotencyKey = `artist:${artistId}:albums:offset:${nextOffset}`;
-      
-      const nextBatchResult = await enqueueMessage(
-        supabase,
-        'album_discovery',
-        { artistId, offset: nextOffset },
-        nextBatchIdempotencyKey,
-        deduplicationService
-      );
-      
-      if (nextBatchResult) {
-        log("info", `Enqueued next album batch at offset ${nextOffset}`);
-      } else {
-        log("warn", `Failed to enqueue next album batch at offset ${nextOffset}`);
+      try {
+        // Check if next page is already queued
+        const nextPageKey = `enqueued:album_discovery:artist:${artistId}:offset:${nextOffset}`;
+        let isNextPageQueued = false;
+        
+        try {
+          isNextPageQueued = await redis.exists(nextPageKey) === 1;
+        } catch (redisError) {
+          // If Redis check fails, assume not queued
+          log("warn", `Redis check failed for next page: ${redisError.message}`);
+        }
+        
+        if (!isNextPageQueued) {
+          // Queue the next batch using SQL function
+          const { data: nextBatchMsg, error: nextBatchError } = await supabase.rpc(
+            'start_album_discovery',
+            { artist_id: artistId, offset_val: nextOffset }
+          );
+          
+          if (nextBatchError) {
+            log("error", `Failed to enqueue next album batch at offset ${nextOffset}`, { error: nextBatchError.message });
+            
+            // Log to worker_issues
+            await logWorkerIssue(
+              supabase,
+              "albumDiscovery",
+              "next_page_error",
+              `Failed to enqueue next album batch for artist ${artist.name}`,
+              {
+                artistId,
+                artistName: artist.name,
+                offset: nextOffset,
+                error: nextBatchError.message
+              }
+            );
+          } else {
+            log("info", `Successfully enqueued next album batch at offset ${nextOffset}, message ID: ${nextBatchMsg}`);
+            
+            // Mark as enqueued in Redis
+            try {
+              await redis.set(nextPageKey, 'true', { ex: 86400 }); // 24 hour TTL
+            } catch (redisError) {
+              // Non-fatal
+              log("warn", `Failed to mark next page as enqueued: ${redisError.message}`);
+            }
+          }
+        } else {
+          log("info", `Next album batch at offset ${nextOffset} already enqueued, skipping`);
+        }
+      } catch (nextPageError) {
+        log("error", `Exception enqueueing next album batch at offset ${nextOffset}`, { error: nextPageError.message });
+        
+        // Log to worker_issues
+        await logWorkerIssue(
+          supabase,
+          "albumDiscovery",
+          "next_page_exception",
+          `Exception enqueueing next album batch for artist ${artist.name}`,
+          {
+            artistId,
+            artistName: artist.name,
+            offset: nextOffset,
+            error: nextPageError.message
+          }
+        );
       }
     }
 
+    // Mark this batch as processed in Redis
+    try {
+      const processedKey = `processed:album:artist:${artistId}:offset:${offset}`;
+      await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+    } catch (redisError) {
+      // Non-fatal
+      log("warn", `Failed to set processed flag in Redis: ${redisError.message}`);
+    }
+    
     return {
       processed: savedAlbums,
       artist: artist.name,
@@ -386,4 +546,30 @@ async function processAlbumDiscovery(
     log("error", `Error in album discovery process`, { error: error.message, artistId });
     throw error;
   }
+}
+
+// Helper function to get a Spotify token
+async function getSpotifyToken(): Promise<string> {
+  const clientId = Deno.env.get("SPOTIFY_CLIENT_ID") || "";
+  const clientSecret = Deno.env.get("SPOTIFY_CLIENT_SECRET") || "";
+  
+  if (!clientId || !clientSecret) {
+    throw new Error("Spotify client ID and client secret must be provided as environment variables");
+  }
+  
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": `Basic ${btoa(`${clientId}:${clientSecret}`)}`
+    },
+    body: "grant_type=client_credentials"
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Failed to get Spotify access token: ${response.statusText}`);
+  }
+  
+  const data = await response.json();
+  return data.access_token;
 }

@@ -1,14 +1,13 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { SpotifyClient } from "../_shared/spotifyClient.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { 
   processQueueMessageSafely, 
   deleteMessageWithRetries, 
-  enqueueMessage 
+  enqueueMessage,
+  logWorkerIssue
 } from "../_shared/queueHelper.ts";
-import { DeduplicationService } from "../_shared/deduplication.ts";
 
 interface ArtistDiscoveryMsg {
   artistId?: string;
@@ -47,9 +46,6 @@ serve(async (req) => {
     url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
     token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
   });
-  
-  // Initialize deduplication service
-  const deduplicationService = new DeduplicationService(redis);
 
   log("info", "Starting artist discovery worker process");
 
@@ -106,15 +102,6 @@ serve(async (req) => {
     // Process messages in background to avoid CPU timeout
     EdgeRuntime.waitUntil((async () => {
       try {
-        // Initialize Spotify client
-        let spotifyClient: SpotifyClient | null = null;
-        try {
-          spotifyClient = new SpotifyClient();
-          log("info", "Spotify client initialized successfully");
-        } catch (spotifyError) {
-          log("error", "Failed to initialize Spotify client", { error: spotifyError.message });
-        }
-        
         let successCount = 0;
         let errorCount = 0;
         let albumsQueued = 0;
@@ -146,7 +133,7 @@ serve(async (req) => {
                 supabase,
                 "artist_discovery",
                 messageId.toString(),
-                async () => await processArtist(supabase, spotifyClient, msg, redis),
+                async () => await processArtist(supabase, msg, redis),
                 idempotencyKey, 
                 async () => {
                   // Check if this artist was already processed
@@ -186,20 +173,52 @@ serve(async (req) => {
                   successCount++;
                   log("info", `Successfully processed artist with ID: ${result.id}`, { artistId: result.id });
                   
-                  // Ensure album discovery is queued
-                  const albumQueueResult = await enqueueMessage(
-                    supabase,
-                    'album_discovery',
-                    { artistId: result.id, offset: 0 },
-                    `artist:${result.id}:albums:offset:0`,
-                    deduplicationService
-                  );
-                  
-                  if (albumQueueResult) {
-                    albumsQueued++;
-                    log("info", `Successfully queued album discovery for artist ID: ${result.id}`);
-                  } else {
-                    log("warn", `Failed to queue album discovery for artist ID: ${result.id}`);
+                  try {
+                    // Enqueue album discovery job - ONLY IF artist processing was successful
+                    // This critical fix ensures we only mark the artist as processed AFTER enqueueing albums
+                    // Use the specialized SQL function
+                    const { data: albumMsg, error: albumError } = await supabase.rpc(
+                      'start_album_discovery',
+                      { artist_id: result.id, offset_val: 0 }
+                    );
+                    
+                    if (albumError) {
+                      // Log the error but don't fail the whole task
+                      log("error", `Failed to enqueue album discovery for artist ${result.id}`, { error: albumError.message });
+                      await logWorkerIssue(
+                        supabase,
+                        "artistDiscovery",
+                        "album_enqueue_error",
+                        `Failed to enqueue album discovery for artist ${result.id}`,
+                        { artistId: result.id, error: albumError.message }
+                      );
+                    } else {
+                      albumsQueued++;
+                      log("info", `Successfully queued album discovery for artist ID: ${result.id}, message ID: ${albumMsg}`);
+                      
+                      // ONLY NOW mark the artist name as processed in Redis
+                      // This ensures that if album discovery queueing fails, the artist will be retried
+                      if (msg.artistName) {
+                        try {
+                          const artistKey = `processed:artist:name:${msg.artistName.toLowerCase()}`;
+                          await redis.set(artistKey, 'true', { ex: 86400 });
+                          log("info", `Marked artist ${msg.artistName} as processed in Redis`);
+                        } catch (redisError) {
+                          // Non-fatal
+                          log("warn", `Failed to mark artist ${msg.artistName} as processed in Redis: ${redisError.message}`);
+                        }
+                      }
+                    }
+                  } catch (enqueueError) {
+                    // Log the error but don't fail the whole task
+                    log("error", `Exception enqueueing album discovery for artist ${result.id}`, { error: enqueueError.message });
+                    await logWorkerIssue(
+                      supabase,
+                      "artistDiscovery",
+                      "album_enqueue_exception",
+                      `Exception enqueueing album discovery for artist ${result.id}`,
+                      { artistId: result.id, error: enqueueError.message }
+                    );
                   }
                 }
               } else {
@@ -246,7 +265,6 @@ serve(async (req) => {
 // Process an artist from the discovery queue
 async function processArtist(
   supabase: any, 
-  spotifyClient: any, 
   msg: ArtistDiscoveryMsg,
   redis: Redis
 ) {
@@ -332,21 +350,9 @@ async function processArtist(
   }
 
   console.log(`Stored artist in database with ID: ${artist.id}`);
-
-  // Mark this artist as processed in Redis 
-  if (artistName) {
-    try {
-      const artistKey = `processed:artist:name:${artistName.toLowerCase()}`;
-      await redis.set(artistKey, 'true', { ex: 86400 });
-      console.log(`Marked artist ${artistName} as processed in Redis`);
-    } catch (redisError) {
-      console.warn(`Failed to mark artist ${artistName} as processed in Redis:`, redisError);
-      // Continue anyway
-    }
-  }
-
-  // The album discovery will be queued outside this function
-  // to ensure proper logging and error handling
+  
+  // Do NOT mark the artist as processed here! 
+  // We'll only do this after successfully queueing the album discovery job
   
   return artist;
 }

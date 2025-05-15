@@ -1,7 +1,6 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { DeduplicationService } from "./deduplication.ts";
 
 /**
  * Logs worker issues to the database for monitoring and debugging
@@ -41,11 +40,10 @@ export async function deleteMessageWithRetries(
   delayMs: number = 500
 ): Promise<boolean> {
   let attempt = 0;
-  let deleted = false;
 
   console.log(`Attempting to delete message ${messageId} from queue ${queueName}`);
 
-  while (attempt < maxRetries && !deleted) {
+  while (attempt < maxRetries) {
     try {
       // Use database function to delete message
       const { data, error } = await supabase.rpc(
@@ -63,7 +61,7 @@ export async function deleteMessageWithRetries(
         console.warn(`Database deletion failed for message ${messageId}:`, error);
       }
 
-      // If failed, try the more reliable function
+      // If failed, try the reset function as a fallback
       try {
         const { data: resetData, error: resetError } = await supabase.rpc(
           'reset_stuck_message',
@@ -182,23 +180,37 @@ export async function processQueueMessageSafely(
       }
       
       // Check for deduplication
+      let isDuplicate = false;
       if (deduplicationService) {
-        const isDuplicate = await deduplicationService.isDuplicate(queueName, idempotencyKey);
-        if (isDuplicate) {
-          console.log(`Message ${messageId} (key: ${idempotencyKey}) deduplicated, skipping`);
-          
-          // Delete message from queue to prevent reprocessing
-          await deleteMessageWithRetries(supabase, queueName, messageId);
-          
-          return { deduplication: true, skipped: true, reason: "deduplicated" };
-        } else {
-          // Mark as processed once we confirm it's not a duplicate
-          await deduplicationService.markAsProcessed(queueName, idempotencyKey);
+        try {
+          isDuplicate = await deduplicationService.isDuplicate(queueName, idempotencyKey);
+          if (isDuplicate) {
+            console.log(`Message ${messageId} (key: ${idempotencyKey}) deduplicated, skipping`);
+            
+            // Delete message from queue to prevent reprocessing
+            await deleteMessageWithRetries(supabase, queueName, messageId);
+            
+            return { deduplication: true, skipped: true, reason: "deduplicated" };
+          }
+        } catch (dedupError) {
+          // If deduplication check fails, log but continue processing
+          // This is safer than failing the whole job
+          console.error(`Deduplication check failed for ${messageId}: ${dedupError.message}`);
         }
       }
       
       // Process the message
       const result = await processMessage();
+      
+      // If successful, mark as processed in deduplication service
+      if (deduplicationService && !isDuplicate) {
+        try {
+          await deduplicationService.markAsProcessed(queueName, idempotencyKey);
+        } catch (markError) {
+          // Non-fatal: Log but continue
+          console.warn(`Failed to mark ${idempotencyKey} as processed: ${markError.message}`);
+        }
+      }
       
       // If successful, delete message from queue
       await deleteMessageWithRetries(supabase, queueName, messageId);
@@ -209,7 +221,9 @@ export async function processQueueMessageSafely(
       console.error(`Attempt ${attempt + 1} to process message ${messageId} failed:`, error);
       
       attempt++;
-      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      if (attempt <= maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs * attempt));
+      }
     }
   }
   
@@ -233,137 +247,159 @@ export async function processQueueMessageSafely(
 }
 
 /**
- * Enqueues a message to a Supabase queue with proper deduplication
- * Returns true if enqueued successfully, false if deduplicated or error
+ * Enqueues a message to a Supabase queue using direct SQL functions
+ * @returns true if enqueued successfully, false if error
  */
 export async function enqueueMessage(
   supabase: any,
   queueName: string,
   message: any,
   deduplicationKey?: string,
-  deduplicationService?: DeduplicationService
+  redis?: Redis
 ): Promise<boolean> {
   try {
-    // Check if we should deduplicate this message
-    if (deduplicationKey && deduplicationService) {
+    // Basic validation
+    if (!queueName) {
+      console.error("Queue name is required");
+      return false;
+    }
+    
+    // Check for deduplication if Redis and key are provided
+    if (deduplicationKey && redis) {
       try {
-        const isDuplicate = await deduplicationService.isDuplicate(queueName, deduplicationKey);
-        if (isDuplicate) {
-          console.log(`Message with key ${deduplicationKey} already queued in ${queueName}, skipping`);
-          return false;
+        const dedupKey = `enqueued:${queueName}:${deduplicationKey}`;
+        const exists = await redis.exists(dedupKey);
+        
+        if (exists === 1) {
+          console.log(`Duplicate job skipped: ${queueName} with key ${deduplicationKey}`);
+          return false; // Already enqueued, not an error
         }
         
-        // Since not a duplicate, mark it as being processed
-        await deduplicationService.markAsProcessed(queueName, deduplicationKey);
-      } catch (dedupError) {
-        // Log but continue - deduplication errors shouldn't block queueing
-        console.warn(`Deduplication error for ${queueName}:${deduplicationKey}, proceeding anyway:`, dedupError);
+        // Set deduplication key with 24h TTL
+        await redis.set(dedupKey, new Date().toISOString(), { ex: 86400 });
+      } catch (redisError) {
+        // If Redis fails, log but continue with enqueueing
+        console.warn(`Redis deduplication check failed for ${queueName}:${deduplicationKey}, proceeding anyway:`, redisError.message);
       }
     }
     
-    // Use the most reliable direct database function
-    try {
-      // Try specialized function first if available
-      if (queueName === 'album_discovery' && message.artistId) {
-        const { data, error } = await supabase.rpc(
-          'start_album_discovery',
-          { artist_id: message.artistId, offset_val: message.offset || 0 }
-        );
-        
-        if (error) {
-          throw new Error(`Error calling start_album_discovery: ${error.message}`);
-        }
-        
-        console.log(`Successfully enqueued album discovery for artist ${message.artistId}, message ID: ${data}`);
-        return true;
-      }
-      
-      if (queueName === 'track_discovery' && message.albumId) {
-        const { data, error } = await supabase.rpc(
-          'start_track_discovery',
-          { album_id: message.albumId, offset_val: message.offset || 0 }
-        );
-        
-        if (error) {
-          throw new Error(`Error calling start_track_discovery: ${error.message}`);
-        }
-        
-        console.log(`Successfully enqueued track discovery for album ${message.albumId}, message ID: ${data}`);
-        return true;
-      }
-      
-      if (queueName === 'artist_discovery' && message.artistName) {
-        const { data, error } = await supabase.rpc(
-          'start_artist_discovery',
-          { artist_name: message.artistName }
-        );
-        
-        if (error) {
-          throw new Error(`Error calling start_artist_discovery: ${error.message}`);
-        }
-        
-        console.log(`Successfully enqueued artist discovery for ${message.artistName}, message ID: ${data}`);
-        return true;
-      }
-      
-      if (queueName === 'producer_identification' && message.trackId) {
-        const { data, error } = await supabase.rpc(
-          'start_producer_identification',
-          { track_id: message.trackId }
-        );
-        
-        if (error) {
-          throw new Error(`Error calling start_producer_identification: ${error.message}`);
-        }
-        
-        console.log(`Successfully enqueued producer identification for track ${message.trackId}, message ID: ${data}`);
-        return true;
-      }
-      
-      // General case - use generic pg_enqueue
+    // Use specialized function based on queue type
+    if (queueName === 'album_discovery' && message.artistId) {
       const { data, error } = await supabase.rpc(
-        'pg_enqueue',
-        { 
-          queue_name: queueName, 
-          message_body: {
-            ...message,
-            _idempotencyKey: deduplicationKey || `${queueName}:${Date.now()}:${Math.random().toString(36).substring(2, 10)}`
-          }
-        }
+        'start_album_discovery',
+        { artist_id: message.artistId, offset_val: message.offset || 0 }
       );
       
       if (error) {
-        throw new Error(`Error enqueueing to ${queueName}: ${error.message}`);
-      }
-      
-      console.log(`Successfully enqueued message to ${queueName}, message ID: ${data}`);
-      return true;
-    } catch (rpcError) {
-      console.error(`Failed to enqueue message to ${queueName} using database function:`, rpcError);
-      
-      // Fall back to Edge Function if database RPC failed
-      try {
-        const { error } = await supabase.functions.invoke("sendToQueue", {
-          body: {
-            queue_name: queueName,
-            message: message
-          }
-        });
-
-        if (error) {
-          console.error(`Error from sendToQueue Edge Function:`, error);
-          return false;
-        }
-
-        console.log(`Successfully enqueued message to ${queueName} via Edge Function`);
-        return true;
-      } catch (fnError) {
-        console.error(`Failed to call sendToQueue Edge Function:`, fnError);
+        console.error(`Error calling start_album_discovery: ${error.message}`);
         return false;
       }
+      
+      console.log(`Successfully enqueued album discovery for artist ${message.artistId}, message ID: ${data}`);
+      return true;
     }
+    
+    if (queueName === 'track_discovery' && message.albumId) {
+      const { data, error } = await supabase.rpc(
+        'start_track_discovery',
+        { album_id: message.albumId, offset_val: message.offset || 0 }
+      );
+      
+      if (error) {
+        console.error(`Error calling start_track_discovery: ${error.message}`);
+        return false;
+      }
+      
+      console.log(`Successfully enqueued track discovery for album ${message.albumId}, message ID: ${data}`);
+      return true;
+    }
+    
+    if (queueName === 'artist_discovery' && message.artistName) {
+      const { data, error } = await supabase.rpc(
+        'start_artist_discovery',
+        { artist_name: message.artistName }
+      );
+      
+      if (error) {
+        console.error(`Error calling start_artist_discovery: ${error.message}`);
+        return false;
+      }
+      
+      console.log(`Successfully enqueued artist discovery for ${message.artistName}, message ID: ${data}`);
+      return true;
+    }
+    
+    if (queueName === 'producer_identification' && message.trackId) {
+      const { data, error } = await supabase.rpc(
+        'start_producer_identification',
+        { track_id: message.trackId }
+      );
+      
+      if (error) {
+        console.error(`Error calling start_producer_identification: ${error.message}`);
+        return false;
+      }
+      
+      console.log(`Successfully enqueued producer identification for track ${message.trackId}, message ID: ${data}`);
+      return true;
+    }
+    
+    // General case - use generic pg_enqueue
+    const { data, error } = await supabase.rpc(
+      'pg_enqueue',
+      { 
+        queue_name: queueName, 
+        message_body: {
+          ...message,
+          _idempotencyKey: deduplicationKey || `${queueName}:${Date.now()}:${Math.random().toString(36).substring(2, 10)}`
+        }
+      }
+    );
+    
+    if (error) {
+      console.error(`Error enqueueing to ${queueName}: ${error.message}`);
+      return false;
+    }
+    
+    console.log(`Successfully enqueued message to ${queueName}, message ID: ${data}`);
+    return true;
   } catch (error) {
     console.error(`Exception enqueueing message to queue ${queueName}:`, error);
     return false;
   }
 }
+
+/**
+ * Acquire a processing lock for distributed processing
+ */
+export async function acquireProcessingLock(
+  entityType: string,
+  entityId: string,
+  ttlSeconds: number = 300
+): Promise<boolean> {
+  try {
+    // Use a simple Redis check for brevity
+    const redis = new Redis({
+      url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+      token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+    });
+    
+    const lockKey = `lock:${entityType}:${entityId}`;
+    const now = new Date().toISOString();
+    
+    // Try to set the lock with NX (only set if not exists)
+    const result = await redis.set(lockKey, now, {
+      nx: true,
+      ex: ttlSeconds
+    });
+    
+    return result === "OK";
+  } catch (error) {
+    // On Redis error, log but continue (safer to allow processing)
+    console.error(`Failed to acquire processing lock for ${entityType}:${entityId}: ${error.message}`);
+    return true;
+  }
+}
+
+// Import from local module for use in function above
+import { DeduplicationService } from "./deduplication.ts";
