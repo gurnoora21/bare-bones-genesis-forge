@@ -127,33 +127,38 @@ class ArtistDiscoveryWorker extends createEnhancedWorker<any> {
     
     // Queue album discovery ONLY AFTER successfully inserting the artist
     // This way, if album queue fails, we still have the artist record
-    const albumEnqueued = await queueHelper.enqueue('album_discovery', {
-      artistId: dbArtistId,
-      offset: 0
-    });
-    
-    if (!albumEnqueued) {
-      throw new Error(`Failed to queue album discovery for artist ${dbArtistId}`);
+    try {
+      const albumEnqueued = await queueHelper.enqueue('album_discovery', {
+        artistId: dbArtistId,
+        offset: 0
+      });
+
+      if (!albumEnqueued) {
+        throw new Error(`Failed to queue album discovery for artist ${dbArtistId}`);
+      }
+      
+      console.log(`Successfully queued album discovery for artist ${dbArtistId}`);
+      
+      // Only mark as processed AFTER successfully enqueuing albums
+      // This ensures failures in queueing will be retried
+      await deduplicationService.markAsProcessed(
+        'artist_discovery', 
+        dedupKey,
+        86400, // 24 hour TTL
+        { entityId: dbArtistId?.toString() }
+      );
+      
+      return { 
+        status: 'completed', 
+        artistId: dbArtistId,
+        spotifyId: spotifyArtist.id,
+        name: spotifyArtist.name,
+        albumEnqueued: true 
+      };
+    } catch (error) {
+      console.error(`Error queueing album discovery: ${error.message}`);
+      throw error; // Re-throw to ensure the message stays visible for retry
     }
-    
-    console.log(`Successfully queued album discovery for artist ${dbArtistId}`);
-    
-    // Only mark as processed AFTER successfully enqueuing albums
-    // This ensures failures in queueing will be retried
-    await deduplicationService.markAsProcessed(
-      'artist_discovery', 
-      dedupKey,
-      86400, // 24 hour TTL
-      { entityId: dbArtistId?.toString() }
-    );
-    
-    return { 
-      status: 'completed', 
-      artistId: dbArtistId,
-      spotifyId: spotifyArtist.id,
-      name: spotifyArtist.name,
-      albumEnqueued: true 
-    };
   }
 }
 
