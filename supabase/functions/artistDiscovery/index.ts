@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -266,7 +265,7 @@ serve(async (req) => {
                 supabase,
                 "artist_discovery",
                 messageId.toString(),
-                async () => await processArtistWithoutCache(supabase, spotifyClient, msg),
+                async () => await processArtistWithoutCache(supabase, spotifyClient, msg, redis),
                 idempotencyKey, 
                 async () => {
                   // Check if this artist was already processed
@@ -395,13 +394,14 @@ serve(async (req) => {
   }
 });
 
-// Updated fallback implementation to use direct API methods without Redis caching
+// Updated implementation to bypass Redis issues and ensure proper album queueing
 async function processArtistWithoutCache(
   supabase: any, 
   spotifyClient: any, 
-  msg: ArtistDiscoveryMsg
+  msg: ArtistDiscoveryMsg,
+  redis: Redis
 ) {
-  console.log("Processing artist without Redis cache:", msg);
+  console.log("Processing artist:", msg);
   const { artistId, artistName } = msg;
   
   if (!artistId && !artistName) {
@@ -429,7 +429,7 @@ async function processArtistWithoutCache(
     
     artistData = await response.json();
   } else if (artistName) {
-    console.log(`Searching for artist by name (no cache): ${artistName}`);
+    console.log(`Searching for artist by name: ${artistName}`);
     
     // Search for artist by name - direct API call
     const response = await fetch(
@@ -485,52 +485,39 @@ async function processArtistWithoutCache(
 
   console.log(`Stored artist in database with ID: ${artist.id}`);
 
-  // FIX: Don't stringify the message body - pass it directly as a JSONB object
-  // The pg_enqueue function expects JSONB directly
-  const { data: enqueueData, error: queueError } = await supabase.rpc('pg_enqueue', {
-    queue_name: 'album_discovery',
-    message_body: { 
-      artistId: artist.id, 
-      offset: 0,
-      _idempotencyKey: `artist:${artist.id}:albums:offset:0` 
-    }
-  });
-
-  if (queueError) {
-    console.error("Error enqueueing album discovery:", queueError);
-    
-    // Additional logging to debug the structure
-    console.error("Failed message structure:", {
-      queue_name: 'album_discovery',
-      message_body: { 
-        artistId: artist.id, 
-        offset: 0 
-      }
-    });
-    
-    // Try an alternative approach with a direct db call
+  // IMPORTANT: Mark this artist as processed in Redis before enqueueing albums
+  if (artistName) {
     try {
-      console.log("Attempting direct queue function call as fallback...");
-      const { data: directData, error: directError } = await supabase.rpc(
-        'start_album_discovery',
-        { 
-          artist_id: artist.id,
-          offset_val: 0
-        }
-      );
-      
-      if (directError) {
-        console.error("Direct queue function also failed:", directError);
-        throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
-      } else {
-        console.log("Direct queue function succeeded:", directData);
-      }
-    } catch (directError) {
-      console.error("Exception in direct queue function:", directError);
-      throw new Error(`Error enqueueing album discovery: ${queueError.message}`);
+      const artistKey = `processed:artist:name:${artistName.toLowerCase()}`;
+      await redis.set(artistKey, 'true', { ex: 86400 });
+      console.log(`Marked artist ${artistName} as processed in Redis`);
+    } catch (redisError) {
+      console.warn(`Failed to mark artist ${artistName} as processed in Redis:`, redisError);
+      // Continue anyway - we don't want Redis issues to block album discovery
     }
-  } else {
-    console.log(`Successfully enqueued album discovery for artist ID ${artist.id}, message ID: ${enqueueData}`);
+  }
+
+  // Critical fix: Let's bypass Redis deduplication for album discovery 
+  // by using direct database function call for maximum reliability
+  try {
+    console.log(`Enqueueing album discovery for artist ID ${artist.id} using start_album_discovery function`);
+    const { data: directData, error: directError } = await supabase.rpc(
+      'start_album_discovery',
+      { 
+        artist_id: artist.id,
+        offset_val: 0
+      }
+    );
+    
+    if (directError) {
+      console.error("Error calling start_album_discovery:", directError);
+      throw new Error(`Error enqueueing album discovery: ${directError.message}`);
+    } else {
+      console.log("Album discovery enqueuing succeeded:", directData);
+    }
+  } catch (enqueueError) {
+    console.error("Exception in album discovery enqueue:", enqueueError);
+    throw new Error(`Error enqueueing album discovery: ${enqueueError.message}`);
   }
 
   console.log(`Processed artist ${artistData.name}, enqueued album discovery for artist ID ${artist.id}`);

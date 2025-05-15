@@ -18,6 +18,7 @@ export interface DeduplicationOptions {
   ttlSeconds?: number;
   useStrictPayloadMatch?: boolean;
   logDetails?: boolean;
+  bypassForQueues?: string[]; // New option to bypass deduplication for specific queues
 }
 
 export interface DeduplicationContext {
@@ -31,11 +32,20 @@ export class DeduplicationService {
   private circuitBreakerState = {
     failures: 0,
     lastFailure: 0,
-    isOpen: false
+    isOpen: false,
+    lastReset: 0
   };
   
   constructor(redis: Redis) {
     this.redis = redis;
+    // Auto-reset circuit breaker every 2 minutes to prevent permanent outage
+    setInterval(() => {
+      if (this.circuitBreakerState.isOpen && 
+          Date.now() - this.circuitBreakerState.lastReset > 120000) {
+        console.log('Auto-resetting circuit breaker after 2 minutes');
+        this.resetCircuitBreaker();
+      }
+    }, 30000);
   }
   
   /**
@@ -49,10 +59,19 @@ export class DeduplicationService {
   ): Promise<boolean> {
     const {
       ttlSeconds = getEnvironmentTTL(),
-      logDetails = false
+      logDetails = false,
+      bypassForQueues = []
     } = options;
     
     const correlationId = context.correlationId || 'untracked';
+    
+    // Bypass for specific queues
+    if (bypassForQueues.includes(namespace)) {
+      if (logDetails) {
+        console.log(`[${correlationId}] Bypassing deduplication for ${namespace}:${key} as it's in bypass list`);
+      }
+      return false;
+    }
     
     // If circuit breaker is open, default to non-duplicate
     if (this.isCircuitOpen()) {
@@ -104,35 +123,51 @@ export class DeduplicationService {
       return;
     }
     
-    try {
-      // Create a namespaced key for Redis
-      const dedupKey = this.createDeduplicationKey(namespace, key);
-      
-      // Store the processing timestamp with TTL
-      const processedData = {
-        timestamp: new Date().toISOString(),
-        correlationId: context.correlationId,
-        operation: context.operation,
-        source: context.source || 'unknown'
-      };
-      
-      const result = await this.redis.set(
-        dedupKey,
-        JSON.stringify(processedData),
-        {
-          ex: effectiveTtl
+    // Create 3 attempts with exponential backoff
+    let attempts = 0;
+    const maxRetries = 3;
+    
+    while (attempts < maxRetries) {
+      try {
+        // Create a namespaced key for Redis
+        const dedupKey = this.createDeduplicationKey(namespace, key);
+        
+        // Store the processing timestamp with TTL
+        const processedData = {
+          timestamp: new Date().toISOString(),
+          correlationId: context.correlationId,
+          operation: context.operation,
+          source: context.source || 'unknown'
+        };
+        
+        const result = await this.redis.set(
+          dedupKey,
+          JSON.stringify(processedData),
+          {
+            ex: effectiveTtl
+          }
+        );
+        
+        // Reset circuit breaker on success
+        this.resetCircuitBreaker();
+        
+        if (result !== "OK") {
+          console.warn(`[${correlationId}] Failed to mark ${namespace}:${key} as processed: ${result}`);
         }
-      );
-      
-      // Reset circuit breaker on success
-      this.resetCircuitBreaker();
-      
-      if (result !== "OK") {
-        console.warn(`[${correlationId}] Failed to mark ${namespace}:${key} as processed: ${result}`);
+        
+        return; // Success
+      } catch (error) {
+        attempts++;
+        console.warn(`[${correlationId}] Error marking as processed (attempt ${attempts}): ${error.message}`);
+        
+        if (attempts >= maxRetries) {
+          this.incrementCircuitFailure();
+          return; // Give up
+        }
+        
+        // Wait with exponential backoff
+        await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts) * 100));
       }
-    } catch (error) {
-      console.warn(`[${correlationId}] Error marking as processed: ${error.message}`);
-      this.incrementCircuitFailure();
     }
   }
   
@@ -213,8 +248,12 @@ export class DeduplicationService {
             for (let i = 0; i < keysToDelete.length; i += 50) {
               const batch = keysToDelete.slice(i, i + 50);
               if (batch.length > 0) {
-                const deleteCount = await this.redis.del(...batch);
-                totalDeleted += deleteCount;
+                try {
+                  const deleteCount = await this.redis.del(...batch);
+                  totalDeleted += deleteCount;
+                } catch (deleteError) {
+                  console.warn(`Error deleting batch: ${deleteError.message}`);
+                }
               }
             }
           }
@@ -225,6 +264,42 @@ export class DeduplicationService {
     } catch (error) {
       console.error(`Error clearing deduplication keys: ${error.message}`);
       this.incrementCircuitFailure();
+      return 0;
+    }
+  }
+  
+  /**
+   * Force clear all keys for a specific queue
+   * This is a heavier operation but helpful in error cases
+   */
+  async forceClearNamespace(namespace: string): Promise<number> {
+    try {
+      // Use the more forceful KEYS command instead of SCAN for force clearing
+      // Note: This is safe since we're narrowing with strict prefix
+      const keys = await this.redis.keys(`dedup:${namespace}:*`);
+      
+      if (keys && keys.length > 0) {
+        let totalDeleted = 0;
+        
+        // Delete in batches to avoid huge commands
+        for (let i = 0; i < keys.length; i += 50) {
+          const batch = keys.slice(i, i + 50);
+          if (batch.length > 0) {
+            try {
+              const deleteCount = await this.redis.del(...batch);
+              totalDeleted += deleteCount;
+            } catch (deleteError) {
+              console.warn(`Error force deleting batch: ${deleteError.message}`);
+            }
+          }
+        }
+        
+        return totalDeleted;
+      }
+      
+      return 0;
+    } catch (error) {
+      console.error(`Error force clearing keys for ${namespace}: ${error.message}`);
       return 0;
     }
   }
@@ -266,7 +341,8 @@ export class DeduplicationService {
     this.circuitBreakerState = {
       failures: 0,
       lastFailure: 0,
-      isOpen: false
+      isOpen: false,
+      lastReset: Date.now()
     };
   }
 }
