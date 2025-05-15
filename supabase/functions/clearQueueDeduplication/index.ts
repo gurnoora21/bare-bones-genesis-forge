@@ -1,8 +1,6 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { DeduplicationService } from "../_shared/deduplication.ts";
 
 // CORS headers
 const corsHeaders = {
@@ -28,9 +26,6 @@ serve(async (req) => {
       url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
       token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
     });
-    
-    // Get the deduplication service
-    const deduplicationService = new DeduplicationService(redis);
     
     // Parse request data
     let queueName: string;
@@ -59,24 +54,39 @@ serve(async (req) => {
     
     let clearedKeys = 0;
     
-    // Clear deduplication keys
-    if (force) {
-      // Force clear all keys for the namespace (more aggressive)
-      clearedKeys = await deduplicationService.forceClearNamespace(queueName);
-    } else {
-      // Use normal clear with pattern if provided
-      clearedKeys = await deduplicationService.clearKeys(queueName, pattern);
+    // Simple operation: just clear all Redis keys related to this queue
+    try {
+      // Use the more direct KEYS command for simplicity
+      const keys = await redis.keys(`dedup:${queueName}:*`);
+      
+      if (keys && keys.length > 0) {
+        // Delete in batches to avoid huge commands
+        for (let i = 0; i < keys.length; i += 50) {
+          const batch = keys.slice(i, i + 50);
+          if (batch.length > 0) {
+            try {
+              const deleteCount = await redis.del(...batch);
+              clearedKeys += deleteCount;
+            } catch (deleteError) {
+              console.warn(`Error deleting batch: ${deleteError.message}`);
+            }
+          }
+        }
+      }
+    } catch (redisError) {
+      console.error(`Redis operation failed: ${redisError.message}`);
+      // Continue anyway to try the DB operation - this is crucial
     }
     
-    // Check if we need to trigger immediate album discovery jobs
-    // This specifically helps with fixing broken album discovery pipelines
+    // For album and artist discovery, always try to re-queue some jobs
+    // This is key to ensuring the pipeline keeps running even if Redis fails
     if (queueName === 'album_discovery' || queueName === 'artist_discovery') {
       // Get recent artists that might need album discovery
       const { data: artists, error } = await supabase
         .from('artists')
         .select('id')
         .order('created_at', { ascending: false })
-        .limit(5);
+        .limit(10);
       
       if (error) {
         return new Response(
