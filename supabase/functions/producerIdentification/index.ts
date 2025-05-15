@@ -4,7 +4,7 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { IdempotentWorker, WorkerContext, ProcessingResult } from "../_shared/idempotentWorker.ts";
+import { IdempotentWorker } from "../_shared/idempotentWorker.ts";
 import { getApiResilienceManager } from "../_shared/apiResilienceManager.ts";
 import { createEnhancedGeniusClient } from "../_shared/enhancedGeniusClient.ts";
 
@@ -44,16 +44,9 @@ interface ProducerIdentificationMessage {
   _idempotencyKey?: string;
 }
 
-class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificationMessage, any> {
+class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificationMessage> {
   constructor() {
-    // Configure worker options
-    super({
-      queueName: 'producer_identification',
-      deadLetterQueueName: 'producer_identification_dlq',
-      batchSize: 3,  // Process 3 messages at a time
-      visibilityTimeoutSeconds: 120,  // 2 minutes timeout
-      maxRetryAttempts: 3
-    });
+    super('producer_identification', supabase, redis);
   }
 
   /**
@@ -93,13 +86,10 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
   }
   
   /**
-   * Main message processing logic
+   * Process a message from the queue
    */
-  protected async processMessage(
-    message: ProducerIdentificationMessage, 
-    context: WorkerContext
-  ): Promise<ProcessingResult> {
-    console.log(`[${context.correlationId}] Processing producer identification for track ${message.trackId || message.track_id}`);
+  async processMessage(message: ProducerIdentificationMessage): Promise<any> {
+    console.log(`Processing producer identification for track ${message.trackId || message.track_id}`);
     
     try {
       // Get track ID (supporting both property names)
@@ -108,7 +98,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       if (!trackId) {
         return { 
           success: false, 
-          error: new Error('No track ID provided in message') 
+          error: "No track ID provided in message"
         };
       }
       
@@ -131,10 +121,10 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         .single();
       
       if (trackError) {
-        console.error(`[${context.correlationId}] Error fetching track:`, trackError);
+        console.error(`Error fetching track:`, trackError);
         return { 
           success: false, 
-          error: new Error(`Failed to fetch track: ${trackError.message}`),
+          error: `Failed to fetch track: ${trackError.message}`,
           metadata: { trackId }
         };
       }
@@ -142,7 +132,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       if (!track) {
         return { 
           success: false, 
-          error: new Error(`Track not found with ID: ${trackId}`),
+          error: `Track not found with ID: ${trackId}`,
           metadata: { trackId } 
         };
       }
@@ -154,46 +144,46 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       if (!artistName || !trackName) {
         return { 
           success: false, 
-          error: new Error(`Incomplete track data: ${JSON.stringify({ artistName, trackName })}`),
+          error: `Incomplete track data: ${JSON.stringify({ artistName, trackName })}`,
           metadata: { trackId, track }
         };
       }
       
-      console.log(`[${context.correlationId}] Searching for '${trackName} by ${artistName}'`);
+      console.log(`Searching for '${trackName} by ${artistName}'`);
       
       // Search for track on Genius using direct DB query acquisition
       try {
         // Bypass circuit breaker logic for now and use direct DB acquisition
         // IMPORTANT: Using direct database lock acquisition to avoid potential issues
-        await this.acquireDirectDbLock(trackId, context.correlationId);
+        await this.acquireDirectDbLock(trackId);
         
         // Only proceed if we were able to acquire the lock
         const searchQuery = `${trackName} ${artistName}`;
         const searchResult = await geniusClient.searchSong(searchQuery);
         
         if (!searchResult.hits || searchResult.hits.length === 0) {
-          console.log(`[${context.correlationId}] No search results found`);
+          console.log(`No search results found`);
           return { 
             success: true,  // Mark as success with no results
             metadata: { trackId, searchQuery, found: false }
           };
         }
         
-        console.log(`[${context.correlationId}] Found ${searchResult.hits.length} results, processing first match`);
+        console.log(`Found ${searchResult.hits.length} results, processing first match`);
         
         // Process first match
         const firstMatch = searchResult.hits[0].result;
         const songId = firstMatch.id;
         
         // Get song details from Genius
-        console.log(`[${context.correlationId}] Getting details for song ID ${songId}`);
+        console.log(`Getting details for song ID ${songId}`);
         const songData = await geniusClient.getSongById(songId);
         
         // Extract producer information
         const producers = songData.song.producer_artists || [];
         
-        // Process producers with transaction
-        const processResult = await this.processProducers(producers, trackId, context.correlationId);
+        // Process producers 
+        const processResult = await this.processProducers(producers, trackId);
         
         return {
           success: true,
@@ -206,7 +196,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
           }
         };
       } catch (error) {
-        console.error(`[${context.correlationId}] Error processing track:`, error);
+        console.error(`Error processing track:`, error);
         return {
           success: false,
           error,
@@ -217,11 +207,11 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         try {
           await this.releaseDirectDbLock(trackId);
         } catch (lockError) {
-          console.error(`[${context.correlationId}] Error releasing lock:`, lockError);
+          console.error(`Error releasing lock:`, lockError);
         }
       }
     } catch (error) {
-      console.error(`[${context.correlationId}] Uncaught error:`, error);
+      console.error(`Uncaught error:`, error);
       return {
         success: false,
         error,
@@ -235,14 +225,12 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
    */
   private async processProducers(
     producers: Array<{ id: number; name: string; url?: string }>,
-    trackId: string,
-    correlationId: string
+    trackId: string
   ): Promise<any> {
-    // Create a transaction for producer processing
-    return await this.transactionManager.transaction(async (client) => {
-      const results = [];
-      
-      for (const producer of producers) {
+    const results = [];
+    
+    for (const producer of producers) {
+      try {
         // Check if producer exists in database
         const { data: existingProducer, error: findError } = await this.supabase
           .from('producers')
@@ -251,7 +239,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
           .maybeSingle();
         
         if (findError) {
-          console.error(`[${correlationId}] Error finding producer:`, findError);
+          console.error(`Error finding producer:`, findError);
           continue;
         }
         
@@ -271,7 +259,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
             .single();
           
           if (insertError) {
-            console.error(`[${correlationId}] Error inserting producer:`, insertError);
+            console.error(`Error inserting producer:`, insertError);
             continue;
           }
           
@@ -281,7 +269,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         }
         
         if (!producerId) {
-          console.error(`[${correlationId}] Failed to get producer ID for ${producer.name}`);
+          console.error(`Failed to get producer ID for ${producer.name}`);
           continue;
         }
         
@@ -295,11 +283,11 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
             source: 'genius'
           }, { 
             onConflict: 'track_id,producer_id',
-            ignoreDuplicates: true  // Or update with { count: track_producers.count + 1 }
+            ignoreDuplicates: true
           });
         
         if (relationError) {
-          console.error(`[${correlationId}] Error creating track-producer relationship:`, relationError);
+          console.error(`Error creating track-producer relationship:`, relationError);
         } else {
           results.push({
             producer_id: producerId,
@@ -307,20 +295,19 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
             added: !existingProducer
           });
         }
+      } catch (error) {
+        console.error(`Error processing producer ${producer.name}:`, error);
       }
-      
-      return { producersProcessed: results };
-    }, {
-      correlationId,
-      isolationLevel: 'read committed'  // Lower isolation level for better concurrency
-    });
+    }
+    
+    return { producersProcessed: results };
   }
   
   /**
    * Acquire a direct database lock bypassing Redis
    * This is a fallback mechanism for when Redis may be unavailable
    */
-  private async acquireDirectDbLock(trackId: string, correlationId: string): Promise<boolean> {
+  private async acquireDirectDbLock(trackId: string): Promise<boolean> {
     try {
       // Try using the RPC function first (preferred way)
       const { data: lockAcquired, error: lockError } = await this.supabase.rpc(
@@ -328,13 +315,12 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         {
           p_entity_type: 'track',
           p_entity_id: trackId,
-          p_timeout_minutes: 10,
-          p_correlation_id: correlationId
+          p_timeout_minutes: 10
         }
       );
       
       if (lockError) {
-        console.error(`[${correlationId}] Error acquiring lock via RPC:`, lockError);
+        console.error(`Error acquiring lock via RPC:`, lockError);
         
         // Fallback to direct SQL approach
         const entityType = 'track';
@@ -363,13 +349,13 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
                 )
                 VALUES (
                   $1, $2, 'IN_PROGRESS', NOW(), 
-                  jsonb_build_object('correlation_id', $3, 'direct_lock', true)
+                  jsonb_build_object('direct_lock', true)
                 )
                 ON CONFLICT (entity_type, entity_id) DO UPDATE
                 SET 
                   state = 'IN_PROGRESS',
                   last_processed_at = NOW(),
-                  metadata = jsonb_build_object('correlation_id', $3, 'direct_lock', true),
+                  metadata = jsonb_build_object('direct_lock', true),
                   updated_at = NOW()
                 WHERE 
                   -- Only update if not already IN_PROGRESS or COMPLETED
@@ -385,12 +371,12 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
               
               COMMIT;
             `,
-            params: [entityType, trackId, correlationId]
+            params: [entityType, trackId]
           }
         );
         
         if (error) {
-          console.error(`[${correlationId}] Error acquiring direct lock:`, error);
+          console.error(`Error acquiring direct lock:`, error);
           return false;
         }
         
@@ -400,7 +386,7 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       
       return !!lockAcquired;
     } catch (error) {
-      console.error(`[${correlationId}] Exception acquiring lock:`, error);
+      console.error(`Exception acquiring lock:`, error);
       return false;
     }
   }
@@ -455,11 +441,30 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
 const worker = new ProducerIdentificationWorker();
 
 // Export handler for the Edge Function
-serve((req) => {
+serve(async (req) => {
   // CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
   
-  return worker.process(req);
+  try {
+    // Process a batch of messages
+    const result = await worker.processBatch({
+      batchSize: 3,
+      timeoutSeconds: 60,
+      processorName: 'producer-identification',
+      visibilityTimeoutSeconds: 120
+    });
+    
+    // Return the processing results
+    return new Response(JSON.stringify(result), { 
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    });
+  } catch (error) {
+    console.error("Error processing batch:", error);
+    return new Response(JSON.stringify({ error: error.message }), { 
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    });
+  }
 });

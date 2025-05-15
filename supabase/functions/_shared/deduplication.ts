@@ -42,11 +42,9 @@ export class DeduplicationService {
     } = options;
     
     const correlationId = context.correlationId || 'untracked';
+    const dedupKey = this.createDeduplicationKey(namespace, key);
     
     try {
-      // Create a namespaced key for Redis
-      const dedupKey = this.createDeduplicationKey(namespace, key);
-      
       // Check if the key exists
       const exists = await this.redis.exists(dedupKey);
       
@@ -75,11 +73,9 @@ export class DeduplicationService {
     context: DeduplicationContext = {}
   ): Promise<void> {
     const correlationId = context.correlationId || 'untracked';
+    const dedupKey = this.createDeduplicationKey(namespace, key);
     
     try {
-      // Create a namespaced key for Redis
-      const dedupKey = this.createDeduplicationKey(namespace, key);
-      
       // Store the processing timestamp with TTL
       const processedData = {
         timestamp: new Date().toISOString(),
