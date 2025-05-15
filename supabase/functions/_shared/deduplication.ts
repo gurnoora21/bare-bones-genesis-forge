@@ -17,6 +17,7 @@ export interface DeduplicationContext {
   correlationId?: string;
   operation?: string;
   source?: string;
+  entityId?: string;  // Added to support entity-specific keys
 }
 
 export class DeduplicationService {
@@ -28,7 +29,7 @@ export class DeduplicationService {
   
   /**
    * Check if an operation with the given key has already been processed
-   * Returns false on Redis errors to ensure jobs proceed
+   * Returns false on Redis errors to ensure jobs proceed (fail open)
    */
   async isDuplicate(
     namespace: string,
@@ -42,22 +43,28 @@ export class DeduplicationService {
     } = options;
     
     const correlationId = context.correlationId || 'untracked';
-    const dedupKey = this.createDeduplicationKey(namespace, key);
+    const entityId = context.entityId || '';
+    
+    // Create a more specific key that includes the entity ID if available
+    const dedupKey = entityId 
+      ? this.createDeduplicationKey(namespace, `${key}:${entityId}`)
+      : this.createDeduplicationKey(namespace, key);
     
     try {
       // Check if the key exists
       const exists = await this.redis.exists(dedupKey);
       
       if (logDetails) {
-        console.log(`[${correlationId}] Deduplication check for ${namespace}:${key} - Result: ${exists === 1 ? 'Duplicate' : 'New'}`);
+        console.log(`[${correlationId}] Deduplication check for ${namespace}:${key}${entityId ? `:${entityId}` : ''} - Result: ${exists === 1 ? 'Duplicate' : 'New'}`);
       }
       
       return exists === 1;
     } catch (error) {
-      // On Redis error, log but don't block the job
-      console.error(`[${correlationId}] Deduplication check failed for ${namespace}:${key}: ${error.message}`);
+      // On Redis error, log but don't block the job (fail open)
+      console.error(`[${correlationId}] Deduplication check failed for ${namespace}:${key}${entityId ? `:${entityId}` : ''}: ${error.message}`);
       
-      // Critical change: Return false (not a duplicate) to allow the job to proceed
+      // Always return false (not a duplicate) to allow the job to proceed
+      // when Redis is unavailable - critical for pipeline continuity
       return false;
     }
   }
@@ -73,7 +80,12 @@ export class DeduplicationService {
     context: DeduplicationContext = {}
   ): Promise<void> {
     const correlationId = context.correlationId || 'untracked';
-    const dedupKey = this.createDeduplicationKey(namespace, key);
+    const entityId = context.entityId || '';
+    
+    // Create a more specific key that includes the entity ID if available
+    const dedupKey = entityId 
+      ? this.createDeduplicationKey(namespace, `${key}:${entityId}`)
+      : this.createDeduplicationKey(namespace, key);
     
     try {
       // Store the processing timestamp with TTL
@@ -81,9 +93,11 @@ export class DeduplicationService {
         timestamp: new Date().toISOString(),
         correlationId: context.correlationId,
         operation: context.operation,
-        source: context.source || 'unknown'
+        source: context.source || 'unknown',
+        entityId: context.entityId
       };
       
+      // Always set an expiry (TTL) to prevent leaking keys
       const result = await this.redis.set(
         dedupKey,
         JSON.stringify(processedData),
@@ -93,11 +107,12 @@ export class DeduplicationService {
       );
       
       if (result !== "OK") {
-        console.warn(`[${correlationId}] Failed to mark ${namespace}:${key} as processed: ${result}`);
+        console.warn(`[${correlationId}] Failed to mark ${namespace}:${key}${entityId ? `:${entityId}` : ''} as processed: ${result}`);
       }
     } catch (error) {
-      // Log error but don't block execution
+      // Log error but don't block execution (fail open)
       console.error(`[${correlationId}] Error marking as processed: ${error.message}`);
+      // Continue execution - pipeline should not stop due to Redis unavailability
     }
   }
   

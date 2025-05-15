@@ -7,6 +7,7 @@ import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { IdempotentWorker } from "../_shared/idempotentWorker.ts";
 import { getApiResilienceManager } from "../_shared/apiResilienceManager.ts";
 import { createEnhancedGeniusClient } from "../_shared/enhancedGeniusClient.ts";
+import { DeduplicationService, getDeduplicationService } from "../_shared/deduplication.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -28,6 +29,9 @@ const geniusClient = createEnhancedGeniusClient(
 const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
 const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
 const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Initialize deduplication service
+const deduplicationService = getDeduplicationService(redis);
 
 // CORS headers for function responses
 const corsHeaders = {
@@ -151,18 +155,43 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
       
       console.log(`Searching for '${trackName} by ${artistName}'`);
       
-      // Search for track on Genius using direct DB query acquisition
+      // Check if we've already processed this track
+      const isDuplicate = await deduplicationService.isDuplicate(
+        'producer_identification', 
+        'track', 
+        { logDetails: true }, 
+        { entityId: trackId, correlationId: `prod_id_${trackId}` }
+      );
+      
+      if (isDuplicate) {
+        console.log(`Track ${trackId} already processed for producer identification, skipping`);
+        return {
+          success: true,
+          skipped: true,
+          reason: 'already_processed',
+          metadata: { trackId }
+        };
+      }
+      
+      // Bypass circuit breaker logic for now and use direct DB acquisition
+      await this.acquireDirectDbLock(trackId);
+      
       try {
-        // Bypass circuit breaker logic for now and use direct DB acquisition
-        // IMPORTANT: Using direct database lock acquisition to avoid potential issues
-        await this.acquireDirectDbLock(trackId);
-        
         // Only proceed if we were able to acquire the lock
         const searchQuery = `${trackName} ${artistName}`;
         const searchResult = await geniusClient.searchSong(searchQuery);
         
         if (!searchResult.hits || searchResult.hits.length === 0) {
           console.log(`No search results found`);
+          
+          // Mark as processed even though no producers found
+          await deduplicationService.markAsProcessed(
+            'producer_identification',
+            'track',
+            86400, // 24 hour TTL
+            { entityId: trackId, correlationId: `prod_id_${trackId}` }
+          );
+          
           return { 
             success: true,  // Mark as success with no results
             metadata: { trackId, searchQuery, found: false }
@@ -185,6 +214,14 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         // Process producers 
         const processResult = await this.processProducers(producers, trackId);
         
+        // Mark as processed
+        await deduplicationService.markAsProcessed(
+          'producer_identification',
+          'track',
+          86400, // 24 hour TTL
+          { entityId: trackId, correlationId: `prod_id_${trackId}` }
+        );
+        
         return {
           success: true,
           metadata: {
@@ -194,13 +231,6 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
             producersFound: producers.length,
             processResult
           }
-        };
-      } catch (error) {
-        console.error(`Error processing track:`, error);
-        return {
-          success: false,
-          error,
-          metadata: { trackId, artistName, trackName }
         };
       } finally {
         // Be extra careful to release the lock

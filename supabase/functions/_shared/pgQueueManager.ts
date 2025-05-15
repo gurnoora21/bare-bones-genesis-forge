@@ -1,11 +1,10 @@
 
 /**
- * PgQueueManager - PostgreSQL-backed Queue Manager using pgmq
+ * PgQueueManager - PostgreSQL-backed Queue Manager using PGMQ
  * 
- * Provides robust, atomic queue operations using PGMQ with visibility timeouts 
- * and optimized processing patterns to ensure exactly-once processing
+ * Provides robust, atomic queue operations with visibility timeouts and retry mechanisms
  */
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 
 interface QueueMessage {
   id: string;
@@ -24,10 +23,10 @@ interface QueueOptions {
 }
 
 export class PgQueueManager {
-  private supabase: any;
+  private supabase: SupabaseClient;
   private retryOptions: { maxRetries: number, delayMs: number };
 
-  constructor(supabase?: any) {
+  constructor(supabase?: SupabaseClient) {
     if (supabase) {
       this.supabase = supabase;
     } else {
@@ -44,13 +43,23 @@ export class PgQueueManager {
   }
 
   /**
-   * Send a message to the queue
+   * Send a message to the queue with clear error handling
    */
   async sendMessage(queueName: string, message: any): Promise<string | null> {
+    if (!queueName) {
+      console.error("Queue name cannot be empty");
+      return null;
+    }
+    
     try {
+      // Ensure message is JSONB compatible
+      const messageBody = typeof message === 'string' 
+        ? JSON.parse(message) 
+        : message;
+      
       const { data, error } = await this.supabase.rpc('pg_enqueue', {
         queue_name: queueName,
-        message_body: typeof message === 'string' ? JSON.parse(message) : message
+        message_body: messageBody
       });
 
       if (error) {
@@ -75,7 +84,7 @@ export class PgQueueManager {
     } = options;
 
     try {
-      // Use the secure pg_dequeue function to atomically retrieve messages and set visibility timeout
+      // Use the pg_dequeue function to atomically retrieve messages and set visibility timeout
       const { data, error } = await this.supabase.rpc('pg_dequeue', {
         queue_name: queueName,
         batch_size: batchSize, 
@@ -109,7 +118,7 @@ export class PgQueueManager {
   }
 
   /**
-   * Delete a message from the queue with robust error handling and retries
+   * Delete a message from the queue with exponential backoff retries
    */
   async deleteMessage(queueName: string, messageId: string): Promise<boolean> {
     let attempt = 0;
@@ -117,7 +126,7 @@ export class PgQueueManager {
 
     while (attempt < this.retryOptions.maxRetries && !success) {
       try {
-        // Use the robust pg_delete_message function
+        // Try to delete the message using the robust pg_delete_message function
         const { data, error } = await this.supabase.rpc('pg_delete_message', {
           queue_name: queueName,
           message_id: messageId.toString()
@@ -129,8 +138,9 @@ export class PgQueueManager {
           return true;
         }
 
-        // Try using the even more robust ensure_message_deleted function as fallback
-        try {
+        // If the delete failed but not due to an error (just returned false),
+        // try using the ensure_message_deleted as a final attempt
+        if (!error && data === false) {
           const { data: ensureData, error: ensureError } = await this.supabase.rpc('ensure_message_deleted', {
             queue_name: queueName,
             message_id: messageId.toString(),
@@ -140,8 +150,6 @@ export class PgQueueManager {
           if (!ensureError && ensureData === true) {
             return true;
           }
-        } catch (ensureError) {
-          console.warn(`Error in ensure_message_deleted for message ${messageId}:`, ensureError);
         }
 
         attempt++;
@@ -181,7 +189,7 @@ export class PgQueueManager {
   }
 
   /**
-   * Check queue status and get information about its state
+   * Get queue status information
    */
   async getQueueStatus(queueName: string): Promise<{ count: number, oldestMessage: Date | null }> {
     try {
@@ -201,50 +209,6 @@ export class PgQueueManager {
     } catch (error) {
       console.error(`Exception getting queue status for ${queueName}:`, error);
       return { count: 0, oldestMessage: null };
-    }
-  }
-
-  /**
-   * Reset the visibility timeout for a stuck message
-   */
-  async resetMessageVisibility(queueName: string, messageId: string): Promise<boolean> {
-    try {
-      const { data, error } = await this.supabase.rpc('reset_stuck_message', {
-        queue_name: queueName,
-        message_id: messageId
-      });
-
-      if (error) {
-        console.error(`Error resetting message visibility for ${messageId}:`, error);
-        return false;
-      }
-
-      return !!data;
-    } catch (error) {
-      console.error(`Exception resetting message visibility for ${messageId}:`, error);
-      return false;
-    }
-  }
-
-  /**
-   * Get a list of stuck messages that have been invisible for too long
-   */
-  async listStuckMessages(queueName: string, minMinutesLocked: number = 10): Promise<QueueMessage[]> {
-    try {
-      const { data, error } = await this.supabase.rpc('list_stuck_messages', {
-        queue_name: queueName,
-        min_minutes_locked: minMinutesLocked
-      });
-
-      if (error) {
-        console.error(`Error listing stuck messages for ${queueName}:`, error);
-        return [];
-      }
-
-      return data || [];
-    } catch (error) {
-      console.error(`Exception listing stuck messages for ${queueName}:`, error);
-      return [];
     }
   }
 
@@ -274,6 +238,6 @@ export class PgQueueManager {
 /**
  * Get a singleton instance of the PgQueueManager
  */
-export function getQueueManager(supabase?: any): PgQueueManager {
+export function getQueueManager(supabase?: SupabaseClient): PgQueueManager {
   return new PgQueueManager(supabase);
 }
