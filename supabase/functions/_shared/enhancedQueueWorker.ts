@@ -1,235 +1,211 @@
-
-/**
- * EnhancedQueueWorker - A scalable worker base class with self-draining capabilities
- * 
- * This worker extends IdempotentWorker with improved throughput handling:
- * - Supports self-draining loops to process multiple batches within one invocation
- * - Implements adaptive backoff based on queue depth
- * - Provides detailed metrics for monitoring
- */
-
-import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { IdempotentWorker, ProcessOptions } from "./idempotentWorker.ts";
-import { getDeduplicationService } from "./deduplication.ts";
-import { getQueueManager } from "./pgQueueManager.ts";
 
-export interface QueueMetrics {
+interface QueueMessage {
+  id: string;
+  message: any;
+}
+
+interface DrainQueueResult {
   processed: number;
   errors: number;
   duplicates: number;
   skipped: number;
   processingTimeMs: number;
+  sentToDlq: number;
+  dlqErrors: number;
 }
 
-export interface DrainOptions extends ProcessOptions {
-  // Maximum number of batches to process in a single invocation
+interface DrainQueueOptions {
   maxBatches?: number;
-  
-  // Maximum total runtime in milliseconds
+  batchSize?: number;
   maxRuntimeMs?: number;
-  
-  // Delay between batches in milliseconds
-  batchDelayMs?: number;
-  
-  // Whether to log detailed metrics
+  processorName?: string;
+  timeoutSeconds?: number;
+  visibilityTimeoutSeconds?: number;
   logDetailedMetrics?: boolean;
-  
-  // Whether to automatically back off if queue is empty
-  adaptiveBackoff?: boolean;
+  deadLetterQueue?: string;
+  maxRetries?: number;
 }
 
-export class EnhancedQueueWorker<T = any> extends IdempotentWorker<T> {
-  protected queueManager: any;
-  protected metrics: QueueMetrics;
-  protected startTime: number;
-  protected abortController: AbortController;
-  
-  constructor(queue: string, supabase?: SupabaseClient, redis?: Redis) {
-    super(queue, supabase, redis);
-    
-    this.queueManager = getQueueManager(this.supabase);
-    this.metrics = {
-      processed: 0,
-      errors: 0,
-      duplicates: 0,
-      skipped: 0,
-      processingTimeMs: 0
-    };
-    this.startTime = 0;
-    this.abortController = new AbortController();
-  }
-  
-  /**
-   * Process multiple batches within time and count constraints
-   */
-  async drainQueue(options: DrainOptions): Promise<QueueMetrics> {
-    const {
-      maxBatches = 5,
-      maxRuntimeMs = 240000, // 4 minutes default (under the 5-minute cron and most function timeouts)
-      batchDelayMs = 250,
-      batchSize = 5,
-      timeoutSeconds = 60,
-      processorName = 'enhanced',
-      visibilityTimeoutSeconds = 30,
-      logDetailedMetrics = true,
-      adaptiveBackoff = true
-    } = options;
-    
-    this.startTime = Date.now();
-    this.metrics = {
-      processed: 0, 
-      errors: 0, 
-      duplicates: 0,
-      skipped: 0,
-      processingTimeMs: 0
-    };
-    
-    // Create a new abort controller for this drain operation
-    this.abortController = new AbortController();
-    
-    let batchCount = 0;
-    let queueSize = 0;
-    let backoffFactor = 1;
-    let consecutiveEmptyBatches = 0;
-    
-    try {
-      // Get initial queue status (if possible)
-      try {
-        const status = await this.queueManager.getQueueStatus(this.queue);
-        queueSize = status?.count || 0;
-        
-        console.log(`Starting drain of ${this.queue}: ${queueSize} messages pending, max ${maxBatches} batches, max runtime ${maxRuntimeMs}ms`);
-      } catch (error) {
-        // Non-critical error, just log and continue
-        console.warn(`Could not get queue status for ${this.queue}: ${error.message}`);
-      }
-      
-      // Process batches until maxBatches reached, maxRuntimeMs exceeded, or queue empty
-      while (batchCount < maxBatches && !this.isTimeExceeded(maxRuntimeMs)) {
-        // Check if we need to abort
-        if (this.abortController.signal.aborted) {
-          console.log(`Processing aborted for ${this.queue} after ${batchCount} batches`);
-          break;
-        }
-        
-        // Process a single batch
-        const batchStartTime = Date.now();
-        const batchResult = await this.processBatch({
-          batchSize,
-          timeoutSeconds,
-          processorName: `${processorName}-${batchCount + 1}`,
-          visibilityTimeoutSeconds
-        });
-        
-        const batchTime = Date.now() - batchStartTime;
-        
-        // Update aggregate metrics
-        this.metrics.processed += batchResult.processed;
-        this.metrics.errors += batchResult.errors;
+interface EnhancedQueueWorker {
+  new(queueName: string, supabase: any, redis: any): {
+    drainQueue(options: DrainQueueOptions): Promise<DrainQueueResult>;
+  };
+}
+
+export function createEnhancedWorker<T extends {}>(queueName: string, supabase: any, redis: any) {
+  return class EnhancedQueueWorker {
+    private queueName: string;
+    protected supabase: any;
+    protected redis: any;
+
+    constructor(queueName: string, supabase: any, redis: any) {
+      this.queueName = queueName;
+      this.supabase = supabase;
+      this.redis = redis;
+    }
+
+    async drainQueue(options: DrainQueueOptions): Promise<DrainQueueResult> {
+      const {
+        maxBatches = 5,
+        batchSize = 10,
+        maxRuntimeMs = 120000, // 2 minutes by default
+        processorName = 'default-processor',
+        timeoutSeconds = 30,
+        visibilityTimeoutSeconds = 60,
+        logDetailedMetrics = false,
+        deadLetterQueue, // new option
+        maxRetries = 3  // new option with default
+      } = options;
+
+      const startTime = Date.now();
+      let processed = 0;
+      let errors = 0;
+      let duplicates = 0;
+      let skipped = 0;
+      let sentToDlq = 0;
+      let dlqErrors = 0;
+
+      let batchCount = 0;
+      let continueProcessing = true;
+
+      while (batchCount < maxBatches && continueProcessing && (Date.now() - startTime) < maxRuntimeMs) {
         batchCount++;
-        
-        if (batchResult.processed === 0) {
-          consecutiveEmptyBatches++;
-          
-          // Break early if queue seems empty
-          if (consecutiveEmptyBatches >= 2) {
-            console.log(`No messages found in ${consecutiveEmptyBatches} consecutive batches, queue may be empty`);
-            break;
+        console.log(`Starting batch ${batchCount} for processor ${processorName}`);
+
+        const { data: messages, error } = await this.supabase.functions.invoke("readQueue", {
+          body: {
+            queue_name: this.queueName,
+            batch_size: batchSize,
+            visibility_timeout: visibilityTimeoutSeconds
           }
-          
-          // Implement backoff if adaptiveBackoff enabled
-          if (adaptiveBackoff) {
-            backoffFactor = Math.min(backoffFactor * 2, 8);
+        });
+
+        if (error) {
+          console.error(`Error reading from queue ${this.queueName}:`, error);
+          break; // Stop processing if we can't read from the queue
+        }
+
+        if (!messages || messages.length === 0) {
+          console.log(`No messages to process in queue ${this.queueName}`);
+          break; // No more messages, stop processing
+        }
+
+        console.log(`Processing ${messages.length} messages in batch ${batchCount}`);
+
+        const batchStartTime = Date.now();
+        for (const message of messages) {
+          const messageStartTime = Date.now();
+          let retryMetrics = {
+            retries: 0,
+            success: false,
+            duplicate: false,
+            skipped: false,
+            error: false,
+            sentToDlq: 0,
+            dlqErrors: 0
+          };
+
+          let retryCount = 0;
+          let lastError: any = null;
+
+          while (retryCount <= maxRetries && !retryMetrics.success) {
+            retryCount++;
+            try {
+              // Process the message
+              const result = await Promise.race([
+                this.processMessage(message.message),
+                new Promise((_, reject) => setTimeout(() => reject(new Error(`Message processing timeout after ${timeoutSeconds} seconds`)), timeoutSeconds * 1000))
+              ]);
+
+              retryMetrics.success = true;
+              processed++;
+              console.log(`Message ${message.id} processed successfully (attempt ${retryCount})`);
+
+            } catch (error) {
+              console.error(`Error processing message ${message.id} (attempt ${retryCount}):`, error);
+              lastError = error;
+              retryMetrics.error = true;
+
+            } finally {
+              // Delete the message from the queue if processing was successful or max retries reached
+              if (retryMetrics.success || retryCount >= maxRetries) {
+                try {
+                  const { error: deleteError } = await this.supabase.functions.invoke("deleteMessage", {
+                    body: {
+                      queue_name: this.queueName,
+                      msg_id: message.id
+                    }
+                  });
+
+                  if (deleteError) {
+                    console.error(`Error deleting message ${message.id} from queue:`, deleteError);
+                  } else {
+                    console.log(`Message ${message.id} deleted from queue`);
+                  }
+                } catch (deleteError) {
+                  console.error(`Fatal error deleting message ${message.id} from queue:`, deleteError);
+                }
+              }
+            }
           }
-        } else {
-          consecutiveEmptyBatches = 0;
-          backoffFactor = 1;
+
+          // After reaching maxRetries, we'd add:
+          if (deadLetterQueue && retryCount > maxRetries) {
+            console.log(`Message ${message.id} failed after ${retryCount} retries, sending to DLQ: ${deadLetterQueue}`);
+
+            try {
+              await this.sendToDLQ(message.id, message.message, lastError.message);
+              // Track in metrics
+              sentToDlq++;
+            } catch (dlqError) {
+              console.error(`Failed to send to DLQ: ${dlqError.message}`);
+              // If we can't send to DLQ, we still need to handle the message somehow
+              dlqErrors++;
+            }
+          }
+
+          const messageEndTime = Date.now();
+          if (logDetailedMetrics) {
+            console.log(`Detailed metrics for message ${message.id}:`, {
+              ...retryMetrics,
+              processingTimeMs: messageEndTime - messageStartTime,
+              messageId: message.id
+            });
+          }
         }
-        
-        if (logDetailedMetrics) {
-          console.log(`Batch ${batchCount}/${maxBatches}: processed ${batchResult.processed}, errors ${batchResult.errors}, time ${batchTime}ms`);
-        }
-        
-        // Wait between batches with adaptive backoff
-        if (batchCount < maxBatches) {
-          await new Promise(resolve => setTimeout(resolve, batchDelayMs * backoffFactor));
-        }
+
+        const batchEndTime = Date.now();
+        console.log(`Batch ${batchCount} completed in ${batchEndTime - batchStartTime}ms`);
       }
-      
-      // Calculate total processing time
-      this.metrics.processingTimeMs = Date.now() - this.startTime;
-      
-      // Log final metrics
-      console.log(`Completed drain of ${this.queue}: processed ${this.metrics.processed}, errors ${this.metrics.errors}, time ${this.metrics.processingTimeMs}ms`);
-      
-      // Record metrics in database
-      this.recordMetrics();
-      
-      return this.metrics;
-    } catch (error) {
-      console.error(`Error during queue drain: ${error.message}`);
-      
-      // Still record metrics even on error
-      this.metrics.processingTimeMs = Date.now() - this.startTime;
-      this.recordMetrics();
-      
+
+      const endTime = Date.now();
+      const processingTimeMs = endTime - startTime;
+
+      console.log(`Processor ${processorName} completed in ${processingTimeMs}ms`);
+      console.log(`Total messages processed: ${processed}, errors: ${errors}, duplicates: ${duplicates}, skipped: ${skipped}`);
+
       return {
-        ...this.metrics,
-        errors: this.metrics.errors + 1 // Add the drain error
+        processed,
+        errors,
+        duplicates,
+        skipped,
+        processingTimeMs,
+        sentToDlq,
+        dlqErrors
       };
     }
-  }
-  
-  /**
-   * Check if maximum runtime has been exceeded
-   */
-  protected isTimeExceeded(maxRuntimeMs: number): boolean {
-    const elapsed = Date.now() - this.startTime;
-    // Add 10% buffer to ensure we don't exceed function timeout
-    return elapsed > (maxRuntimeMs * 0.9);
-  }
-  
-  /**
-   * Abort ongoing processing (can be called from outside)
-   */
-  abort(): void {
-    this.abortController.abort();
-  }
-  
-  /**
-   * Record metrics to the database
-   */
-  protected async recordMetrics(): Promise<void> {
-    try {
-      await this.supabase.from('queue_metrics').insert({
-        queue_name: this.queue,
-        operation: 'drain',
-        started_at: new Date(this.startTime).toISOString(),
-        finished_at: new Date().toISOString(),
-        processed_count: this.metrics.processed,
-        success_count: this.metrics.processed - this.metrics.errors,
-        error_count: this.metrics.errors,
-        details: {
-          duplicates: this.metrics.duplicates,
-          skipped: this.metrics.skipped,
-          processing_time_ms: this.metrics.processingTimeMs,
-          batches: this.metrics.processed > 0 ? Math.ceil(this.metrics.processed / 5) : 0
-        }
-      });
-    } catch (error) {
-      console.error(`Failed to record metrics for ${this.queue}: ${error.message}`);
-    }
-  }
-}
 
-/**
- * Create an EnhancedQueueWorker instance
- */
-export function createEnhancedWorker<T = any>(
-  queue: string, 
-  supabase?: SupabaseClient, 
-  redis?: Redis
-): EnhancedQueueWorker<T> {
-  return new EnhancedQueueWorker<T>(queue, supabase, redis);
+    // Abstract method to be implemented by subclasses
+    async processMessage(message: T): Promise<any> {
+      throw new Error("Method not implemented.");
+    }
+
+    // Abstract method to send to DLQ
+    async sendToDLQ(messageId: string, message: any, failureReason: string): Promise<boolean> {
+      console.log(`Sending message ${messageId} to DLQ. Reason: ${failureReason}`);
+      return true;
+    }
+  };
 }

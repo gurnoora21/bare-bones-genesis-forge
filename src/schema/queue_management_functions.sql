@@ -1,4 +1,3 @@
-
 -- Create a function to ensure a message is deleted from a queue with robust error handling
 CREATE OR REPLACE FUNCTION public.ensure_message_deleted(
   queue_name TEXT,
@@ -137,5 +136,238 @@ BEGIN
   
   GET DIAGNOSTICS reset_count = ROW_COUNT;
   RETURN reset_count;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to move a message to a dead-letter queue
+CREATE OR REPLACE FUNCTION public.move_to_dead_letter_queue(
+  source_queue TEXT,
+  dlq_name TEXT,
+  message_id TEXT,
+  failure_reason TEXT,
+  metadata JSONB DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+  message_body JSONB;
+  dlq_msg_id BIGINT;
+BEGIN
+  -- Check if the DLQ exists, create if not
+  BEGIN
+    PERFORM pgmq.create(dlq_name);
+  EXCEPTION WHEN OTHERS THEN
+    -- Queue might already exist, which is fine
+    RAISE NOTICE 'Ensuring DLQ exists: %', SQLERRM;
+  END;
+  
+  -- Get the message body from the source queue
+  BEGIN
+    SELECT message
+    INTO message_body
+    FROM pgmq.get_queue_table_name(source_queue)
+    WHERE id::TEXT = message_id OR msg_id::TEXT = message_id;
+    
+    IF message_body IS NULL THEN
+      RAISE NOTICE 'Message % not found in queue %', message_id, source_queue;
+      RETURN FALSE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error fetching message %: %', message_id, SQLERRM;
+    RETURN FALSE;
+  END;
+  
+  -- Add failure metadata
+  message_body := jsonb_set(
+    message_body,
+    '{_dlq_metadata}',
+    jsonb_build_object(
+      'source_queue', source_queue,
+      'original_message_id', message_id,
+      'moved_at', now(),
+      'failure_reason', failure_reason,
+      'custom_metadata', metadata
+    )
+  );
+  
+  -- Send to DLQ
+  BEGIN
+    SELECT pgmq.send(dlq_name, message_body)
+    INTO dlq_msg_id;
+    
+    IF dlq_msg_id IS NULL THEN
+      RAISE NOTICE 'Failed to send message to DLQ %', dlq_name;
+      RETURN FALSE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error sending to DLQ %: %', dlq_name, SQLERRM;
+    RETURN FALSE;
+  END;
+  
+  -- Try to delete the original message
+  PERFORM ensure_message_deleted(source_queue, message_id);
+  
+  -- Log the DLQ action
+  INSERT INTO monitoring_events (
+    event_type, 
+    details
+  ) VALUES (
+    'message_moved_to_dlq',
+    jsonb_build_object(
+      'source_queue', source_queue,
+      'dlq_name', dlq_name,
+      'source_message_id', message_id,
+      'dlq_message_id', dlq_msg_id,
+      'failure_reason', failure_reason,
+      'timestamp', now()
+    )
+  );
+  
+  RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to reprocess a message from a DLQ back to original queue
+CREATE OR REPLACE FUNCTION public.reprocess_from_dlq(
+  dlq_name TEXT,
+  message_id TEXT,
+  override_body JSONB DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+  message_body JSONB;
+  source_queue TEXT;
+  reprocessed_id BIGINT;
+  metadata JSONB;
+BEGIN
+  -- Get the message from the DLQ
+  BEGIN
+    SELECT message
+    INTO message_body
+    FROM pgmq.get_queue_table_name(dlq_name)
+    WHERE id::TEXT = message_id OR msg_id::TEXT = message_id;
+    
+    IF message_body IS NULL THEN
+      RAISE NOTICE 'Message % not found in DLQ %', message_id, dlq_name;
+      RETURN FALSE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error fetching message %: %', message_id, SQLERRM;
+    RETURN FALSE;
+  END;
+  
+  -- Get source queue from metadata
+  source_queue := message_body->'_dlq_metadata'->>'source_queue';
+  metadata := message_body->'_dlq_metadata';
+  
+  -- Use override body if provided
+  IF override_body IS NOT NULL THEN
+    message_body := override_body;
+  END IF;
+  
+  -- Remove DLQ metadata for clean reprocessing
+  message_body := message_body - '_dlq_metadata';
+  
+  -- Add reprocessing metadata
+  message_body := jsonb_set(
+    message_body,
+    '{_reprocessing_metadata}',
+    jsonb_build_object(
+      'reprocessed_from_dlq', dlq_name,
+      'original_message_id', message_id,
+      'reprocessed_at', now()
+    )
+  );
+  
+  -- Send to original queue
+  BEGIN
+    SELECT pgmq.send(source_queue, message_body)
+    INTO reprocessed_id;
+    
+    IF reprocessed_id IS NULL THEN
+      RAISE NOTICE 'Failed to send message back to queue %', source_queue;
+      RETURN FALSE;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error sending to original queue %: %', source_queue, SQLERRM;
+    RETURN FALSE;
+  END;
+  
+  -- Delete from DLQ
+  PERFORM ensure_message_deleted(dlq_name, message_id);
+  
+  -- Log the reprocessing action
+  INSERT INTO monitoring_events (
+    event_type, 
+    details
+  ) VALUES (
+    'message_reprocessed_from_dlq',
+    jsonb_build_object(
+      'dlq_name', dlq_name,
+      'source_queue', source_queue,
+      'original_message_id', message_id,
+      'new_message_id', reprocessed_id,
+      'timestamp', now(),
+      'original_metadata', metadata
+    )
+  );
+  
+  RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to purge old messages from a DLQ
+CREATE OR REPLACE FUNCTION public.purge_dlq_messages(
+  dlq_name TEXT,
+  older_than_days INTEGER DEFAULT 30,
+  max_messages INTEGER DEFAULT 1000
+) RETURNS INTEGER AS $$
+DECLARE
+  deleted_count INTEGER := 0;
+  message_record RECORD;
+BEGIN
+  -- Track this operation
+  INSERT INTO monitoring_events (
+    event_type, 
+    details
+  ) VALUES (
+    'dlq_purge_operation',
+    jsonb_build_object(
+      'dlq_name', dlq_name,
+      'older_than_days', older_than_days,
+      'max_messages', max_messages,
+      'started_at', now()
+    )
+  );
+
+  -- Loop through and delete old messages
+  FOR message_record IN 
+    SELECT id::TEXT as msg_id 
+    FROM pgmq.get_queue_table_name(dlq_name)
+    WHERE created_at < (NOW() - (older_than_days * INTERVAL '1 day'))
+    LIMIT max_messages
+  LOOP
+    -- Delete the message
+    PERFORM ensure_message_deleted(dlq_name, message_record.msg_id);
+    deleted_count := deleted_count + 1;
+  END LOOP;
+  
+  -- Update monitoring event with results
+  UPDATE monitoring_events
+  SET details = jsonb_set(
+    details,
+    '{results}',
+    jsonb_build_object(
+      'deleted_count', deleted_count,
+      'completed_at', now()
+    )
+  )
+  WHERE event_type = 'dlq_purge_operation' 
+  AND details->>'dlq_name' = dlq_name
+  AND details->>'started_at' = (
+    SELECT MAX(details->>'started_at') 
+    FROM monitoring_events 
+    WHERE event_type = 'dlq_purge_operation'
+    AND details->>'dlq_name' = dlq_name
+  );
+  
+  RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;

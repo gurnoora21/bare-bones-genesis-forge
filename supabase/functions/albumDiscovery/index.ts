@@ -25,6 +25,13 @@ const spotifyClient = new SpotifyClient(
   Deno.env.get("SPOTIFY_CLIENT_SECRET") || ""
 );
 
+// Define DLQ configuration
+const DLQ_CONFIG = {
+  queueName: "album_discovery_dlq",
+  maxRetries: 3,
+  retryDelayMs: 5000, // 5 seconds between retries
+}
+
 // CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -273,6 +280,58 @@ class AlbumDiscoveryWorker extends createEnhancedWorker<any> {
       console.error(`Failed to log worker issue: ${error.message}`);
     }
   }
+  
+  // Helper method to send to DLQ after max retries
+  private async sendToDLQ(
+    messageId: string, 
+    message: any, 
+    failureReason: string
+  ): Promise<boolean> {
+    try {
+      console.log(`Moving message ${messageId} to DLQ due to: ${failureReason}`);
+      
+      // Try to use the DB function to move to DLQ
+      const { data, error } = await this.supabase.rpc('move_to_dead_letter_queue', {
+        source_queue: 'album_discovery',
+        dlq_name: DLQ_CONFIG.queueName,
+        message_id: messageId,
+        failure_reason: failureReason,
+        metadata: {
+          worker_name: 'albumDiscovery',
+          failed_at: new Date().toISOString(),
+          retries: DLQ_CONFIG.maxRetries
+        }
+      });
+      
+      if (error) {
+        console.error(`Error moving message to DLQ: ${error.message}`);
+        
+        // Fallback: direct send to DLQ if function fails
+        await this.supabase.functions.invoke("sendToQueue", {
+          body: {
+            queue_name: DLQ_CONFIG.queueName,
+            message: {
+              ...message,
+              _dlq_metadata: {
+                source_queue: 'album_discovery',
+                original_message_id: messageId,
+                moved_at: new Date().toISOString(),
+                failure_reason: failureReason,
+                move_method: 'direct_fallback'
+              }
+            }
+          }
+        });
+        
+        return true;
+      }
+      
+      return data === true;
+    } catch (error) {
+      console.error(`Failed to send message to DLQ: ${error.message}`);
+      return false;
+    }
+  }
 }
 
 // Process albums with self-draining capabilities
@@ -282,7 +341,7 @@ async function processAlbumDiscovery() {
   try {
     const worker = new AlbumDiscoveryWorker();
     
-    // Process multiple batches within the time limit 
+    // Process multiple batches within the time limit with DLQ support
     const result = await worker.drainQueue({
       maxBatches: 8,          // Process up to 8 batches in one invocation
       maxRuntimeMs: 240000,   // 4 minute runtime limit (below Edge Function timeout)
@@ -290,7 +349,9 @@ async function processAlbumDiscovery() {
       processorName: 'album-discovery',
       timeoutSeconds: 60,     // Timeout per message
       visibilityTimeoutSeconds: 300, // 5 minute visibility timeout
-      logDetailedMetrics: true
+      logDetailedMetrics: true,
+      deadLetterQueue: DLQ_CONFIG.queueName,  // Enable DLQ for poison messages
+      maxRetries: DLQ_CONFIG.maxRetries       // Number of retries before sending to DLQ
     });
     
     return {
