@@ -21,7 +21,7 @@ serve(async (req) => {
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
     const supabase = createClient(supabaseUrl, supabaseKey);
     
-    // Get stats from all relevant tables - simplified version
+    // Get counts from all relevant tables
     const [
       artists,
       albums,
@@ -34,16 +34,49 @@ serve(async (req) => {
       supabase.from('producers').select('count', { count: 'exact', head: true })
     ]);
     
-    // Simplified response with just basic counts
+    // Calculate pipeline health
+    const artistCount = artists.count || 0;
+    const albumCount = albums.count || 0;
+    const trackCount = tracks.count || 0;
+    const producerCount = producers.count || 0;
+    
+    // Simple pipeline status information
     const pipelineStatus = {
       table_counts: {
-        artists: artists.count || 0,
-        albums: albums.count || 0,
-        tracks: tracks.count || 0,
-        producers: producers.count || 0
+        artists: artistCount,
+        albums: albumCount,
+        tracks: trackCount,
+        producers: producerCount
       },
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      health_check: {
+        status: "ok",
+        issues: []
+      }
     };
+    
+    // Perform basic health checks
+    const issues = [];
+    
+    // Check if we have artists but no albums (potential pipeline breakage)
+    if (artistCount > 0 && albumCount === 0) {
+      issues.push("Artists exist but no albums found - potential issue with album discovery");
+      pipelineStatus.health_check.status = "warning";
+    }
+    
+    // Check if we have albums but no tracks (potential pipeline breakage)
+    if (albumCount > 0 && trackCount === 0) {
+      issues.push("Albums exist but no tracks found - potential issue with track discovery");
+      pipelineStatus.health_check.status = "warning";
+    }
+    
+    // Check if we have tracks but no producers (potential pipeline breakage)
+    if (trackCount > 0 && producerCount === 0) {
+      issues.push("Tracks exist but no producers found - potential issue with producer identification");
+      pipelineStatus.health_check.status = "warning";
+    }
+    
+    pipelineStatus.health_check.issues = issues;
     
     return new Response(
       JSON.stringify(pipelineStatus),
@@ -53,7 +86,10 @@ serve(async (req) => {
     console.error("Error checking pipeline status:", error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        timestamp: new Date().toISOString()
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }

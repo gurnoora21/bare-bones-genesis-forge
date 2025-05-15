@@ -1,6 +1,5 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { getRedis } from "../_shared/upstashRedis.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -14,15 +13,17 @@ serve(async (req) => {
   }
 
   try {
-    // Simplified API to just report basic stats
+    // Extract API parameter if provided
     const url = new URL(req.url);
-    const api = url.searchParams.get('api') || '*';
+    const api = url.searchParams.get('api') || 'all';
     
+    // Simplified response - we won't track API stats anymore
     return new Response(
       JSON.stringify({ 
         success: true,
-        message: "API monitoring has been simplified. For detailed metrics, check Supabase logs directly.",
-        api_requested: api
+        message: "API monitoring has been simplified to focus on core pipeline functionality",
+        timestamp: new Date().toISOString(),
+        requested_api: api
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
@@ -30,7 +31,10 @@ serve(async (req) => {
     console.error("Error in apiMonitor:", error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        timestamp: new Date().toISOString()
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }

@@ -27,23 +27,42 @@ serve(async (req) => {
 
     const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
     
-    // Parse request body if available
+    // Parse request body for threshold settings
     const { threshold_minutes = 10, auto_fix = true } = 
       req.method === 'POST' ? await req.json() : {};
     
-    // Simple queue check and reset functionality
-    const results = await supabase.rpc(
+    // Reset stuck messages if requested
+    const { data: results, error } = await supabase.rpc(
       'reset_all_stuck_messages', 
       { threshold_minutes }
     );
     
-    // Log the action but don't worry about complex metrics
+    if (error) {
+      console.error("Error resetting stuck messages:", error);
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
     console.log(`Queue monitor executed: reset stuck messages older than ${threshold_minutes} minutes`);
+    
+    // Report on results
+    const fixedMessages = results || [];
+    const queueCounts = {};
+    
+    // Group by queue
+    fixedMessages.forEach(msg => {
+      const queue = msg.queue_name;
+      queueCounts[queue] = (queueCounts[queue] || 0) + 1;
+    });
     
     return new Response(
       JSON.stringify({ 
         success: true, 
-        fixed_messages: results.data || [],
+        fixed_messages: fixedMessages,
+        counts_by_queue: queueCounts,
+        total_fixed: fixedMessages.length,
         timestamp: new Date().toISOString() 
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

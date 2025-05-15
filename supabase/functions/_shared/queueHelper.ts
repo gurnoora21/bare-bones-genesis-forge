@@ -1,7 +1,6 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { StateTransitionResult, ProcessingState } from "./stateManager.ts";
 import { DeduplicationService } from "./deduplication.ts";
 
 /**
@@ -32,7 +31,7 @@ export async function logWorkerIssue(
 }
 
 /**
- * Deletes a message from the queue with retries
+ * Deletes a message from the queue
  */
 export async function deleteMessageWithRetries(
   supabase: any,
@@ -48,48 +47,23 @@ export async function deleteMessageWithRetries(
 
   while (attempt < maxRetries && !deleted) {
     try {
-      // First approach: Use direct RPC call to database function
-      try {
-        const { data, error } = await supabase.rpc(
-          'pg_delete_message',
-          { 
-            queue_name: queueName, 
-            message_id: messageId.toString()
-          }
-        );
-        
-        if (!error && data === true) {
-          console.log(`Successfully deleted message ${messageId} using database function`);
-          return true;
-        } else if (error) {
-          console.warn(`Database deletion failed for message ${messageId}:`, error);
+      // Use database function to delete message
+      const { data, error } = await supabase.rpc(
+        'pg_delete_message',
+        { 
+          queue_name: queueName, 
+          message_id: messageId.toString()
         }
-      } catch (rpcError) {
-        console.warn(`RPC error for message ${messageId}:`, rpcError);
+      );
+      
+      if (!error && data === true) {
+        console.log(`Successfully deleted message ${messageId}`);
+        return true;
+      } else if (error) {
+        console.warn(`Database deletion failed for message ${messageId}:`, error);
       }
 
-      // Second approach: Use ensure_message_deleted database function
-      try {
-        const { data, error } = await supabase.rpc(
-          'ensure_message_deleted',
-          { 
-            queue_name: queueName, 
-            message_id: messageId.toString(),
-            max_attempts: 2
-          }
-        );
-        
-        if (!error && data === true) {
-          console.log(`Successfully deleted message ${messageId} using ensure_message_deleted`);
-          return true;
-        } else if (error) {
-          console.warn(`ensure_message_deleted failed for message ${messageId}:`, error);
-        }
-      } catch (ensureError) {
-        console.warn(`ensure_message_deleted error for message ${messageId}:`, ensureError);
-      }
-      
-      // Third approach: Try direct reset if delete fails
+      // If failed, try the more reliable function
       try {
         const { data: resetData, error: resetError } = await supabase.rpc(
           'reset_stuck_message',
@@ -101,10 +75,8 @@ export async function deleteMessageWithRetries(
         
         if (!resetError && resetData === true) {
           console.log(`Reset visibility timeout for message ${messageId}`);
-          // Consider this a success since the message will be reprocessed
+          // Consider this a success
           return true;
-        } else if (resetError) {
-          console.warn(`Failed to reset message ${messageId}:`, resetError);
         }
       } catch (resetError) {
         console.warn(`Error trying to reset message ${messageId}:`, resetError);
@@ -127,7 +99,7 @@ export async function deleteMessageWithRetries(
   // If we get here, we've exhausted our retries
   console.error(`Failed to delete message ${messageId} after ${maxRetries} attempts`);
   
-  // Log this issue so we can track it
+  // Log this issue
   try {
     await logWorkerIssue(
       supabase,
@@ -140,38 +112,39 @@ export async function deleteMessageWithRetries(
     console.error("Failed to log deletion issue:", logError);
   }
   
-  // Return false to indicate failure
   return false;
 }
 
 /**
- * Checks if a track has already been processed
+ * Checks if an entity has already been processed
  */
-export async function checkTrackProcessed(
+export async function checkEntityProcessed(
   supabase: any,
-  trackSpotifyId: string
+  tableName: string,
+  fieldName: string,
+  fieldValue: string
 ): Promise<boolean> {
   try {
     const { data, error } = await supabase
-      .from('tracks')
+      .from(tableName)
       .select('id')
-      .eq('spotify_id', trackSpotifyId)
+      .eq(fieldName, fieldValue)
       .maybeSingle();
 
     if (error) {
-      console.error("Error checking if track exists:", error);
+      console.error(`Error checking if ${tableName} exists:`, error);
       return false;
     }
 
     return !!data;
   } catch (error) {
-    console.error("Error checking if track exists:", error);
+    console.error(`Error checking if ${tableName} exists:`, error);
     return false;
   }
 }
 
 /**
- * Safely processes a queue message with idempotency and deduplication
+ * Safely processes a queue message with idempotency
  */
 export async function processQueueMessageSafely(
   supabase: any,
@@ -185,8 +158,7 @@ export async function processQueueMessageSafely(
   const { 
     maxRetries = 3, 
     retryDelayMs = 1000,
-    circuitBreaker = false,
-    deduplication = { enabled: false, redis: null, ttlSeconds: 3600, strictMatching: true }
+    deduplication = { enabled: true, redis: null, ttlSeconds: 3600 }
   } = options;
   
   let attempt = 0;
@@ -211,7 +183,6 @@ export async function processQueueMessageSafely(
       
       // Check for deduplication
       if (deduplicationService) {
-        // Use the correct method: isDuplicate instead of checkAndRegister
         const isDuplicate = await deduplicationService.isDuplicate(queueName, idempotencyKey);
         if (isDuplicate) {
           console.log(`Message ${messageId} (key: ${idempotencyKey}) deduplicated, skipping`);
@@ -236,12 +207,6 @@ export async function processQueueMessageSafely(
     } catch (error) {
       lastError = error;
       console.error(`Attempt ${attempt + 1} to process message ${messageId} failed:`, error);
-      
-      // Implement circuit breaker pattern
-      if (circuitBreaker && attempt >= 3) {
-        console.warn(`Circuit breaker triggered for message ${messageId} after multiple failures`);
-        throw error; // Stop retrying
-      }
       
       attempt++;
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));
@@ -268,121 +233,135 @@ export async function processQueueMessageSafely(
 }
 
 /**
- * Acquires a processing lock for an entity to prevent duplicate processing
- */
-export async function acquireProcessingLock(
-  entityType: string,
-  entityId: string,
-  options: any = {}
-): Promise<boolean> {
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL") || "",
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
-  );
-
-  try {
-    // Use the lockManager edge function to acquire a lock
-    const { data, error } = await supabase.functions.invoke("lockManager", {
-      body: {
-        operation: "acquire",
-        entityType,
-        entityId,
-        options: {
-          timeoutMinutes: options.timeoutMinutes || 30,
-          ttlSeconds: options.ttlSeconds || 1800,
-          workerId: Deno.env.get("WORKER_ID") || `worker_${Math.random().toString(36).substring(2, 10)}`,
-          correlationId: options.correlationId || `lock_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
-        }
-      }
-    });
-    
-    if (error) {
-      console.error(`Error acquiring lock for ${entityType}:${entityId}:`, error);
-      return false;
-    }
-    
-    if (data && data.acquired) {
-      console.log(`Successfully acquired lock for ${entityType}:${entityId} via ${data.method}`);
-      return true;
-    } else {
-      const reason = data?.reason || "Unknown reason";
-      console.log(`Failed to acquire lock for ${entityType}:${entityId}: ${reason}`);
-      return false;
-    }
-  } catch (error) {
-    console.error(`Exception acquiring lock for ${entityType}:${entityId}:`, error);
-    return false;
-  }
-}
-
-/**
- * Releases a processing lock
- */
-export async function releaseProcessingLock(
-  entityType: string,
-  entityId: string,
-  workerId?: string
-): Promise<boolean> {
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL") || "",
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
-  );
-
-  try {
-    // Use the lockManager edge function to release a lock
-    const { data, error } = await supabase.functions.invoke("lockManager", {
-      body: {
-        operation: "release",
-        entityType,
-        entityId,
-        options: {
-          workerId: workerId || Deno.env.get("WORKER_ID") || undefined,
-        }
-      }
-    });
-    
-    if (error) {
-      console.error(`Error releasing lock for ${entityType}:${entityId}:`, error);
-      return false;
-    }
-    
-    if (data && data.released) {
-      console.log(`Successfully released lock for ${entityType}:${entityId}`);
-      return true;
-    } else {
-      const errors = data?.errors ? JSON.stringify(data.errors) : "Unknown reason";
-      console.log(`Failed to release lock for ${entityType}:${entityId}: ${errors}`);
-      return false;
-    }
-  } catch (error) {
-    console.error(`Exception releasing lock for ${entityType}:${entityId}:`, error);
-    return false;
-  }
-}
-
-/**
- * Enqueues a message to a Supabase queue
+ * Enqueues a message to a Supabase queue with proper deduplication
+ * Returns true if enqueued successfully, false if deduplicated or error
  */
 export async function enqueueMessage(
   supabase: any,
   queueName: string,
-  message: any
+  message: any,
+  deduplicationKey?: string,
+  deduplicationService?: DeduplicationService
 ): Promise<boolean> {
   try {
-    const { error } = await supabase.functions.invoke("sendToQueue", {
-      body: {
-        queue_name: queueName,
-        message: message
+    // Check if we should deduplicate this message
+    if (deduplicationKey && deduplicationService) {
+      try {
+        const isDuplicate = await deduplicationService.isDuplicate(queueName, deduplicationKey);
+        if (isDuplicate) {
+          console.log(`Message with key ${deduplicationKey} already queued in ${queueName}, skipping`);
+          return false;
+        }
+        
+        // Since not a duplicate, mark it as being processed
+        await deduplicationService.markAsProcessed(queueName, deduplicationKey);
+      } catch (dedupError) {
+        // Log but continue - deduplication errors shouldn't block queueing
+        console.warn(`Deduplication error for ${queueName}:${deduplicationKey}, proceeding anyway:`, dedupError);
       }
-    });
-
-    if (error) {
-      console.error(`Error enqueueing message to queue ${queueName}:`, error);
-      return false;
     }
+    
+    // Use the most reliable direct database function
+    try {
+      // Try specialized function first if available
+      if (queueName === 'album_discovery' && message.artistId) {
+        const { data, error } = await supabase.rpc(
+          'start_album_discovery',
+          { artist_id: message.artistId, offset_val: message.offset || 0 }
+        );
+        
+        if (error) {
+          throw new Error(`Error calling start_album_discovery: ${error.message}`);
+        }
+        
+        console.log(`Successfully enqueued album discovery for artist ${message.artistId}, message ID: ${data}`);
+        return true;
+      }
+      
+      if (queueName === 'track_discovery' && message.albumId) {
+        const { data, error } = await supabase.rpc(
+          'start_track_discovery',
+          { album_id: message.albumId, offset_val: message.offset || 0 }
+        );
+        
+        if (error) {
+          throw new Error(`Error calling start_track_discovery: ${error.message}`);
+        }
+        
+        console.log(`Successfully enqueued track discovery for album ${message.albumId}, message ID: ${data}`);
+        return true;
+      }
+      
+      if (queueName === 'artist_discovery' && message.artistName) {
+        const { data, error } = await supabase.rpc(
+          'start_artist_discovery',
+          { artist_name: message.artistName }
+        );
+        
+        if (error) {
+          throw new Error(`Error calling start_artist_discovery: ${error.message}`);
+        }
+        
+        console.log(`Successfully enqueued artist discovery for ${message.artistName}, message ID: ${data}`);
+        return true;
+      }
+      
+      if (queueName === 'producer_identification' && message.trackId) {
+        const { data, error } = await supabase.rpc(
+          'start_producer_identification',
+          { track_id: message.trackId }
+        );
+        
+        if (error) {
+          throw new Error(`Error calling start_producer_identification: ${error.message}`);
+        }
+        
+        console.log(`Successfully enqueued producer identification for track ${message.trackId}, message ID: ${data}`);
+        return true;
+      }
+      
+      // General case - use generic pg_enqueue
+      const { data, error } = await supabase.rpc(
+        'pg_enqueue',
+        { 
+          queue_name: queueName, 
+          message_body: {
+            ...message,
+            _idempotencyKey: deduplicationKey || `${queueName}:${Date.now()}:${Math.random().toString(36).substring(2, 10)}`
+          }
+        }
+      );
+      
+      if (error) {
+        throw new Error(`Error enqueueing to ${queueName}: ${error.message}`);
+      }
+      
+      console.log(`Successfully enqueued message to ${queueName}, message ID: ${data}`);
+      return true;
+    } catch (rpcError) {
+      console.error(`Failed to enqueue message to ${queueName} using database function:`, rpcError);
+      
+      // Fall back to Edge Function if database RPC failed
+      try {
+        const { error } = await supabase.functions.invoke("sendToQueue", {
+          body: {
+            queue_name: queueName,
+            message: message
+          }
+        });
 
-    console.log(`Message successfully enqueued to queue ${queueName}`);
-    return true;
+        if (error) {
+          console.error(`Error from sendToQueue Edge Function:`, error);
+          return false;
+        }
+
+        console.log(`Successfully enqueued message to ${queueName} via Edge Function`);
+        return true;
+      } catch (fnError) {
+        console.error(`Failed to call sendToQueue Edge Function:`, fnError);
+        return false;
+      }
+    }
   } catch (error) {
     console.error(`Exception enqueueing message to queue ${queueName}:`, error);
     return false;

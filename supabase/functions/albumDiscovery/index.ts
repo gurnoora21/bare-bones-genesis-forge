@@ -3,7 +3,11 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { processQueueMessageSafely, deleteMessageWithRetries } from "../_shared/queueHelper.ts";
+import { 
+  processQueueMessageSafely, 
+  deleteMessageWithRetries,
+  enqueueMessage
+} from "../_shared/queueHelper.ts";
 import { DeduplicationService } from "../_shared/deduplication.ts";
 
 interface AlbumDiscoveryMsg {
@@ -32,6 +36,9 @@ serve(async (req) => {
     url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
     token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
   });
+  
+  // Initialize deduplication service
+  const deduplicationService = new DeduplicationService(redis);
   
   // Create a process ID to track this invocation in logs
   const processId = crypto.randomUUID();
@@ -132,7 +139,7 @@ serve(async (req) => {
         
         let successCount = 0;
         let errorCount = 0;
-        let dedupedCount = 0;
+        let tracksQueued = 0;
 
         for (const message of messages) {
           try {
@@ -171,48 +178,43 @@ serve(async (req) => {
             const idempotencyKey = `artist:${msg.artistId}:albums:offset:${msg.offset || 0}`;
             
             try {
-              // Process message with MINIMAL deduplication - we want to make sure albums are processed
-              await processQueueMessageSafely(
+              // Process message - we're relying on direct processing now
+              const result = await processQueueMessageSafely(
                 supabase,
                 "album_discovery",
                 messageId.toString(),
-                async () => await processAlbumDiscovery(supabase, spotifyClient, msg, log),
-                idempotencyKey, 
                 async () => {
-                  // Check if artist has albums already, if yes, we might be duplicating
-                  // But we need to be careful as duplicate album discovery is better than none
-                  try {
-                    const { count, error } = await supabase
-                      .from('albums')
-                      .select('*', { count: 'exact', head: true })
-                      .eq('artist_id', msg.artistId);
-                      
-                    // Only consider duplicates if album count > 0 AND offset = 0
-                    if (!error && count && count > 0 && msg.offset === 0) {
-                      log("info", `Artist ${msg.artistId} already has ${count} albums - potential duplicate, but proceeding anyway`);
-                    }
-                    
-                    // Always return false to force processing - we'd rather have duplicate processing 
-                    // than missing album discovery
-                    return false;
-                  } catch (dbError) {
-                    log("warn", `Error checking existing albums for artist ${msg.artistId}`, { error: dbError.message });
-                    return false;
-                  }
+                  const processed = await processAlbumDiscovery(
+                    supabase, 
+                    spotifyClient, 
+                    msg, 
+                    log, 
+                    deduplicationService
+                  );
+                  
+                  // Track how many track discovery jobs we enqueued
+                  tracksQueued += processed.tracksQueued || 0;
+                  
+                  return processed;
+                },
+                idempotencyKey,
+                async () => {
+                  // We'll always do album discovery since pagination might be needed
+                  return false;
                 },
                 {
                   maxRetries: 3,
                   deduplication: {
-                    enabled: false, // CRITICAL: disable deduplication to fix pipeline
-                    redis,
-                    ttlSeconds: 86400,
-                    bypassForQueues: ['album_discovery'] // Also add safety bypass in case deduplication is re-enabled
+                    enabled: false // Disable deduplication as we want to process every album discovery message
                   }
                 }
               );
               
               successCount++;
-              log("info", `Successfully processed album discovery for artist ID: ${msg.artistId}`);
+              log("info", `Successfully processed album discovery for artist ID: ${msg.artistId}`, {
+                savedAlbums: result.processed,
+                artist: result.artist
+              });
               
             } catch (processError) {
               log("error", `Error processing album discovery message ${messageId}`, { 
@@ -236,22 +238,12 @@ serve(async (req) => {
           }
         }
 
-        log("info", `Background processing complete: ${successCount} successful, ${dedupedCount} deduplicated, ${errorCount} failed`);
-        
-        // Record metrics
-        try {
-          await supabase.from('queue_metrics').insert({
-            queue_name: "album_discovery",
-            operation: "batch_processing",
-            started_at: new Date().toISOString(),
-            finished_at: new Date().toISOString(),
-            processed_count: messages.length,
-            success_count: successCount,
-            error_count: errorCount
-          });
-        } catch (metricsError) {
-          log("warn", "Failed to record metrics", { error: metricsError.message });
-        }
+        log("info", `Background processing complete`, {
+          successes: successCount,
+          errors: errorCount,
+          tracksQueued,
+          messageCount: messages.length
+        });
       } catch (backgroundError) {
         log("error", "Error in background processing", { error: backgroundError.message, stack: backgroundError.stack });
       }
@@ -271,7 +263,8 @@ async function processAlbumDiscovery(
   supabase: any, 
   spotifyClient: SpotifyClient,
   msg: AlbumDiscoveryMsg,
-  log: (level: string, message: string, data?: any) => void
+  log: (level: string, message: string, data?: any) => void,
+  deduplicationService: DeduplicationService
 ): Promise<any> {
   const { artistId, offset = 0 } = msg;
 
@@ -295,13 +288,15 @@ async function processAlbumDiscovery(
     
     if (!albumsData || !albumsData.items || !Array.isArray(albumsData.items)) {
       log("warn", `No albums returned from Spotify for artist ${artist.name}`, { artistId });
-      return { processed: 0, message: "No albums found" };
+      return { processed: 0, message: "No albums found", artist: artist.name, tracksQueued: 0 };
     }
 
     log("info", `Retrieved ${albumsData.items.length} albums from Spotify for artist ${artist.name}`);
 
     // Process each album
     let savedAlbums = 0;
+    let tracksQueued = 0;
+    
     for (const albumData of albumsData.items) {
       try {
         // Normalize and store album data
@@ -332,19 +327,21 @@ async function processAlbumDiscovery(
         log("info", `Stored album in database: ${albumData.name} with ID ${album.id}`);
 
         // Queue track discovery for this album
-        const { data: trackJobId, error: trackJobError } = await supabase.rpc('pg_enqueue', {
-          queue_name: 'track_discovery',
-          message_body: { 
-            albumId: album.id, 
-            offset: 0,
-            _idempotencyKey: `album:${album.id}:tracks:offset:0` 
-          }
-        });
-
-        if (trackJobError) {
-          log("error", `Error enqueueing track discovery for album ${album.id}`, { error: trackJobError.message });
+        const idempotencyKey = `album:${album.id}:tracks:offset:0`;
+        
+        const trackQueueResult = await enqueueMessage(
+          supabase,
+          'track_discovery',
+          { albumId: album.id, offset: 0 },
+          idempotencyKey,
+          deduplicationService
+        );
+        
+        if (trackQueueResult) {
+          tracksQueued++;
+          log("info", `Enqueued track discovery for album ${album.id}`);
         } else {
-          log("info", `Enqueued track discovery for album ${album.id}, message ID: ${trackJobId}`);
+          log("warn", `Failed to enqueue track discovery for album ${album.id}`);
         }
 
         savedAlbums++;
@@ -360,29 +357,29 @@ async function processAlbumDiscovery(
     if (albumsData.next) {
       const nextOffset = offset + albumsData.items.length;
       
-      // Queue next batch of albums
-      const { data: nextBatchId, error: nextBatchError } = await supabase.rpc('pg_enqueue', {
-        queue_name: 'album_discovery',
-        message_body: {
-          artistId,
-          offset: nextOffset,
-          _idempotencyKey: `artist:${artistId}:albums:offset:${nextOffset}`
-        }
-      });
-
-      if (nextBatchError) {
-        log("error", `Error enqueueing next album batch at offset ${nextOffset}`, { 
-          error: nextBatchError.message 
-        });
+      // Queue next batch of albums using our simplified helper
+      const nextBatchIdempotencyKey = `artist:${artistId}:albums:offset:${nextOffset}`;
+      
+      const nextBatchResult = await enqueueMessage(
+        supabase,
+        'album_discovery',
+        { artistId, offset: nextOffset },
+        nextBatchIdempotencyKey,
+        deduplicationService
+      );
+      
+      if (nextBatchResult) {
+        log("info", `Enqueued next album batch at offset ${nextOffset}`);
       } else {
-        log("info", `Enqueued next album batch at offset ${nextOffset}, message ID: ${nextBatchId}`);
+        log("warn", `Failed to enqueue next album batch at offset ${nextOffset}`);
       }
     }
 
     return {
       processed: savedAlbums,
       artist: artist.name,
-      message: `Processed ${savedAlbums} albums for artist ${artist.name}`
+      message: `Processed ${savedAlbums} albums for artist ${artist.name}`,
+      tracksQueued
     };
 
   } catch (error) {

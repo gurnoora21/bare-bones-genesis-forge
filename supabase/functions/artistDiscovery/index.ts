@@ -1,10 +1,14 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { processQueueMessageSafely, logWorkerIssue, deleteMessageWithRetries } from "../_shared/queueHelper.ts";
+import { 
+  processQueueMessageSafely, 
+  deleteMessageWithRetries, 
+  enqueueMessage 
+} from "../_shared/queueHelper.ts";
 import { DeduplicationService } from "../_shared/deduplication.ts";
-import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 
 interface ArtistDiscoveryMsg {
   artistId?: string;
@@ -16,115 +20,15 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Add a worker issue logging function
-async function logWorkerIssue(
-  supabase: any,
-  workerName: string,
-  issueType: string,
-  message: string,
-  details: any = {}
-) {
-  try {
-    await supabase.from('worker_issues').insert({
-      worker_name: workerName,
-      issue_type: issueType,
-      message: message,
-      details: details,
-      resolved: false
-    });
-    console.error(`[${workerName}] ${issueType}: ${message}`);
-  } catch (error) {
-    console.error("Failed to log worker issue:", error);
-  }
-}
-
-// Helper function to delete messages with retries
-async function deleteMessageWithRetries(
-  supabase: any,
-  queueName: string,
-  messageId: string,
-  maxRetries: number = 3
-): Promise<boolean> {
-  console.log(`Attempting to delete message ${messageId} from queue ${queueName} with up to ${maxRetries} retries`);
-  
-  let deleted = false;
-  let attempts = 0;
-  
-  while (!deleted && attempts < maxRetries) {
-    attempts++;
-    
-    try {
-      // Try using the database function first
-      const { data, error } = await supabase.rpc(
-        'pg_delete_message',
-        { 
-          queue_name: queueName, 
-          message_id: messageId.toString()
-        }
-      );
-      
-      if (error) {
-        console.error(`Delete attempt ${attempts} failed with RPC error:`, error);
-      } else if (data === true) {
-        console.log(`Successfully deleted message ${messageId} from ${queueName} (attempt ${attempts})`);
-        deleted = true;
-        break;
-      } else {
-        console.warn(`Delete attempt ${attempts} returned false for message ${messageId}`);
-      }
-
-      // If the first method failed and this isn't the last attempt, try the Edge Function approach
-      if (!deleted && attempts < maxRetries) {
-        const deleteResponse = await fetch(
-          `${Deno.env.get("SUPABASE_URL")}/functions/v1/deleteFromQueue`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${Deno.env.get("SUPABASE_ANON_KEY")}`
-            },
-            body: JSON.stringify({ queue_name: queueName, message_id: messageId })
-          }
-        );
-        
-        if (deleteResponse.ok) {
-          const result = await deleteResponse.json();
-          if (result.success) {
-            console.log(`Successfully deleted message ${messageId} via Edge Function (attempt ${attempts})`);
-            deleted = true;
-            break;
-          } else if (result.reset) {
-            console.log(`Reset visibility timeout for message ${messageId} (attempt ${attempts})`);
-            // We'll consider this a success in terms of handling the message
-            deleted = true;
-            break;
-          }
-        }
-      }
-      
-      // Wait before retrying (exponential backoff with jitter)
-      if (!deleted && attempts < maxRetries) {
-        const baseDelay = Math.pow(2, attempts) * 100;
-        const jitter = Math.floor(Math.random() * 100);
-        const delayMs = baseDelay + jitter;
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
-    } catch (e) {
-      console.error(`Error during deletion attempt ${attempts} for message ${messageId}:`, e);
-      
-      // Wait before retrying
-      if (attempts < maxRetries) {
-        const delayMs = Math.pow(2, attempts) * 100;
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
-    }
-  }
-  
-  if (!deleted) {
-    console.error(`Failed to delete message ${messageId} after ${maxRetries} attempts`);
-  }
-  
-  return deleted;
+// Simple logging function
+function log(level: string, message: string, details: any = {}) {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    service: "artistDiscovery",
+    ...details
+  }));
 }
 
 serve(async (req) => {
@@ -144,14 +48,14 @@ serve(async (req) => {
     token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
   });
   
-  // Initialize metrics
-  const metrics = getDeduplicationMetrics(redis);
+  // Initialize deduplication service
+  const deduplicationService = new DeduplicationService(redis);
 
-  console.log("Starting artist discovery worker process...");
+  log("info", "Starting artist discovery worker process");
 
   try {
     // Process queue batch
-    console.log("Attempting to dequeue from artist_discovery queue");
+    log("info", "Attempting to dequeue from artist_discovery queue");
     const { data: queueData, error: queueError } = await supabase.rpc('pg_dequeue', { 
       queue_name: "artist_discovery",
       batch_size: 5,
@@ -159,15 +63,7 @@ serve(async (req) => {
     });
 
     if (queueError) {
-      console.error("Error reading from queue:", queueError);
-      await logWorkerIssue(
-        supabase,
-        "artistDiscovery", 
-        "queue_error", 
-        `Error reading from queue: ${queueError.message}`, 
-        { error: queueError }
-      );
-      
+      log("error", "Error reading from queue", { error: queueError });
       return new Response(JSON.stringify({ error: queueError }), { 
         status: 500, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -177,7 +73,10 @@ serve(async (req) => {
     // Parse the JSONB result from pg_dequeue
     let messages = [];
     try {
-      console.log("Raw queue data received:", typeof queueData, queueData ? JSON.stringify(queueData).substring(0, 300) + "..." : "null");
+      log("info", "Raw queue data received", { 
+        dataType: typeof queueData,
+        data: queueData ? JSON.stringify(queueData).substring(0, 300) + "..." : "null"
+      });
       
       // Handle either string or object formats
       if (typeof queueData === 'string') {
@@ -186,18 +85,10 @@ serve(async (req) => {
         messages = queueData;
       }
     } catch (e) {
-      console.error("Error parsing queue data:", e);
-      console.log("Raw queue data:", queueData);
-      await logWorkerIssue(
-        supabase,
-        "artistDiscovery", 
-        "queue_parsing", 
-        `Error parsing queue data: ${e.message}`, 
-        { queueData, error: e.message }
-      );
+      log("error", "Error parsing queue data", { error: e.message, queueData });
     }
 
-    console.log(`Retrieved ${messages.length} messages from queue`);
+    log("info", `Retrieved ${messages.length} messages from queue`);
 
     if (!messages || messages.length === 0) {
       return new Response(
@@ -215,34 +106,24 @@ serve(async (req) => {
     // Process messages in background to avoid CPU timeout
     EdgeRuntime.waitUntil((async () => {
       try {
-        let spotifyClient = null;
-        
-        // Try to initialize Spotify client, but don't fail if it doesn't work
+        // Initialize Spotify client
+        let spotifyClient: SpotifyClient | null = null;
         try {
           spotifyClient = new SpotifyClient();
+          log("info", "Spotify client initialized successfully");
         } catch (spotifyError) {
-          console.error("Failed to initialize Spotify client:", spotifyError);
-          await logWorkerIssue(
-            supabase,
-            "artistDiscovery", 
-            "spotify_init_error", 
-            `Failed to initialize Spotify client: ${spotifyError.message}`, 
-            { error: spotifyError }
-          );
+          log("error", "Failed to initialize Spotify client", { error: spotifyError.message });
         }
         
         let successCount = 0;
         let errorCount = 0;
-        let dedupedCount = 0;
+        let albumsQueued = 0;
 
         for (const message of messages) {
-          // Ensure the message is properly parsed
           try {
             let msg: ArtistDiscoveryMsg;
             
             // Handle potential message format issues
-            console.log("Processing message:", JSON.stringify(message));
-            
             if (typeof message.message === 'string') {
               msg = JSON.parse(message.message) as ArtistDiscoveryMsg;
             } else if (message.message && typeof message.message === 'object') {
@@ -252,7 +133,7 @@ serve(async (req) => {
             }
             
             const messageId = message.id || message.msg_id;
-            console.log(`Processing message ${messageId}: ${JSON.stringify(msg)}`);
+            log("info", `Processing message ${messageId}`, { msg });
             
             // Create idempotency key based on artist ID or name
             const idempotencyKey = msg.artistId 
@@ -260,12 +141,12 @@ serve(async (req) => {
               : `artist:name:${msg.artistName}`;
             
             try {
-              // Process message with deduplication
+              // Process message with basic deduplication 
               const result = await processQueueMessageSafely(
                 supabase,
                 "artist_discovery",
                 messageId.toString(),
-                async () => await processArtistWithoutCache(supabase, spotifyClient, msg, redis),
+                async () => await processArtist(supabase, spotifyClient, msg, redis),
                 idempotencyKey, 
                 async () => {
                   // Check if this artist was already processed
@@ -277,11 +158,12 @@ serve(async (req) => {
                       .maybeSingle();
                     return !!data;
                   } else if (msg.artistName) {
+                    // For names, we'll check Redis but errors shouldn't block
                     try {
                       const artistKey = `processed:artist:name:${msg.artistName.toLowerCase()}`;
                       return await redis.exists(artistKey) === 1;
                     } catch (redisError) {
-                      console.warn(`Redis check failed for artist ${msg.artistName}:`, redisError);
+                      log("warn", `Redis check failed for artist ${msg.artistName}`, { error: redisError.message });
                       return false;
                     }
                   }
@@ -292,100 +174,67 @@ serve(async (req) => {
                   deduplication: {
                     enabled: true,
                     redis,
-                    ttlSeconds: 86400, // 24 hour deduplication window
-                    strictMatching: false
+                    ttlSeconds: 86400 // 24 hour deduplication window
                   }
                 }
               );
               
               if (result) {
                 if (typeof result === 'object' && result.deduplication) {
-                  dedupedCount++;
-                  await metrics.recordDeduplicated("artist_discovery", "consumer");
-                  console.log(`Message ${messageId} was handled by deduplication`);
+                  log("info", `Message ${messageId} was handled by deduplication`);
                 } else {
                   successCount++;
-                  console.log(`Successfully processed artist with ID: ${result.id}`);
+                  log("info", `Successfully processed artist with ID: ${result.id}`, { artistId: result.id });
                   
-                  // Mark this artist as processed in Redis
-                  if (msg.artistName) {
-                    try {
-                      const artistKey = `processed:artist:name:${msg.artistName.toLowerCase()}`;
-                      await redis.set(artistKey, 'true', { ex: 86400 });
-                    } catch (redisError) {
-                      console.warn(`Failed to mark artist ${msg.artistName} as processed in Redis:`, redisError);
-                    }
+                  // Ensure album discovery is queued
+                  const albumQueueResult = await enqueueMessage(
+                    supabase,
+                    'album_discovery',
+                    { artistId: result.id, offset: 0 },
+                    `artist:${result.id}:albums:offset:0`,
+                    deduplicationService
+                  );
+                  
+                  if (albumQueueResult) {
+                    albumsQueued++;
+                    log("info", `Successfully queued album discovery for artist ID: ${result.id}`);
+                  } else {
+                    log("warn", `Failed to queue album discovery for artist ID: ${result.id}`);
                   }
                 }
               } else {
-                console.error(`Failed to process message ${messageId}`);
+                log("error", `Failed to process message ${messageId}`);
                 errorCount++;
               }
             } catch (processError) {
-              console.error(`Error processing artist message:`, processError);
-              await logWorkerIssue(
-                supabase,
-                "artistDiscovery", 
-                "processing_error", 
-                `Error processing artist: ${processError.message}`, 
-                { message: msg, error: processError.message }
-              );
+              log("error", `Error processing artist message`, { error: processError.message, message: msg });
               errorCount++;
             }
           } catch (parseError) {
-            console.error(`Error parsing message:`, parseError);
-            await logWorkerIssue(
-              supabase,
-              "artistDiscovery", 
-              "message_parsing", 
-              `Error parsing message: ${parseError.message}`, 
-              { message, error: parseError.message }
-            );
+            log("error", `Error parsing message`, { error: parseError.message, message });
             errorCount++;
+            
+            // Try to delete the message to avoid reprocessing
+            if (message.id || message.msg_id) {
+              await deleteMessageWithRetries(supabase, "artist_discovery", (message.id || message.msg_id).toString());
+            }
           }
         }
 
-        console.log(`Background processing complete: ${successCount} successful, ${dedupedCount} deduplicated, ${errorCount} failed`);
-        
-        // Record metrics
-        try {
-          await supabase.from('queue_metrics').insert({
-            queue_name: "artist_discovery",
-            operation: "batch_processing",
-            started_at: new Date().toISOString(),
-            finished_at: new Date().toISOString(),
-            processed_count: messages.length,
-            success_count: successCount,
-            error_count: errorCount,
-            details: { 
-              deduplicated_count: dedupedCount
-            }
-          });
-        } catch (metricsError) {
-          console.error("Failed to record metrics:", metricsError);
-        }
+        log("info", `Background processing complete`, {
+          successes: successCount,
+          errors: errorCount,
+          albumsQueued: albumsQueued,
+          messageCount: messages.length
+        });
       } catch (backgroundError) {
-        console.error("Error in background processing:", backgroundError);
-        await logWorkerIssue(
-          supabase,
-          "artistDiscovery", 
-          "background_error", 
-          `Background processing error: ${backgroundError.message}`, 
-          { error: backgroundError.message }
-        );
+        log("error", "Error in background processing", { error: backgroundError.message, stack: backgroundError.stack });
       }
     })());
     
     return response;
   } catch (mainError) {
-    console.error("Major error in artistDiscovery function:", mainError);
-    await logWorkerIssue(
-      supabase,
-      "artistDiscovery", 
-      "fatal_error", 
-      `Major error: ${mainError.message}`, 
-      { error: mainError.message, stack: mainError.stack }
-    );
+    log("error", "Major error in artistDiscovery function", { error: mainError.message, stack: mainError.stack });
     
     return new Response(JSON.stringify({ error: mainError.message }), { 
       status: 500, 
@@ -394,14 +243,13 @@ serve(async (req) => {
   }
 });
 
-// Updated implementation to bypass Redis issues and ensure proper album queueing
-async function processArtistWithoutCache(
+// Process an artist from the discovery queue
+async function processArtist(
   supabase: any, 
   spotifyClient: any, 
   msg: ArtistDiscoveryMsg,
   redis: Redis
 ) {
-  console.log("Processing artist:", msg);
   const { artistId, artistName } = msg;
   
   if (!artistId && !artistName) {
@@ -485,7 +333,7 @@ async function processArtistWithoutCache(
 
   console.log(`Stored artist in database with ID: ${artist.id}`);
 
-  // IMPORTANT: Mark this artist as processed in Redis before enqueueing albums
+  // Mark this artist as processed in Redis 
   if (artistName) {
     try {
       const artistKey = `processed:artist:name:${artistName.toLowerCase()}`;
@@ -493,34 +341,13 @@ async function processArtistWithoutCache(
       console.log(`Marked artist ${artistName} as processed in Redis`);
     } catch (redisError) {
       console.warn(`Failed to mark artist ${artistName} as processed in Redis:`, redisError);
-      // Continue anyway - we don't want Redis issues to block album discovery
+      // Continue anyway
     }
   }
 
-  // Critical fix: Let's bypass Redis deduplication for album discovery 
-  // by using direct database function call for maximum reliability
-  try {
-    console.log(`Enqueueing album discovery for artist ID ${artist.id} using start_album_discovery function`);
-    const { data: directData, error: directError } = await supabase.rpc(
-      'start_album_discovery',
-      { 
-        artist_id: artist.id,
-        offset_val: 0
-      }
-    );
-    
-    if (directError) {
-      console.error("Error calling start_album_discovery:", directError);
-      throw new Error(`Error enqueueing album discovery: ${directError.message}`);
-    } else {
-      console.log("Album discovery enqueuing succeeded:", directData);
-    }
-  } catch (enqueueError) {
-    console.error("Exception in album discovery enqueue:", enqueueError);
-    throw new Error(`Error enqueueing album discovery: ${enqueueError.message}`);
-  }
-
-  console.log(`Processed artist ${artistData.name}, enqueued album discovery for artist ID ${artist.id}`);
+  // The album discovery will be queued outside this function
+  // to ensure proper logging and error handling
+  
   return artist;
 }
 
