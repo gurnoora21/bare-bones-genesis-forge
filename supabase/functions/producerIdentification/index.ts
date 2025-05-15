@@ -1,13 +1,20 @@
 
-// Producer identification worker using the enhanced circuit breaker and resilience mechanisms
+/**
+ * Producer Identification Edge Function
+ * 
+ * Processes track messages to identify producers via Genius API
+ * Uses enhanced worker base class for scaling and reliability
+ */
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { IdempotentWorker } from "../_shared/idempotentWorker.ts";
-import { getApiResilienceManager } from "../_shared/apiResilienceManager.ts";
-import { createEnhancedGeniusClient } from "../_shared/enhancedGeniusClient.ts";
-import { DeduplicationService, getDeduplicationService } from "../_shared/deduplication.ts";
+import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
+
+// Initialize Supabase client
+const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
+const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Initialize Redis client
 const redis = new Redis({
@@ -15,108 +22,75 @@ const redis = new Redis({
   token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
 });
 
-// Initialize API resilience manager
-const apiResilienceManager = getApiResilienceManager(redis);
+// Import Genius client factory
+import { createEnhancedGeniusClient } from "../_shared/enhancedGeniusClient.ts";
 
-// Initialize Genius client with resilience
-const geniusClient = createEnhancedGeniusClient(
-  Deno.env.get("GENIUS_ACCESS_TOKEN") || "",
-  redis,
-  apiResilienceManager
-);
-
-// Initialize Supabase client
-const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// Initialize deduplication service
-const deduplicationService = getDeduplicationService(redis);
-
-// CORS headers for function responses
+// CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-interface ProducerIdentificationMessage {
-  trackId: string;
-  track_id?: string;  // Alternative property name
-  artistName?: string;
-  trackName?: string;
-  album?: string;
-  _idempotencyKey?: string;
-}
-
-class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificationMessage> {
+// Producer Identification Worker class
+class ProducerIdentificationWorker extends createEnhancedWorker<any> {
+  private geniusClient: any;
+  
   constructor() {
     super('producer_identification', supabase, redis);
+    
+    // Initialize the Genius client with API key
+    this.geniusClient = createEnhancedGeniusClient(
+      Deno.env.get("GENIUS_ACCESS_TOKEN") || ""
+    );
   }
-
-  /**
-   * Extract entity information from message for deduplication and locking
-   */
-  protected extractEntityInfo(message: ProducerIdentificationMessage): { entityType: string; entityId: string } | null {
+  
+  // Validate message format
+  validateMessage(message: any): boolean {
+    return Boolean(message && (message.trackId || message.track_id));
+  }
+  
+  // Create idempotency key for this operation
+  createIdempotencyKey(message: any): string {
+    return message._idempotencyKey || 
+      `producer_identification:track:${message.trackId || message.track_id}`;
+  }
+  
+  // Process a single message
+  async processMessage(message: any): Promise<any> {
+    console.log("Processing producer identification for track:", 
+      message.trackId || message.track_id);
+    
+    // Get the normalized track ID
     const trackId = message.trackId || message.track_id;
     
-    if (trackId) {
-      return {
-        entityType: 'track',
-        entityId: trackId
+    if (!trackId) {
+      throw new Error("Message missing trackId");
+    }
+    
+    // Acquire a direct DB lock for this track
+    const lockAcquired = await this.acquireDirectDbLock(trackId);
+    
+    if (!lockAcquired) {
+      console.log(`Track ${trackId} is already being processed, skipping`);
+      return { 
+        status: 'skipped', 
+        reason: 'already_processing'
       };
     }
     
-    return null;
-  }
-  
-  /**
-   * Validate the message before processing
-   */
-  protected validateMessage(message: ProducerIdentificationMessage): boolean {
-    return !!(message.trackId || message.track_id);
-  }
-  
-  /**
-   * Create idempotency key for the message
-   */
-  protected createIdempotencyKey(message: ProducerIdentificationMessage): string {
-    // Use provided idempotency key if available
-    if (message._idempotencyKey) {
-      return message._idempotencyKey;
-    }
-    
-    const trackId = message.trackId || message.track_id;
-    return `producer_identification:track:${trackId}`;
-  }
-  
-  /**
-   * Process a message from the queue
-   */
-  async processMessage(message: ProducerIdentificationMessage): Promise<any> {
-    console.log(`Processing producer identification for track ${message.trackId || message.track_id}`);
-    
     try {
-      // Get track ID (supporting both property names)
-      const trackId = message.trackId || message.track_id;
-      
-      if (!trackId) {
-        return { 
-          success: false, 
-          error: "No track ID provided in message"
-        };
-      }
-      
-      // Get track details from database
-      const { data: track, error: trackError } = await this.supabase
+      // Fetch track details from database
+      const { data: track, error } = await supabase
         .from('tracks')
         .select(`
           id, 
           name, 
-          album_id,
-          albums:album_id (
+          spotify_id, 
+          albums!inner (
+            id, 
             name, 
-            artist_id,
-            artists:artist_id (
+            artists!inner (
+              id, 
               name
             )
           )
@@ -124,377 +98,278 @@ class ProducerIdentificationWorker extends IdempotentWorker<ProducerIdentificati
         .eq('id', trackId)
         .single();
       
-      if (trackError) {
-        console.error(`Error fetching track:`, trackError);
-        return { 
-          success: false, 
-          error: `Failed to fetch track: ${trackError.message}`,
-          metadata: { trackId }
-        };
+      if (error || !track) {
+        throw new Error(`Failed to fetch track ${trackId}: ${error?.message || 'Track not found'}`);
       }
       
-      if (!track) {
-        return { 
-          success: false, 
-          error: `Track not found with ID: ${trackId}`,
-          metadata: { trackId } 
-        };
-      }
-      
-      const artistName = track.albums?.artists?.name;
+      // Extract track and artist names
       const trackName = track.name;
-      const albumName = track.albums?.name;
+      const artistName = track.albums?.artists?.[0]?.name;
       
-      if (!artistName || !trackName) {
+      if (!trackName || !artistName) {
+        throw new Error(`Missing track name or artist name for track ${trackId}`);
+      }
+      
+      // Search for the song on Genius
+      console.log(`Searching Genius for "${trackName} ${artistName}"`);
+      const searchResults = await this.geniusClient.searchSong(`${trackName} ${artistName}`);
+      
+      // If no results found, log and return success with no producers
+      if (!searchResults || !searchResults.hits || searchResults.hits.length === 0) {
+        console.log(`No Genius results found for "${trackName} ${artistName}"`);
         return { 
-          success: false, 
-          error: `Incomplete track data: ${JSON.stringify({ artistName, trackName })}`,
-          metadata: { trackId, track }
+          status: 'completed', 
+          found: false,
+          message: 'No Genius results found' 
         };
       }
       
-      console.log(`Searching for '${trackName} by ${artistName}'`);
+      console.log(`Found ${searchResults.hits.length} potential matches on Genius`);
       
-      // Check if we've already processed this track
-      const isDuplicate = await deduplicationService.isDuplicate(
-        'producer_identification', 
-        'track', 
-        { logDetails: true }, 
-        { entityId: trackId, correlationId: `prod_id_${trackId}` }
-      );
-      
-      if (isDuplicate) {
-        console.log(`Track ${trackId} already processed for producer identification, skipping`);
-        return {
-          success: true,
-          skipped: true,
-          reason: 'already_processed',
-          metadata: { trackId }
+      // Take the first search result as the most likely match
+      const firstHit = searchResults.hits[0];
+      if (!firstHit || !firstHit.result || !firstHit.result.id) {
+        console.log(`No valid hit in search results for "${trackName} ${artistName}"`);
+        return { 
+          status: 'completed', 
+          found: false,
+          message: 'Invalid search results structure' 
         };
       }
       
-      // Bypass circuit breaker logic for now and use direct DB acquisition
-      await this.acquireDirectDbLock(trackId);
+      // Get detailed song info to extract producer credits
+      const songId = firstHit.result.id;
+      console.log(`Fetching detailed info for Genius song ID: ${songId}`);
+      const songDetails = await this.geniusClient.getSongById(songId);
       
-      try {
-        // Only proceed if we were able to acquire the lock
-        const searchQuery = `${trackName} ${artistName}`;
-        const searchResult = await geniusClient.searchSong(searchQuery);
-        
-        if (!searchResult.hits || searchResult.hits.length === 0) {
-          console.log(`No search results found`);
-          
-          // Mark as processed even though no producers found
-          await deduplicationService.markAsProcessed(
-            'producer_identification',
-            'track',
-            86400, // 24 hour TTL
-            { entityId: trackId, correlationId: `prod_id_${trackId}` }
-          );
-          
-          return { 
-            success: true,  // Mark as success with no results
-            metadata: { trackId, searchQuery, found: false }
-          };
-        }
-        
-        console.log(`Found ${searchResult.hits.length} results, processing first match`);
-        
-        // Process first match
-        const firstMatch = searchResult.hits[0].result;
-        const songId = firstMatch.id;
-        
-        // Get song details from Genius
-        console.log(`Getting details for song ID ${songId}`);
-        const songData = await geniusClient.getSongById(songId);
-        
-        // Extract producer information
-        const producers = songData.song.producer_artists || [];
-        
-        // Process producers 
-        const processResult = await this.processProducers(producers, trackId);
-        
-        // Mark as processed
-        await deduplicationService.markAsProcessed(
-          'producer_identification',
-          'track',
-          86400, // 24 hour TTL
-          { entityId: trackId, correlationId: `prod_id_${trackId}` }
-        );
-        
-        return {
-          success: true,
-          metadata: {
-            trackId,
-            geniusSongId: songId,
-            songTitle: songData.song.title,
-            producersFound: producers.length,
-            processResult
-          }
+      if (!songDetails || !songDetails.song) {
+        console.log(`No song details returned from Genius API for ID ${songId}`);
+        return { 
+          status: 'completed', 
+          found: false,
+          message: 'Failed to get song details' 
         };
-      } finally {
-        // Be extra careful to release the lock
-        try {
-          await this.releaseDirectDbLock(trackId);
-        } catch (lockError) {
-          console.error(`Error releasing lock:`, lockError);
-        }
       }
-    } catch (error) {
-      console.error(`Uncaught error:`, error);
+      
+      // Extract producers from song details
+      const producers = songDetails.song.producer_artists || [];
+      
+      if (producers.length === 0) {
+        console.log(`No producers found for "${trackName}" (ID: ${songId})`);
+        return { 
+          status: 'completed', 
+          found: true,
+          producers_found: 0,
+          message: 'No producers listed on Genius' 
+        };
+      }
+      
+      console.log(`Found ${producers.length} producers for "${trackName}"`);
+      
+      // Process each producer
+      const processedProducers = await this.processProducers(producers, trackId);
+      
       return {
-        success: false,
-        error,
-        metadata: { message }
+        status: 'completed',
+        found: true,
+        producers_found: producers.length,
+        producers_processed: processedProducers.length,
+        producers: processedProducers
       };
+    } finally {
+      // Always release the lock when done
+      await this.releaseDirectDbLock(trackId);
     }
   }
   
-  /**
-   * Process producers found in Genius data
-   */
-  private async processProducers(
-    producers: Array<{ id: number; name: string; url?: string }>,
-    trackId: string
-  ): Promise<any> {
+  // Process a list of producers for a specific track
+  private async processProducers(producers: any[], trackId: string): Promise<any[]> {
     const results = [];
     
-    for (const producer of producers) {
-      try {
-        // Check if producer exists in database
-        const { data: existingProducer, error: findError } = await this.supabase
-          .from('producers')
-          .select('id, name')
-          .eq('normalized_name', producer.name.toLowerCase())
-          .maybeSingle();
-        
-        if (findError) {
-          console.error(`Error finding producer:`, findError);
-          continue;
-        }
-        
-        let producerId;
-        
-        // Insert or get producer
-        if (!existingProducer) {
-          // Create new producer
-          const { data: newProducer, error: insertError } = await this.supabase
-            .from('producers')
-            .insert({
-              name: producer.name,
-              normalized_name: producer.name.toLowerCase(),
-              metadata: { genius_id: producer.id, genius_url: producer.url }
+    // Use transaction to ensure both producer insert and relationship are atomic
+    const { data: transactionResult, error: transactionError } = await supabase.rpc(
+      'execute_in_transaction',
+      {
+        p_sql: `
+          WITH producer_inserts AS (
+            INSERT INTO producers (name, normalized_name, metadata)
+            VALUES 
+              ${producers.map((p, i) => 
+                `($${i*3 + 1}, $${i*3 + 2}, $${i*3 + 3})`
+              ).join(', ')}
+            ON CONFLICT (normalized_name) DO UPDATE SET
+              metadata = COALESCE(producers.metadata, '{}'::jsonb) || EXCLUDED.metadata
+            RETURNING id, name, normalized_name
+          ),
+          relation_inserts AS (
+            INSERT INTO track_producers (track_id, producer_id, confidence, source)
+            SELECT 
+              $${producers.length*3 + 1}::uuid, 
+              id, 
+              0.9, 
+              'genius'
+            FROM producer_inserts
+            ON CONFLICT (track_id, producer_id) DO NOTHING
+            RETURNING producer_id
+          )
+          SELECT json_agg(pi.*) FROM producer_inserts pi
+        `,
+        p_params: [
+          // Build the parameter array dynamically
+          ...producers.flatMap(p => [
+            p.name, 
+            this.normalizeProducerName(p.name),
+            JSON.stringify({
+              genius_id: p.id,
+              genius_url: p.url
             })
-            .select('id')
-            .single();
-          
-          if (insertError) {
-            console.error(`Error inserting producer:`, insertError);
-            continue;
-          }
-          
-          producerId = newProducer?.id;
-        } else {
-          producerId = existingProducer.id;
-        }
-        
-        if (!producerId) {
-          console.error(`Failed to get producer ID for ${producer.name}`);
-          continue;
-        }
-        
-        // Create track-producer relationship using ON CONFLICT for idempotence
-        const { error: relationError } = await this.supabase
-          .from('track_producers')
-          .insert({
-            track_id: trackId,
-            producer_id: producerId,
-            confidence: 0.95,  // High confidence from Genius data
-            source: 'genius'
-          }, { 
-            onConflict: 'track_id,producer_id',
-            ignoreDuplicates: true
-          });
-        
-        if (relationError) {
-          console.error(`Error creating track-producer relationship:`, relationError);
-        } else {
-          results.push({
-            producer_id: producerId,
-            producer_name: producer.name,
-            added: !existingProducer
-          });
-        }
-      } catch (error) {
-        console.error(`Error processing producer ${producer.name}:`, error);
+          ]),
+          trackId
+        ]
       }
+    );
+    
+    if (transactionError) {
+      throw new Error(`Failed to process producers: ${transactionError.message}`);
     }
     
-    return { producersProcessed: results };
+    // Return the list of processed producers
+    return transactionResult?.result || [];
   }
   
-  /**
-   * Acquire a direct database lock bypassing Redis
-   * This is a fallback mechanism for when Redis may be unavailable
-   */
+  // Normalize a producer name for matching
+  private normalizeProducerName(name: string): string {
+    return name.toLowerCase()
+      .replace(/[^\w\s]/g, '') // Remove special characters
+      .replace(/\s+/g, '');    // Remove spaces
+  }
+  
+  // Acquire a direct DB lock for a track
   private async acquireDirectDbLock(trackId: string): Promise<boolean> {
     try {
-      // Try using the RPC function first (preferred way)
-      const { data: lockAcquired, error: lockError } = await this.supabase.rpc(
-        'acquire_processing_lock',
-        {
-          p_entity_type: 'track',
-          p_entity_id: trackId,
-          p_timeout_minutes: 10
-        }
-      );
+      const { data, error } = await supabase.rpc('acquire_processing_lock', {
+        p_entity_type: 'track',
+        p_entity_id: trackId,
+        p_timeout_minutes: 10,
+        p_correlation_id: `producer_identification:${new Date().toISOString()}`
+      });
       
-      if (lockError) {
-        console.error(`Error acquiring lock via RPC:`, lockError);
-        
-        // Fallback to direct SQL approach
-        const entityType = 'track';
-        
-        // Use transaction and advisory lock to prevent race conditions
-        const { data, error } = await this.supabase.rpc(
-          'raw_sql_query',
-          {
-            sql_query: `
-              BEGIN;
-              
-              -- Use advisory lock for this operation
-              SELECT pg_advisory_xact_lock(('x' || substr(md5($1 || ':' || $2), 1, 16))::bit(64)::bigint);
-              
-              -- Get current state
-              WITH current_state AS (
-                SELECT state, last_processed_at
-                FROM public.processing_status
-                WHERE entity_type = $1 AND entity_id = $2
-              ),
-              
-              -- Handle insert or update
-              upsert AS (
-                INSERT INTO public.processing_status (
-                  entity_type, entity_id, state, last_processed_at, metadata
-                )
-                VALUES (
-                  $1, $2, 'IN_PROGRESS', NOW(), 
-                  jsonb_build_object('direct_lock', true)
-                )
-                ON CONFLICT (entity_type, entity_id) DO UPDATE
-                SET 
-                  state = 'IN_PROGRESS',
-                  last_processed_at = NOW(),
-                  metadata = jsonb_build_object('direct_lock', true),
-                  updated_at = NOW()
-                WHERE 
-                  -- Only update if not already IN_PROGRESS or COMPLETED
-                  (processing_status.state = 'PENDING' OR 
-                   processing_status.state = 'FAILED' OR
-                   (processing_status.state = 'IN_PROGRESS' AND 
-                    processing_status.last_processed_at < NOW() - INTERVAL '10 minutes'))
-                RETURNING state
-              )
-              
-              -- Return success status
-              SELECT EXISTS(SELECT 1 FROM upsert) AS acquired;
-              
-              COMMIT;
-            `,
-            params: [entityType, trackId]
-          }
-        );
-        
-        if (error) {
-          console.error(`Error acquiring direct lock:`, error);
-          return false;
-        }
-        
-        // Extract result from the query
-        return data && data[0] && data[0].acquired === true;
+      if (error) {
+        console.error(`Error acquiring lock for track ${trackId}: ${error.message}`);
+        return false;
       }
       
-      return !!lockAcquired;
+      return data === true;
     } catch (error) {
-      console.error(`Exception acquiring lock:`, error);
+      console.error(`Exception acquiring lock for track ${trackId}: ${error.message}`);
       return false;
     }
   }
   
-  /**
-   * Release direct database lock
-   */
+  // Release a direct DB lock for a track
   private async releaseDirectDbLock(trackId: string): Promise<boolean> {
     try {
-      // Try the RPC function first
-      const { data: released, error: releaseError } = await this.supabase.rpc(
-        'release_processing_lock',
-        {
-          p_entity_type: 'track',
-          p_entity_id: trackId
-        }
-      );
+      const { data, error } = await supabase.rpc('release_processing_lock', {
+        p_entity_type: 'track',
+        p_entity_id: trackId
+      });
       
-      if (releaseError) {
-        console.error(`Error releasing lock via RPC:`, releaseError);
-        
-        // Fallback to direct update
-        const { error } = await this.supabase
-          .from('processing_status')
-          .update({
-            state: 'PENDING',
-            last_processed_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            metadata: { released_at: new Date().toISOString(), force_released: true }
-          })
-          .eq('entity_type', 'track')
-          .eq('entity_id', trackId)
-          .eq('state', 'IN_PROGRESS');
-          
-        if (error) {
-          console.error(`Error releasing lock directly:`, error);
-          return false;
-        }
-        
-        return true;
+      if (error) {
+        console.error(`Error releasing lock for track ${trackId}: ${error.message}`);
+        return false;
       }
       
-      return !!released;
+      return data === true;
     } catch (error) {
-      console.error(`Exception releasing lock:`, error);
+      console.error(`Exception releasing lock for track ${trackId}: ${error.message}`);
       return false;
     }
   }
 }
 
-// Create worker instance
-const worker = new ProducerIdentificationWorker();
+// Process producer identification messages
+async function processProducerIdentification(req: Request): Promise<any> {
+  // Extract params from request if any
+  let params: any = {};
+  if (req.method === 'POST') {
+    try {
+      params = await req.json();
+    } catch (error) {
+      console.log("No valid JSON body provided");
+    }
+  }
+  
+  try {
+    // Create worker instance
+    const worker = new ProducerIdentificationWorker();
+    
+    // Process with self-draining batch
+    const result = await worker.drainQueue({
+      maxBatches: params.maxBatches || 3,  // Process up to 3 batches
+      batchSize: params.batchSize || 5,    // 5 messages per batch
+      maxRuntimeMs: 240000,                // 4 minute runtime max
+      processorName: 'producer-identification',
+      logDetailedMetrics: true,
+      // Configure to use DLQ for failed messages
+      deadLetterQueueName: 'producer_identification_dlq'
+    });
+    
+    return {
+      processed: result.processed,
+      errors: result.errors,
+      processingTimeMs: result.processingTimeMs,
+      success: result.errors === 0
+    };
+  } catch (error) {
+    console.error("Error processing producer identification:", error);
+    return {
+      error: error.message,
+      success: false
+    };
+  }
+}
 
-// Export handler for the Edge Function
+// Handle HTTP requests
 serve(async (req) => {
-  // CORS preflight
+  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
   
   try {
-    // Process a batch of messages
-    const result = await worker.processBatch({
-      batchSize: 3,
-      timeoutSeconds: 60,
-      processorName: 'producer-identification',
-      visibilityTimeoutSeconds: 120
-    });
+    // Process the batch in the background using EdgeRuntime.waitUntil
+    const resultPromise = processProducerIdentification(req);
     
-    // Return the processing results
-    return new Response(JSON.stringify(result), { 
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-    });
+    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
+      EdgeRuntime.waitUntil(resultPromise);
+      
+      // Return immediately with acknowledgment
+      return new Response(
+        JSON.stringify({ message: "Producer identification processing started" }),
+        { 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        }
+      );
+    } else {
+      // If EdgeRuntime.waitUntil is not available, wait for completion
+      const result = await resultPromise;
+      
+      return new Response(
+        JSON.stringify(result),
+        { 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        }
+      );
+    }
   } catch (error) {
-    console.error("Error processing batch:", error);
-    return new Response(JSON.stringify({ error: error.message }), { 
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-    });
+    console.error("Error in producer identification handler:", error);
+    
+    return new Response(
+      JSON.stringify({ error: error.message, success: false }),
+      { 
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        }
+    );
   }
 });

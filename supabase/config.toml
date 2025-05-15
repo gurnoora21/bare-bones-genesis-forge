@@ -1,5 +1,4 @@
 
-# project_id is the first line always!
 project_id = "wshetxovyxtfqohhbvpg"
 
 [api]
@@ -9,35 +8,74 @@ schemas = ["public", "storage", "graphql_public"]
 
 [db]
 port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = false
+port = 54329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[realtime]
+enabled = true
 
 [studio]
 enabled = true
 port = 54323
+api_url = "http://localhost"
 
 [inbucket]
 enabled = true
 port = 54324
 
-[auth]
-enabled = true
-port = 54325
-
 [storage]
 enabled = true
-port = 54326
+file_size_limit = "50MiB"
 
-[realtime]
+[auth]
 enabled = true
-port = 54327
+site_url = "http://localhost:3000"
 
-[functions]
+[auth.email]
 enabled = true
-port = 54328
 
-[functions.cronCleanupStaleEntities]
-verify_jwt = false
-schedule = "0 */1 * * *"  # Run every hour
+[auth.sms]
+enabled = true
+
+[auth.external.github]
+enabled = true
+client_id = "env(SUPABASE_AUTH_GITHUB_CLIENT_ID)"
+secret = "env(SUPABASE_AUTH_GITHUB_SECRET)"
+url = "env(SUPABASE_AUTH_GITHUB_URL)"
 
 [analytics]
-enabled = true
-port = 54329
+enabled = false
+port = 54327
+
+[experimental]
+trace = false
+
+# Configure Edge Functions
+[functions]
+  [functions.artistDiscovery]
+    verify_jwt = false
+  
+  [functions.albumDiscovery]
+    verify_jwt = false
+  
+  [functions.trackDiscovery]
+    verify_jwt = false
+  
+  [functions.producerIdentification]
+    verify_jwt = false
+    
+  [functions.socialEnrichment]
+    verify_jwt = false
+    
+  [functions.cronQueueProcessor]
+    verify_jwt = false
+    
+  [functions.pipelineMonitor]
+    verify_jwt = false

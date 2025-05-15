@@ -2,6 +2,7 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
 import { getQueueHelper } from "../_shared/queueHelper.ts";
 import { getDeduplicationService } from "../_shared/deduplication.ts";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -16,13 +17,9 @@ const redis = new Redis({
   token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
 });
 
-// Initialize the queue helper
+// Initialize services
 const queueHelper = getQueueHelper(supabase, redis);
-
-// Initialize deduplication service
 const deduplicationService = getDeduplicationService(redis);
-
-// Initialize Spotify client 
 const spotifyClient = new SpotifyClient(
   Deno.env.get("SPOTIFY_CLIENT_ID") || "",
   Deno.env.get("SPOTIFY_CLIENT_SECRET") || ""
@@ -34,289 +31,282 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Process a batch of album discovery messages
-async function processAlbumDiscoveryBatch() {
-  console.log("Starting album discovery batch processing");
+// Define the album discovery worker implementation
+class AlbumDiscoveryWorker extends createEnhancedWorker<any> {
+  constructor() {
+    super('album_discovery', supabase, redis);
+  }
   
-  try {
-    // Read messages from the queue
-    const { data: messages, error } = await supabase.rpc(
-      'pg_dequeue',
-      { 
-        queue_name: 'album_discovery',
-        batch_size: 5,
-        visibility_timeout: 300
-      }
+  async processMessage(message: any): Promise<any> {
+    console.log("Processing album discovery message:", message);
+    
+    // Extract album job info
+    const artistId = message.artistId;
+    const offset = message.offset || 0;
+    
+    if (!artistId) {
+      throw new Error("Message missing artistId");
+    }
+    
+    // Generate deduplication key
+    const dedupKey = `artist:${artistId}:albums:offset:${offset}`;
+    
+    // Check if already processed (extra safety)
+    const isDuplicate = await deduplicationService.isDuplicate(
+      'album_discovery', 
+      dedupKey,
+      { logDetails: true },
+      { entityId: artistId }
     );
     
-    if (error) {
-      console.error("Error reading from album_discovery queue:", error);
-      return { error: error.message };
+    if (isDuplicate) {
+      console.log(`Album page for artist ${artistId} at offset ${offset} already processed, skipping`);
+      return { status: 'skipped', reason: 'already_processed' };
     }
     
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      console.log("No album discovery messages to process");
-      return { processed: 0 };
+    // Get artist details from database
+    const { data: artist, error: artistError } = await supabase
+      .from('artists')
+      .select('id, name, spotify_id')
+      .eq('id', artistId)
+      .single();
+    
+    if (artistError || !artist) {
+      throw new Error(`Error fetching artist ${artistId}: ${artistError?.message || 'Artist not found'}`);
     }
     
-    console.log(`Processing ${messages.length} album discovery messages`);
+    if (!artist.spotify_id) {
+      throw new Error(`Artist ${artistId} has no Spotify ID`);
+    }
     
-    // Tracking metrics
+    console.log(`Fetching albums for artist ${artist.name} (${artist.spotify_id}) at offset ${offset}`);
+    
+    // Get albums from Spotify
+    const albumsData = await spotifyClient.getArtistAlbums(artist.spotify_id, {
+      limit: 50,
+      offset: offset,
+      include_groups: "album,single,compilation"
+    });
+    
+    if (!albumsData || !albumsData.items) {
+      console.log(`No albums found for artist ${artist.name} at offset ${offset}`);
+      
+      // Mark as processed even with zero results (valid end of pagination)
+      await deduplicationService.markAsProcessed(
+        'album_discovery', 
+        dedupKey,
+        86400, // 24 hour TTL
+        { entityId: artistId }
+      );
+      
+      return { status: 'completed', albumsProcessed: 0, message: 'No albums returned from Spotify' };
+    }
+    
+    console.log(`Found ${albumsData.items.length} albums for artist ${artist.name}`);
+    
+    // Process metrics
     const results = {
-      processed: 0,
-      skipped: 0,
-      errors: 0,
       albumsProcessed: 0,
       tracksQueued: 0,
-      nextPagesQueued: 0
+      nextPagesQueued: 0,
+      errors: 0
     };
     
-    // Process each message
-    for (const message of messages) {
+    // Process each album
+    for (const album of albumsData.items) {
       try {
-        // Parse message
-        let payload;
-        try {
-          payload = typeof message.message === 'string' 
-            ? JSON.parse(message.message) 
-            : message.message;
-        } catch (parseError) {
-          console.error(`Error parsing message ${message.id}:`, parseError);
-          
-          // Delete invalid message and continue
-          await supabase.rpc('pg_delete_message', {
-            queue_name: 'album_discovery',
-            message_id: message.id
-          });
-          
-          results.errors++;
+        if (!album.id || !album.name) {
+          console.warn(`Skipping album with missing data:`, album);
           continue;
         }
         
-        // Extract album job info
-        const artistId = payload.artistId;
-        const offset = payload.offset || 0;
+        // Prepare album data
+        const albumData = {
+          artist_id: artist.id,
+          name: album.name,
+          spotify_id: album.id,
+          release_date: album.release_date || null,
+          cover_url: album.images && album.images.length > 0 ? album.images[0].url : null,
+          metadata: {
+            album_type: album.album_type,
+            total_tracks: album.total_tracks,
+            spotify_url: album.external_urls?.spotify,
+            label: album.label,
+            copyrights: album.copyrights
+          }
+        };
         
-        if (!artistId) {
-          console.error(`Message ${message.id} missing artistId`);
-          
-          // Delete invalid message and continue
-          await supabase.rpc('pg_delete_message', {
-            queue_name: 'album_discovery',
-            message_id: message.id
-          });
-          
-          results.errors++;
-          continue;
-        }
-        
-        // Generate deduplication key
-        const dedupKey = `artist:${artistId}:albums:offset:${offset}`;
-        
-        // Check if already processed
-        const isDuplicate = await deduplicationService.isDuplicate(
-          'album_discovery', 
-          dedupKey,
-          { logDetails: true },
-          { entityId: artistId }
-        );
-        
-        if (isDuplicate) {
-          console.log(`Album page for artist ${artistId} at offset ${offset} already processed, skipping`);
-          
-          // Delete message for already processed album page
-          await supabase.rpc('pg_delete_message', {
-            queue_name: 'album_discovery',
-            message_id: message.id
-          });
-          
-          results.skipped++;
-          continue;
-        }
-        
-        // Get artist details from database
-        const { data: artist, error: artistError } = await supabase
-          .from('artists')
-          .select('id, name, spotify_id')
-          .eq('id', artistId)
+        // Insert or update album
+        const { data: savedAlbum, error: albumError } = await supabase
+          .from('albums')
+          .upsert(albumData, {
+            onConflict: 'spotify_id',
+            returning: 'minimal'
+          })
+          .select('id')
           .single();
         
-        if (artistError || !artist) {
-          console.error(`Error fetching artist ${artistId}:`, artistError);
-          
-          // Delete message if artist doesn't exist (no point retrying)
-          await supabase.rpc('pg_delete_message', {
-            queue_name: 'album_discovery',
-            message_id: message.id
-          });
-          
-          results.errors++;
-          continue;
-        }
-        
-        if (!artist.spotify_id) {
-          console.error(`Artist ${artistId} has no Spotify ID`);
-          
-          // Delete message if artist has no Spotify ID (can't fetch albums)
-          await supabase.rpc('pg_delete_message', {
-            queue_name: 'album_discovery',
-            message_id: message.id
-          });
-          
-          results.errors++;
-          continue;
-        }
-        
-        console.log(`Fetching albums for artist ${artist.name} (${artist.spotify_id}) at offset ${offset}`);
-        
-        // Get albums from Spotify
-        const albumsData = await spotifyClient.getArtistAlbums(artist.spotify_id, {
-          limit: 50,
-          offset: offset,
-          include_groups: "album,single,compilation"
-        });
-        
-        if (!albumsData || !albumsData.items) {
-          console.log(`No albums found for artist ${artist.name} at offset ${offset}`);
-          
-          // Mark as processed (no results is not an error)
-          await deduplicationService.markAsProcessed(
-            'album_discovery', 
-            dedupKey,
-            86400, // 24 hour TTL
-            { entityId: artistId }
-          );
-          
-          // Delete message - successfully processed with zero results
-          await supabase.rpc('pg_delete_message', {
-            queue_name: 'album_discovery',
-            message_id: message.id
-          });
-          
-          results.processed++;
-          continue;
-        }
-        
-        console.log(`Found ${albumsData.items.length} albums for artist ${artist.name}`);
-        
-        // Process each album
-        for (const album of albumsData.items) {
-          try {
-            if (!album.id || !album.name) {
-              console.warn(`Skipping album with missing data:`, album);
-              continue;
-            }
-            
-            // Prepare album data
-            const albumData = {
-              artist_id: artist.id,
-              name: album.name,
+        if (albumError) {
+          // Log to worker_issues for consistent error tracking
+          await this.logWorkerIssue(
+            'database_error',
+            `Error upserting album ${album.name}: ${albumError.message}`,
+            { 
+              album_name: album.name,
               spotify_id: album.id,
-              release_date: album.release_date || null,
-              cover_url: album.images && album.images.length > 0 ? album.images[0].url : null,
-              metadata: {
-                album_type: album.album_type,
-                total_tracks: album.total_tracks,
-                spotify_url: album.external_urls?.spotify,
-                label: album.label,
-                copyrights: album.copyrights
-              }
-            };
-            
-            // Insert or update album
-            const { data: savedAlbum, error: albumError } = await supabase
-              .from('albums')
-              .upsert(albumData, {
-                onConflict: 'spotify_id',
-                returning: 'minimal'
-              })
-              .select('id')
-              .single();
-            
-            if (albumError) {
-              console.error(`Error upserting album ${album.name}:`, albumError);
-              continue; // Skip to next album, don't abort the whole batch
+              artist_id: artist.id 
             }
-            
-            const dbAlbumId = savedAlbum?.id;
-            
-            if (!dbAlbumId) {
-              console.error(`Failed to get album ID after upsert for ${album.name}`);
-              continue;
-            }
-            
-            console.log(`Successfully saved/updated album ${album.name} (${dbAlbumId})`);
-            results.albumsProcessed++;
-            
-            // Queue track discovery for this album
-            const trackEnqueued = await queueHelper.enqueue('track_discovery', {
-              albumId: dbAlbumId,
-              albumName: album.name,
-              artistId: artist.id,
-              offset: 0
-            });
-            
-            if (trackEnqueued) {
-              console.log(`Successfully queued track discovery for album ${dbAlbumId}`);
-              results.tracksQueued++;
-            } else {
-              console.error(`Failed to queue track discovery for album ${dbAlbumId}`);
-              // Don't fail the whole task if just track queue fails
-            }
-          } catch (albumError) {
-            console.error(`Error processing album ${album.name}:`, albumError);
-            // Continue to next album
-          }
+          );
+          results.errors++;
+          continue;
         }
         
-        // Check if there are more albums to fetch (pagination)
-        if (albumsData.next) {
-          // Queue the next page
-          const nextOffset = offset + albumsData.items.length;
-          const nextPageKey = `artist:${artistId}:albums:offset:${nextOffset}`;
-          
-          const nextPageEnqueued = await queueHelper.enqueue('album_discovery', {
-            artistId: artistId,
-            offset: nextOffset
-          }, nextPageKey);
-          
-          if (nextPageEnqueued) {
-            console.log(`Queued next album page for artist ${artist.name} at offset ${nextOffset}`);
-            results.nextPagesQueued++;
-          } else {
-            console.error(`Failed to queue next album page for artist ${artist.name}`);
-            // Still consider the current page processed
-          }
+        const dbAlbumId = savedAlbum?.id;
+        
+        if (!dbAlbumId) {
+          await this.logWorkerIssue(
+            'data_error',
+            `Failed to get album ID after upsert for ${album.name}`,
+            {
+              album_name: album.name,
+              spotify_id: album.id
+            }
+          );
+          results.errors++;
+          continue;
         }
         
-        // Mark this page as processed
-        await deduplicationService.markAsProcessed(
-          'album_discovery', 
-          dedupKey,
-          86400, // 24 hour TTL
-          { entityId: artistId }
-        );
+        console.log(`Successfully saved/updated album ${album.name} (${dbAlbumId})`);
+        results.albumsProcessed++;
         
-        // Delete the message from the queue
-        await supabase.rpc('pg_delete_message', {
-          queue_name: 'album_discovery',
-          message_id: message.id
+        // Queue track discovery for this album
+        const trackEnqueued = await queueHelper.enqueue('track_discovery', {
+          albumId: dbAlbumId,
+          albumName: album.name,
+          artistId: artist.id,
+          offset: 0
         });
         
-        results.processed++;
-      } catch (messageError) {
-        console.error(`Error processing album message ${message.id}:`, messageError);
-        
-        // Don't delete message on error - allow retry
+        if (trackEnqueued) {
+          console.log(`Successfully queued track discovery for album ${dbAlbumId}`);
+          results.tracksQueued++;
+        } else {
+          await this.logWorkerIssue(
+            'queue_error',
+            `Failed to queue track discovery for album ${dbAlbumId}`,
+            {
+              album_id: dbAlbumId,
+              album_name: album.name
+            }
+          );
+          results.errors++;
+        }
+      } catch (albumError) {
+        console.error(`Error processing album ${album.name}:`, albumError);
+        await this.logWorkerIssue(
+          'processing_error',
+          `Error processing album: ${albumError.message}`,
+          {
+            album_name: album.name || 'unknown'
+          }
+        );
         results.errors++;
       }
     }
     
-    console.log(`Album discovery batch completed: ${JSON.stringify(results)}`);
-    return results;
+    // Check if there are more albums to fetch (pagination)
+    if (albumsData.next) {
+      // Queue the next page
+      const nextOffset = offset + albumsData.items.length;
+      const nextPageKey = `artist:${artistId}:albums:offset:${nextOffset}`;
+      
+      const nextPageEnqueued = await queueHelper.enqueue('album_discovery', {
+        artistId: artistId,
+        offset: nextOffset
+      }, nextPageKey);
+      
+      if (nextPageEnqueued) {
+        console.log(`Queued next album page for artist ${artist.name} at offset ${nextOffset}`);
+        results.nextPagesQueued++;
+      } else {
+        await this.logWorkerIssue(
+          'queue_error',
+          `Failed to queue next album page for artist ${artist.name}`,
+          {
+            artist_id: artistId,
+            next_offset: nextOffset
+          }
+        );
+        results.errors++;
+      }
+    }
+    
+    // Mark this page as processed
+    await deduplicationService.markAsProcessed(
+      'album_discovery', 
+      dedupKey,
+      86400, // 24 hour TTL
+      { entityId: artistId }
+    );
+    
+    return { 
+      status: 'completed',
+      ...results
+    };
+  }
+  
+  // Helper to standardize worker issue logging
+  private async logWorkerIssue(
+    issueType: string, 
+    message: string, 
+    details?: Record<string, any>
+  ): Promise<void> {
+    try {
+      await this.supabase.from('worker_issues').insert({
+        worker_name: 'albumDiscovery',
+        issue_type: issueType,
+        message: message,
+        details: details || {},
+        created_at: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error(`Failed to log worker issue: ${error.message}`);
+    }
+  }
+}
+
+// Process albums with self-draining capabilities
+async function processAlbumDiscovery() {
+  console.log("Starting album discovery batch processing");
+  
+  try {
+    const worker = new AlbumDiscoveryWorker();
+    
+    // Process multiple batches within the time limit 
+    const result = await worker.drainQueue({
+      maxBatches: 8,          // Process up to 8 batches in one invocation
+      maxRuntimeMs: 240000,   // 4 minute runtime limit (below Edge Function timeout)
+      batchSize: 5,           // 5 messages per batch
+      processorName: 'album-discovery',
+      timeoutSeconds: 60,     // Timeout per message
+      visibilityTimeoutSeconds: 300, // 5 minute visibility timeout
+      logDetailedMetrics: true
+    });
+    
+    return {
+      processed: result.processed,
+      errors: result.errors,
+      duplicates: result.duplicates,
+      skipped: result.skipped,
+      processingTimeMs: result.processingTimeMs,
+      success: result.errors === 0
+    };
   } catch (batchError) {
     console.error("Fatal error in album discovery batch:", batchError);
-    return { error: batchError.message };
+    return { 
+      error: batchError.message,
+      success: false
+    };
   }
 }
 
@@ -328,7 +318,7 @@ serve(async (req) => {
   
   try {
     // Process the batch in the background using EdgeRuntime.waitUntil
-    const resultPromise = processAlbumDiscoveryBatch();
+    const resultPromise = processAlbumDiscovery();
     
     if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
       EdgeRuntime.waitUntil(resultPromise);
@@ -361,7 +351,7 @@ serve(async (req) => {
     console.error("Error in album discovery handler:", error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ error: error.message, success: false }),
       { 
         status: 500,
         headers: { 
