@@ -157,28 +157,53 @@ export class MetricsCollector {
       
       if (this.supabase) {
         try {
-          // First, make sure the table exists
+          // First, make sure the monitoring schema and table exist
+          await this.ensureMonitoringSchema();
           await this.ensurePipelineMetricsTable();
           
-          // Insert metrics into database
-          const { error } = await this.supabase
-            .from('pipeline_metrics')
+          // Insert metrics into database with proper schema prefix
+          const { data, error } = await this.supabase
+            .from('monitoring.pipeline_metrics')
             .insert(metricsRows);
             
           if (error) {
-            // Instead of putting metrics back in buffer, we'll just log the error
-            // This prevents repeated failure loops
-            this.logger.warn("Failed to persist metrics", { error: error.message });
-            this.consecutiveErrors++;
-            
-            // As a fallback, we'll persist metrics to Redis if available
-            await this.persistToFallback(metricsToFlush);
-            
-            return false;
+            // Try alternative approach with raw SQL if normal insert fails
+            try {
+              // Using raw_sql_query RPC to create the insert statement
+              await this.supabase.rpc('raw_sql_query', {
+                sql_query: `
+                  INSERT INTO monitoring.pipeline_metrics
+                  (metric_name, metric_value, tags, timestamp)
+                  SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(
+                    metric_name TEXT,
+                    metric_value DOUBLE PRECISION,
+                    tags JSONB,
+                    timestamp TIMESTAMPTZ
+                  )
+                `,
+                params: JSON.stringify(metricsRows)
+              });
+              
+              // Reset error counter on success
+              this.consecutiveErrors = 0;
+              return true;
+            } catch (sqlError) {
+              // Log the specific SQL error
+              this.logger.warn("Failed to insert metrics via SQL", { 
+                error: sqlError.message,
+                originalError: error.message
+              });
+              this.consecutiveErrors++;
+              
+              // Fall back to local logging
+              await this.persistToFallback(metricsToFlush);
+              return false;
+            }
           }
           
           // Reset error counter on success
           this.consecutiveErrors = 0;
+          return true;
         } catch (error) {
           // Handle case where supabase client is invalid or table doesn't exist
           this.logger.warn("Error persisting metrics to database", { 
@@ -197,9 +222,6 @@ export class MetricsCollector {
         await this.persistToFallback(metricsToFlush);
         return false;
       }
-      
-      this.logger.debug(`Successfully persisted ${metricsToFlush.length} metrics`);
-      return true;
     } catch (error) {
       this.logger.warn("Exception persisting metrics", { error: error.message });
       this.consecutiveErrors++;
@@ -209,24 +231,36 @@ export class MetricsCollector {
       this.flushInProgress = false;
     }
   }
+
+  /**
+   * Ensure the monitoring schema exists
+   */
+  private async ensureMonitoringSchema(): Promise<void> {
+    if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+      return; // Skip if we've failed too many times
+    }
+    
+    try {
+      // Create monitoring schema if it doesn't exist
+      await this.supabase.rpc('raw_sql_query', {
+        sql_query: `CREATE SCHEMA IF NOT EXISTS monitoring;`
+      });
+    } catch (error) {
+      this.logger.warn("Error ensuring monitoring schema", { error: error.message });
+      // Continue anyway - the schema might already exist
+    }
+  }
   
   /**
    * Ensure the pipeline_metrics table exists
    */
   private async ensurePipelineMetricsTable(): Promise<void> {
     if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
-      // If we've failed too many times in a row, don't try to create the table
-      // This prevents spamming the database with failed requests
-      return;
+      return; // Skip if we've failed too many times
     }
     
     try {
-      // Check if the monitoring schema exists
-      await this.supabase.rpc('raw_sql_query', {
-        sql_query: `CREATE SCHEMA IF NOT EXISTS monitoring;`
-      });
-      
-      // Try to create the table if it doesn't exist
+      // Create the table in the monitoring schema
       await this.supabase.rpc('raw_sql_query', {
         sql_query: `
           CREATE TABLE IF NOT EXISTS monitoring.pipeline_metrics (

@@ -31,14 +31,33 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
    * Validate message before processing
    */
   protected validateMessage(message: any, logger: StructuredLogger): boolean {
+    // Log received message structure to help with debugging
+    logger.debug("Validating artist discovery message", { 
+      messageType: typeof message, 
+      messageStructure: typeof message === 'object' ? Object.keys(message) : 'not_object',
+      originalMessage: message
+    });
+    
     // First run the base validation
     if (!super.validateMessage(message, logger)) {
       return false;
     }
     
+    // Handle nested message structure from queue
+    let artistMessage = message;
+    
+    // If we have a wrapped message from the queue, extract it
+    if (message.message && typeof message.message === 'object') {
+      artistMessage = message.message;
+      logger.debug("Using nested artist message", { 
+        originalKeys: Object.keys(message),
+        extractedKeys: Object.keys(artistMessage)
+      });
+    }
+    
     // Check for artistName field
-    if (!message.artistName) {
-      logger.error("Message missing artistName", { message });
+    if (!artistMessage.artistName) {
+      logger.error("Message missing artistName", { message: artistMessage });
       return false;
     }
     
@@ -49,10 +68,15 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
    * Process an artist discovery message
    */
   async handleMessage(message: any, logger: StructuredLogger): Promise<any> {
-    logger.info("Processing artist discovery message", { artistName: message.artistName });
+    // Handle case where message is wrapped in a message property (common from queue)
+    let artistMessage = message;
+    if (message.message && typeof message.message === 'object') {
+      artistMessage = message.message;
+      logger.debug("Using nested artist message object", { extractedMessage: artistMessage });
+    }
     
-    // Extract artist name
-    const artistName = message.artistName;
+    const artistName = artistMessage.artistName;
+    logger.info("Processing artist discovery message", { artistName });
     
     // Generate deduplication key
     const dedupKey = `artist_discovery:artist:name:${artistName.toLowerCase()}`;

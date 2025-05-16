@@ -153,14 +153,23 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
       queue: this.queue
     });
     
+    // Log the message structure to help with debugging
+    msgLogger.debug("Received message structure", {
+      messageType: typeof message,
+      hasId: typeof message === 'object' && message !== null,
+      messageKeys: typeof message === 'object' && message !== null ? 
+        Object.keys(message as object) : [],
+      messageIdFound: messageId
+    });
+    
     // Skip invalid messages without required fields
     if (!this.validateMessage(message, msgLogger)) {
       return { skipped: true, reason: "invalid_message" };
     }
     
     msgLogger.info(`Processing message from ${this.queue}`, {
-      messageType: typeof message,
-      hasId: typeof message === 'object' && message && ((message as any).id !== undefined || (message as any)._id !== undefined)
+      messageId,
+      messageType: typeof message
     });
     
     const startTime = Date.now();
@@ -203,14 +212,35 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
   protected validateMessage(message: T, logger: StructuredLogger): boolean {
     // Check message is an object
     if (!message || typeof message !== 'object') {
-      logger.error("Skipping invalid message: not an object");
+      logger.error("Skipping invalid message: not an object", { 
+        messageType: typeof message,
+        messageValue: message 
+      });
       return false;
+    }
+    
+    // For messages from queue, we often get a wrapper object with message property
+    let actualMessage = message;
+    
+    // If message has a nested 'message' property, use that instead
+    if (typeof message === 'object' && 
+        message !== null && 
+        'message' in message && 
+        typeof (message as any).message === 'object') {
+      actualMessage = (message as any).message;
+      logger.debug("Using nested message object", { 
+        originalMessageKeys: Object.keys(message as object),
+        nestedMessageKeys: Object.keys(actualMessage as object) 
+      });
     }
     
     // Check if message has an ID for tracking
     const messageId = this.getMessageId(message);
     if (!messageId) {
-      logger.error("Skipping invalid message without ID");
+      logger.error("Skipping invalid message without ID", {
+        messageObject: typeof message === 'object' ? 
+          JSON.stringify(message).substring(0, 1000) : 'not_an_object'
+      });
       return false;
     }
     
@@ -223,18 +253,47 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
   protected getMessageId(message: any): string {
     if (!message) return `unknown_${Date.now()}`;
     
-    // Try various common ID fields
-    if (typeof message === 'object') {
-      return message.id || 
-             message._id || 
-             message.messageId || 
-             message.msg_id || 
-             message.message_id || 
-             `generated_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    // First check for direct ID fields in the top-level message
+    if (typeof message === 'object' && message !== null) {
+      // Check top-level ID fields
+      const directId = message.id || 
+                      message._id || 
+                      message.messageId || 
+                      message.msg_id || 
+                      message.message_id;
+                      
+      if (directId !== undefined && directId !== null) {
+        return String(directId);
+      }
+      
+      // Check if this is a message wrapper from the queue
+      if ('message' in message) {
+        // If message contains a nested message object, check for IDs there
+        const nestedMessage = message.message;
+        if (nestedMessage && typeof nestedMessage === 'object') {
+          const nestedId = nestedMessage.id || 
+                          nestedMessage._id || 
+                          nestedMessage.messageId || 
+                          nestedMessage.msg_id || 
+                          nestedMessage.message_id;
+          
+          if (nestedId !== undefined && nestedId !== null) {
+            return String(nestedId);
+          }
+        }
+      }
+      
+      // If we still don't have an ID, but have an actual message object, generate a stable one
+      try {
+        const stableHash = JSON.stringify(message).substring(0, 100);
+        return `hash_${Date.now()}_${stableHash.replace(/[^a-zA-Z0-9]/g, '')}`;
+      } catch (e) {
+        // In case of JSON stringify error
+      }
     }
     
-    // Fallback to a generated ID
-    return `fallback_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    // Fallback to a generated ID as last resort
+    return `generated_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   }
   
   /**
@@ -256,27 +315,37 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
     try {
       // First, make sure the table exists
       await this.supabase.rpc('raw_sql_query', {
-        sql_query: `CREATE TABLE IF NOT EXISTS queue_metrics (
-          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          queue_name TEXT NOT NULL,
-          operation TEXT NOT NULL,
-          batch_size INTEGER,
-          success_count INTEGER,
-          error_count INTEGER,
-          processing_time_ms INTEGER,
-          metadata JSONB DEFAULT '{}'::jsonb,
-          created_at TIMESTAMPTZ DEFAULT now()
-        )`
+        sql_query: `
+          CREATE SCHEMA IF NOT EXISTS monitoring;
+          
+          CREATE TABLE IF NOT EXISTS monitoring.queue_metrics (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            queue_name TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            batch_size INTEGER,
+            success_count INTEGER,
+            error_count INTEGER,
+            processing_time_ms INTEGER,
+            metadata JSONB DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ DEFAULT now()
+          );`
       });
       
-      await this.supabase.from('queue_metrics').insert({
-        queue_name: this.queue,
-        operation: data.operation,
-        batch_size: data.batchSize,
-        success_count: data.successCount,
-        error_count: data.errorCount,
-        processing_time_ms: data.processingTimeMs,
-        metadata: { batchId: data.batchId }
+      // Use raw SQL for better reliability
+      await this.supabase.rpc('raw_sql_query', {
+        sql_query: `
+          INSERT INTO monitoring.queue_metrics
+          (queue_name, operation, batch_size, success_count, error_count, processing_time_ms, metadata)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        params: JSON.stringify([
+          this.queue,
+          data.operation,
+          data.batchSize,
+          data.successCount,
+          data.errorCount,
+          data.processingTimeMs,
+          { batchId: data.batchId }
+        ])
       });
     } catch (error) {
       // Log error but don't fail the processing
@@ -295,10 +364,12 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
     details: any = {}
   ): Promise<void> {
     try {
-      // First, ensure the table exists
+      // First, ensure the schema and table exist
       await this.supabase.rpc('raw_sql_query', {
         sql_query: `
-          CREATE TABLE IF NOT EXISTS worker_issues (
+          CREATE SCHEMA IF NOT EXISTS monitoring;
+          
+          CREATE TABLE IF NOT EXISTS monitoring.worker_issues (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             worker_name TEXT NOT NULL, 
             issue_type TEXT NOT NULL,
@@ -308,16 +379,23 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now(),
             resolved BOOLEAN DEFAULT FALSE
-          )
+          );
         `
       });
       
-      await this.supabase.from('worker_issues').insert({
-        worker_name: this.workerName,
-        issue_type: issueType,
-        severity,
-        message,
-        details
+      // Use raw SQL for better reliability
+      await this.supabase.rpc('raw_sql_query', {
+        sql_query: `
+          INSERT INTO monitoring.worker_issues
+          (worker_name, issue_type, severity, message, details)
+          VALUES ($1, $2, $3, $4, $5)`,
+        params: JSON.stringify([
+          this.workerName,
+          issueType,
+          severity,
+          message,
+          details
+        ])
       });
     } catch (error) {
       // Log error but don't fail the processing
