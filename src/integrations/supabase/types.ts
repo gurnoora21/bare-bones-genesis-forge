@@ -496,6 +496,19 @@ export type Database = {
       }
     }
     Views: {
+      dlq_messages: {
+        Row: {
+          custom_metadata: Json | null
+          failure_reason: Json | null
+          full_message: Json | null
+          message_id: number | null
+          moved_to_dlq_at: string | null
+          original_msg_id: number | null
+          queue_name: string | null
+          source_queue: Json | null
+        }
+        Relationships: []
+      }
       producer_popularity: {
         Row: {
           artist_count: number | null
@@ -628,6 +641,19 @@ export type Database = {
           record_count: number
         }[]
       }
+      get_dlq_messages: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          queue_name: string
+          source_queue: Json
+          message_id: number
+          original_msg_id: number
+          moved_to_dlq_at: string
+          failure_reason: Json
+          custom_metadata: Json
+          full_message: Json
+        }[]
+      }
       get_producer_collaborations: {
         Args: { producer_id: string }
         Returns: {
@@ -647,6 +673,17 @@ export type Database = {
       get_system_health: {
         Args: Record<PropertyKey, never>
         Returns: Json
+      }
+      list_dlq_messages: {
+        Args: { p_queue_name?: string }
+        Returns: {
+          queue_name: string
+          source_queue: string
+          message_id: string
+          moved_at: string
+          failure_reason: string
+          message: Json
+        }[]
       }
       maintenance_clear_stale_entities: {
         Args: Record<PropertyKey, never>
@@ -752,6 +789,10 @@ export type Database = {
           p_operation_id: string
           p_spotify_id?: string
         }
+        Returns: Json
+      }
+      process_track_batch: {
+        Args: { p_track_data: Json[]; p_album_id: string; p_artist_id: string }
         Returns: Json
       }
       purge_dlq_messages: {
