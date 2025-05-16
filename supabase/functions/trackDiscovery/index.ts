@@ -9,7 +9,7 @@ import {
   acquireProcessingLock
 } from "../_shared/queueHelper.ts";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { DeduplicationService } from "../_shared/deduplication.ts";
+import { DeduplicationService, getDeduplicationService } from "../_shared/deduplication.ts";
 import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 
 // Initialize Redis client for distributed locking and idempotency
@@ -72,17 +72,17 @@ serve(async (req) => {
   
   // Initialize metrics
   const metrics = getDeduplicationMetrics(redis);
+  // Initialize deduplication service
+  const dedupService = getDeduplicationService(redis);
 
   try {
     console.log("Starting track discovery process");
     
-    // Process queue batch
-    const { data: messages, error } = await supabase.functions.invoke("readQueue", {
-      body: { 
-        queue_name: "track_discovery",
-        batch_size: 3,
-        visibility_timeout: 300 // 5 minutes
-      }
+    // Process queue batch using direct rpc call to pg_dequeue
+    const { data: queueData, error } = await supabase.rpc('pg_dequeue', { 
+      queue_name: "track_discovery",
+      batch_size: 3,
+      visibility_timeout: 300 // 5 minutes
     });
 
     if (error) {
@@ -95,12 +95,15 @@ serve(async (req) => {
         { error }
       );
       
-      return new Response(JSON.stringify({ error }), { 
+      return new Response(JSON.stringify({ error: error.message }), { 
         status: 500, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
+    // Parse the message data
+    const messages = queueData ? JSON.parse(queueData) : [];
+    
     if (!messages || messages.length === 0) {
       console.log("No messages to process in track_discovery queue");
       return new Response(JSON.stringify({ 
@@ -167,24 +170,46 @@ serve(async (req) => {
             const idempotencyKey = `album:${msg.albumId}:offset:${msg.offset || 0}`;
             console.log(`Processing track message for album: ${msg.albumName} (${msg.albumId}) with idempotency key ${idempotencyKey}`);
             
+            // Check if this album+offset was already processed using deduplication service
+            const alreadyProcessed = await dedupService.isDuplicate(
+              'track_discovery', 
+              idempotencyKey, 
+              { logDetails: true }, 
+              { entityId: msg.albumId }
+            );
+            
+            if (alreadyProcessed) {
+              console.log(`Tracks for album ${msg.albumId} at offset ${msg.offset || 0} already processed, skipping`);
+              dedupedCount++;
+              await metrics.recordDeduplicated("track_discovery", "consumer");
+              
+              // Delete the message from the queue since it's already processed
+              await supabase.rpc('ensure_message_deleted', {
+                queue_name: 'track_discovery',
+                message_id: messageId
+              });
+              
+              processingResults.push({
+                messageId,
+                albumId: msg.albumId,
+                albumName: msg.albumName,
+                success: true,
+                deduplication: true,
+                skipped: true
+              });
+              
+              continue;
+            }
+            
             try {
               // Process message with idempotency checks
               const result = await processQueueMessageSafely(
                 supabase,
                 "track_discovery",
-                messageId.toString(), // FIX: toString() is now safe since we checked messageId is defined
-                async () => await processTracks(supabase, spotifyClient, msg),
+                messageId.toString(),
+                async () => await processTracks(supabase, spotifyClient, msg, dedupService),
                 idempotencyKey,
-                async () => {
-                  // Check if this album page was already processed
-                  try {
-                    const key = `processed:album:${msg.albumId}:offset:${msg.offset || 0}`;
-                    return await redis.exists(key) === 1;
-                  } catch (error) {
-                    console.error(`Redis check failed for ${idempotencyKey}:`, error);
-                    return false;
-                  }
-                },
+                null, // No need for duplicate check function here as we already did it
                 { 
                   maxRetries: 2, 
                   circuitBreaker: true,
@@ -305,7 +330,8 @@ serve(async (req) => {
 async function processTracks(
   supabase: any, 
   spotifyClient: any,
-  msg: TrackDiscoveryMsg
+  msg: TrackDiscoveryMsg,
+  dedupService: DeduplicationService
 ) {
   const { albumId, albumName, artistId, offset = 0 } = msg;
   console.log(`Processing tracks for album ${albumName} (ID: ${albumId}) at offset ${offset}`);
@@ -321,15 +347,6 @@ async function processTracks(
     if (!hasLock) {
       console.log(`Another process is handling album ${albumName} offset ${offset}, skipping`);
       return { skipped: true, reason: "concurrent_processing" };
-    }
-    
-    // Mark this batch as being processed in Redis
-    try {
-      const processingKey = `processing:album:${albumId}:offset:${offset}`;
-      await redis.set(processingKey, 'true', { ex: 300 }); // 5 minute TTL
-    } catch (redisError) {
-      // Non-fatal if Redis fails, continue with processing
-      console.warn("Failed to set processing flag in Redis:", redisError);
     }
     
     // Get album's database ID
@@ -377,13 +394,13 @@ async function processTracks(
     if (!tracksData.items || tracksData.items.length === 0) {
       console.log(`No tracks found for album ${albumName}`);
       
-      // Mark this batch as processed even if no tracks were found
-      try {
-        const processedKey = `processed:album:${albumId}:offset:${offset}`;
-        await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
-      } catch (redisError) {
-        console.warn("Failed to set processed flag in Redis:", redisError);
-      }
+      // Mark this batch as processed with deduplication service
+      await dedupService.markAsProcessed(
+        'track_discovery', 
+        lockKey,
+        86400, // 24 hour TTL
+        { entityId: albumId }
+      );
       
       return { processed: 0 };
     }
@@ -400,12 +417,12 @@ async function processTracks(
       console.log(`No primary artist tracks found for artist ${artist.name} in album ${albumName}`);
       
       // Mark this batch as processed even with zero tracks
-      try {
-        const processedKey = `processed:album:${albumId}:offset:${offset}`;
-        await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
-      } catch (redisError) {
-        console.warn("Failed to set processed flag in Redis:", redisError);
-      }
+      await dedupService.markAsProcessed(
+        'track_discovery', 
+        lockKey,
+        86400, // 24 hour TTL
+        { entityId: albumId }
+      );
       
       return { processed: 0, skipped: true, reason: "no_primary_tracks" };
     }
@@ -601,21 +618,13 @@ async function processTracks(
       console.log(`Completed track discovery for album ${albumName}: Found ${processedCount} tracks`);
     }
     
-    // Mark this batch as fully processed in Redis
-    try {
-      const processedKey = `processed:album:${albumId}:offset:${offset}`;
-      await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
-    } catch (redisError) {
-      console.warn("Failed to set processed flag in Redis:", redisError);
-    }
-    
-    // Remove processing flag
-    try {
-      const processingKey = `processing:album:${albumId}:offset:${offset}`;
-      await redis.del(processingKey);
-    } catch (redisError) {
-      console.warn("Failed to remove processing flag:", redisError);
-    }
+    // Mark this batch as fully processed using deduplication service
+    await dedupService.markAsProcessed(
+      'track_discovery', 
+      lockKey,
+      86400, // 24 hour TTL
+      { entityId: albumId }
+    );
     
     return { 
       processed: processedCount, 
@@ -624,28 +633,10 @@ async function processTracks(
     };
   } catch (error) {
     console.error(`Failed to process tracks for album ${albumName}:`, error);
-    
-    // Remove processing flag on error
-    try {
-      const processingKey = `processing:album:${albumId}:offset:${offset}`;
-      await redis.del(processingKey);
-    } catch (redisError) {
-      console.warn("Failed to remove processing flag:", redisError);
-    }
-    
     throw error; // Re-throw to ensure proper error handling in the parent function
   } finally {
-    // Always release lock and remove processing flag, regardless of success or error
+    // Always release lock, regardless of success or error
     if (hasLock) {
-      try {
-        // Remove processing flag on completion or error
-        const processingKey = `processing:album:${albumId}:offset:${offset}`;
-        await redis.del(processingKey);
-      } catch (redisError) {
-        console.warn("Failed to remove processing flag:", redisError);
-      }
-      
-      // Clear lock no matter what
       console.log(`Releasing lock for album ${albumId} offset ${offset}`);
       try {
         await supabase.rpc('release_processing_lock', {

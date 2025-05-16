@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -281,7 +282,7 @@ class AlbumDiscoveryWorker extends createEnhancedWorker<any> {
   }
   
   // Helper method to send to DLQ after max retries
-  private async sendToDLQ(
+  async sendToDLQ(
     messageId: string, 
     message: any, 
     failureReason: string
@@ -353,12 +354,25 @@ async function processAlbumDiscovery() {
       maxRetries: DLQ_CONFIG.maxRetries       // Number of retries before sending to DLQ
     });
     
+    // Check if there were errors and if they exceeded retries, send to DLQ
+    if (result.errors > 0 && result.lastFailedMessage) {
+      console.log(`Message had errors after ${DLQ_CONFIG.maxRetries} retries, sending to DLQ`);
+      
+      const worker = new AlbumDiscoveryWorker();
+      await worker.sendToDLQ(
+        result.lastFailedMessage.id,
+        result.lastFailedMessage.message,
+        `Failed after ${DLQ_CONFIG.maxRetries} retries: ${result.lastFailedMessage.error || 'Unknown error'}`
+      );
+    }
+    
     return {
       processed: result.processed,
       errors: result.errors,
       duplicates: result.duplicates,
       skipped: result.skipped,
       processingTimeMs: result.processingTimeMs,
+      sentToDlq: result.sentToDlq || 0,
       success: result.errors === 0
     };
   } catch (batchError) {
