@@ -20,10 +20,7 @@ const redis = new Redis({
 // Initialize services
 const queueHelper = getQueueHelper(supabase, redis);
 const deduplicationService = getDeduplicationService(redis);
-const spotifyClient = new SpotifyClient(
-  Deno.env.get("SPOTIFY_CLIENT_ID") || "",
-  Deno.env.get("SPOTIFY_CLIENT_SECRET") || ""
-);
+const spotifyClient = new SpotifyClient();
 
 // CORS headers
 const corsHeaders = {
@@ -68,10 +65,11 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
     
     if (artistId) {
       console.log(`Fetching artist by ID: ${artistId}`);
-      spotifyArtist = await spotifyClient.getArtist(artistId);
+      spotifyArtist = await spotifyClient.getArtistById(artistId);
     } else {
       console.log(`Searching for artist: ${artistName}`);
-      const searchResults = await spotifyClient.searchArtist(artistName);
+      // Fix: Use searchArtists (from the SpotifyClient) instead of searchArtist
+      const searchResults = await spotifyClient.getArtistByName(artistName);
       
       if (!searchResults || !searchResults.artists || searchResults.artists.items.length === 0) {
         console.log(`No Spotify results found for artist "${artistName}"`);
@@ -174,7 +172,9 @@ async function processArtistDiscovery() {
       processorName: 'artist-discovery',
       timeoutSeconds: 60,     // Timeout per message
       visibilityTimeoutSeconds: 900, // Increased to 15 minutes per fix #8
-      logDetailedMetrics: true
+      logDetailedMetrics: true,
+      deadLetterQueue: 'artist_discovery_dlq', // Add DLQ for failed messages
+      maxRetries: 3           // Maximum number of retries before sending to DLQ
     });
     
     return {
@@ -183,6 +183,7 @@ async function processArtistDiscovery() {
       duplicates: result.duplicates || 0,
       skipped: result.skipped || 0,
       processingTimeMs: result.processingTimeMs || 0,
+      sentToDlq: result.sentToDlq || 0,
       success: result.errors === 0
     };
   } catch (batchError) {

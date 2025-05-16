@@ -124,7 +124,7 @@ export function createEnhancedWorker(queueName: string, supabase: any, redis: an
               console.error(`Error processing message ${message.id} (attempt ${retryCount}):`, error);
               lastError = error;
               retryMetrics.error = true;
-
+              errors++;
             } finally {
               // Delete the message from the queue if processing was successful or max retries reached
               if (retryMetrics.success || retryCount >= maxRetries) {
@@ -149,17 +149,19 @@ export function createEnhancedWorker(queueName: string, supabase: any, redis: an
           }
 
           // After reaching maxRetries, we'd add:
-          if (deadLetterQueue && retryCount > maxRetries) {
-            console.log(`Message ${message.id} failed after ${retryCount} retries, sending to DLQ: ${deadLetterQueue}`);
+          if (deadLetterQueue && retryCount > maxRetries && !retryMetrics.success) {
+            console.log(`Message ${message.id} failed after ${retryCount - 1} retries, sending to DLQ: ${deadLetterQueue}`);
 
             try {
-              await this.sendToDLQ(message.id, message.message, lastError.message);
+              await this.sendToDLQ(message.id, message.message, deadLetterQueue, lastError?.message || 'Unknown error');
               // Track in metrics
               sentToDlq++;
+              retryMetrics.sentToDlq = 1;
             } catch (dlqError) {
               console.error(`Failed to send to DLQ: ${dlqError.message}`);
               // If we can't send to DLQ, we still need to handle the message somehow
               dlqErrors++;
+              retryMetrics.dlqErrors = 1;
             }
           }
 
@@ -199,10 +201,36 @@ export function createEnhancedWorker(queueName: string, supabase: any, redis: an
       throw new Error("Method not implemented.");
     }
 
-    // Abstract method to send to DLQ
-    async sendToDLQ(messageId: string, message: any, failureReason: string): Promise<boolean> {
-      console.log(`Sending message ${messageId} to DLQ. Reason: ${failureReason}`);
-      return true;
+    // Implementation of the sendToDLQ method
+    async sendToDLQ(messageId: string, message: any, dlqName: string, failureReason: string): Promise<boolean> {
+      try {
+        console.log(`Sending message ${messageId} to DLQ ${dlqName}. Reason: ${failureReason}`);
+        
+        const { data, error } = await this.supabase.functions.invoke("sendToDLQ", {
+          body: {
+            queue_name: this.queueName,
+            dlq_name: dlqName,
+            message_id: messageId,
+            message: message,
+            failure_reason: failureReason,
+            metadata: {
+              worker_id: this.workerId,
+              original_queue: this.queueName,
+              sent_to_dlq_at: new Date().toISOString()
+            }
+          }
+        });
+        
+        if (error) {
+          console.error(`Error sending to DLQ: ${error.message}`);
+          throw new Error(`DLQ sending failed: ${error.message}`);
+        }
+        
+        return true;
+      } catch (error) {
+        console.error(`Failed to send to DLQ ${dlqName}: ${error.message}`);
+        return false;
+      }
     }
   };
 }

@@ -1,48 +1,16 @@
 
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { DeduplicationService } from "../_shared/deduplication.ts";
 
+// Initialize Supabase client
+const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
+const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Common CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
-
-// Default deduplication settings by queue type
-const queueDeduplicationSettings = {
-  // Default settings, applied when specific queue settings are not found
-  default: {
-    enabled: true,
-    ttlSeconds: 300, // 5 minutes
-    strictMatching: false
-  },
-  // Queue-specific settings
-  artist_discovery: {
-    enabled: true,
-    ttlSeconds: 3600, // 1 hour
-    strictMatching: false
-  },
-  album_discovery: {
-    enabled: true,
-    ttlSeconds: 1800, // 30 minutes
-    strictMatching: false
-  },
-  track_discovery: {
-    enabled: true,
-    ttlSeconds: 1800, // 30 minutes
-    strictMatching: false
-  },
-  producer_identification: {
-    enabled: true,
-    ttlSeconds: 3600, // 1 hour
-    strictMatching: true
-  },
-  social_enrichment: {
-    enabled: true,
-    ttlSeconds: 3600 * 24, // 24 hours
-    strictMatching: true
-  }
 };
 
 serve(async (req) => {
@@ -50,93 +18,96 @@ serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
-
+  
   try {
-    const { queue_name, message, deduplication_options } = await req.json();
+    // Parse the request body
+    const { queue_name, message, idempotency_key, create_only } = await req.json();
     
-    if (!queue_name || !message) {
-      throw new Error("queue_name and message are required");
+    if (!queue_name) {
+      return new Response(
+        JSON.stringify({ error: "Missing queue_name parameter" }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
     }
     
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
-    
-    // Initialize Redis for deduplication
-    const redis = new Redis({
-      url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
-      token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
-    });
-    
-    // Set up deduplication service
-    const deduplicationService = new DeduplicationService(redis);
-    
-    // Get deduplication settings for this queue
-    const queueSettings = queueDeduplicationSettings[queue_name] || queueDeduplicationSettings.default;
-    
-    // Merge with any custom options provided in the request
-    const dedupOptions = {
-      ...queueSettings,
-      ...(deduplication_options || {})
-    };
-
-    // Check for duplicate message if deduplication is enabled
-    if (dedupOptions.enabled) {
-      try {
-        const isDuplicate = await deduplicationService.isDuplicate(
-          queue_name, 
-          message,
-          {
-            ttlSeconds: dedupOptions.ttlSeconds,
-            useStrictPayloadMatch: dedupOptions.strictMatching
-          }
-        );
-        
-        if (isDuplicate) {
-          console.log(`Duplicate detected, skipping enqueue to ${queue_name}: ${JSON.stringify(message).substring(0, 100)}...`);
-          
-          return new Response(
-            JSON.stringify({
-              success: true,
-              messageId: null,
-              duplicate: true,
-              message: `Duplicate message detected and skipped for queue ${queue_name}`
-            }),
-            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      } catch (dedupError) {
-        // Log but continue if deduplication check fails
-        console.warn(`Deduplication check failed for ${queue_name}, proceeding with enqueue:`, dedupError);
-      }
+    // First, ensure the queue exists
+    try {
+      // Register the queue using a database function
+      await supabase.rpc('register_queue', {
+        p_queue_name: queue_name,
+        p_display_name: queue_name,
+        p_description: `Queue for ${queue_name} messages`,
+        p_active: true
+      });
+    } catch (createError) {
+      // Queue might already exist, which is fine
+      console.log(`Note: Queue ${queue_name} might already exist: ${createError.message}`);
     }
     
-    console.log(`Sending message to queue ${queue_name}: ${JSON.stringify(message)}`);
+    // If create_only flag is set, we only want to create the queue
+    if (create_only) {
+      return new Response(
+        JSON.stringify({ success: true, queue_created: queue_name }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
     
+    if (!message) {
+      return new Response(
+        JSON.stringify({ error: "Missing message parameter" }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    console.log(`Sending message to queue ${queue_name}`);
+    
+    // Send to queue using pg_enqueue
     const { data: messageId, error } = await supabase.rpc('pg_enqueue', {
-      queue_name,
-      message_body: JSON.stringify(message)
+      queue_name: queue_name,
+      message_body: {
+        ...message,
+        _idempotencyKey: idempotency_key || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
+      }
     });
     
     if (error) {
-      console.error(`Error sending to queue ${queue_name}:`, error);
-      throw error;
+      // Try alternative method
+      try {
+        const { data: altSendResult } = await supabase.rpc('pg_send_text', {
+          queue_name: queue_name,
+          msg_text: JSON.stringify({
+            ...message,
+            _idempotencyKey: idempotency_key || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
+          })
+        });
+        
+        return new Response(
+          JSON.stringify({ success: true, message_id: altSendResult, method: 'pg_send_text' }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+        
+      } catch (altError) {
+        return new Response(
+          JSON.stringify({ error: `All queue sending methods failed: ${error.message} / ${altError.message}` }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
     }
     
-    console.log(`Successfully sent message to queue ${queue_name} with ID: ${messageId}`);
-    
     return new Response(
-      JSON.stringify({ success: true, messageId }),
+      JSON.stringify({ success: true, message_id: messageId }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     
   } catch (error) {
-    console.error("Error sending to queue:", error);
+    console.error("Error in sendToQueue handler:", error);
     
     return new Response(
       JSON.stringify({ error: error.message }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      }
     );
   }
 });
