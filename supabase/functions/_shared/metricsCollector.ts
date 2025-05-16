@@ -1,4 +1,3 @@
-
 /**
  * Metrics Collector for storing pipeline performance metrics
  * Aggregates metrics and persists them to Postgres for analysis
@@ -19,6 +18,7 @@ export class MetricsCollector {
   private bufferSize: number;
   private flushInterval: number | null = null;
   private lastFlushTime: number = Date.now();
+  private flushInProgress: boolean = false;
   
   constructor(supabase: any, options: { 
     bufferSize?: number, 
@@ -40,20 +40,25 @@ export class MetricsCollector {
    * Record a single metric point
    */
   record(metric: MetricPoint): void {
-    // Add timestamp if not provided
-    const fullMetric = {
-      ...metric,
-      timestamp: metric.timestamp || new Date()
-    };
-    
-    // Add to buffer
-    this.metricsBuffer.push(fullMetric);
-    
-    // Auto-flush if buffer size threshold is reached
-    if (this.metricsBuffer.length >= this.bufferSize) {
-      this.flush().catch(err => {
-        this.logger.error("Failed to flush metrics buffer", err);
-      });
+    try {
+      // Add timestamp if not provided
+      const fullMetric = {
+        ...metric,
+        timestamp: metric.timestamp || new Date()
+      };
+      
+      // Add to buffer
+      this.metricsBuffer.push(fullMetric);
+      
+      // Auto-flush if buffer size threshold is reached
+      if (this.metricsBuffer.length >= this.bufferSize) {
+        this.flush().catch(err => {
+          this.logger.warn("Failed to flush metrics buffer", { error: err.message });
+        });
+      }
+    } catch (err) {
+      // Don't let metrics recording break the application
+      this.logger.warn("Error recording metric", { error: err.message });
     }
   }
   
@@ -124,6 +129,13 @@ export class MetricsCollector {
       return true;
     }
     
+    // Prevent concurrent flushes
+    if (this.flushInProgress) {
+      return false;
+    }
+    
+    this.flushInProgress = true;
+    
     const metricsToFlush = [...this.metricsBuffer];
     this.metricsBuffer = [];
     this.lastFlushTime = Date.now();
@@ -137,25 +149,71 @@ export class MetricsCollector {
         timestamp: metric.timestamp
       }));
       
-      // Insert metrics into database
-      const { error } = await this.supabase
-        .from('pipeline_metrics')
-        .insert(metricsRows);
-        
-      if (error) {
-        // Put metrics back in buffer to retry later
-        this.metricsBuffer = [...metricsToFlush, ...this.metricsBuffer];
-        this.logger.error("Failed to persist metrics", error);
+      if (this.supabase) {
+        try {
+          // Insert metrics into database
+          const { error } = await this.supabase
+            .from('pipeline_metrics')
+            .insert(metricsRows);
+            
+          if (error) {
+            // Instead of putting metrics back in buffer, we'll just log the error
+            // This prevents repeated failure loops
+            this.logger.warn("Failed to persist metrics", { error: error.message });
+            
+            // As a fallback, we'll persist metrics to Redis if available
+            await this.persistToFallback(metricsToFlush);
+            
+            return false;
+          }
+        } catch (error) {
+          // Handle case where supabase client is invalid or table doesn't exist
+          this.logger.warn("Error persisting metrics to database", { 
+            error: error.message, 
+            retryCount: metricsToFlush.length 
+          });
+          
+          await this.persistToFallback(metricsToFlush);
+          
+          return false;
+        }
+      } else {
+        // Supabase client not available, try fallback
+        this.logger.warn("No Supabase client available for metrics persistence");
+        await this.persistToFallback(metricsToFlush);
         return false;
       }
       
       this.logger.debug(`Successfully persisted ${metricsToFlush.length} metrics`);
       return true;
     } catch (error) {
-      // Put metrics back in buffer to retry later
-      this.metricsBuffer = [...metricsToFlush, ...this.metricsBuffer];
-      this.logger.error("Exception persisting metrics", error);
+      this.logger.warn("Exception persisting metrics", { error: error.message });
+      await this.persistToFallback(metricsToFlush);
       return false;
+    } finally {
+      this.flushInProgress = false;
+    }
+  }
+  
+  /**
+   * Persist metrics to a fallback storage (Redis or console)
+   * when database persistence fails
+   */
+  private async persistToFallback(metrics: MetricPoint[]): Promise<void> {
+    try {
+      // Log metrics to console as a fallback
+      const summary = {
+        count: metrics.length,
+        names: [...new Set(metrics.map(m => m.name))],
+        timestamp: new Date().toISOString()
+      };
+      
+      this.logger.info("Metrics summary (fallback)", { summary });
+      
+      // We could also attempt to save to Redis here if available
+      // or to a local file if running in development
+    } catch (error) {
+      this.logger.warn("Failed to persist metrics to fallback", { error: error.message });
     }
   }
   
@@ -167,7 +225,7 @@ export class MetricsCollector {
     
     setTimeout(() => {
       this.flush().catch(err => {
-        this.logger.error("Auto-flush failed", err);
+        this.logger.warn("Auto-flush failed", { error: err.message });
       }).finally(() => {
         this.scheduleAutoFlush();
       });

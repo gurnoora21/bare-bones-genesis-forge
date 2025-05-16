@@ -38,7 +38,7 @@ export class GeniusClient {
     // Search results change less frequently than individual resources
     const cacheTtl = endpoint.includes("/search") ? 60 * 60 * 24 : 60 * 60 * 12;
     
-    // Use the standard execute method with proper error handling
+    // Use the rate limiter execute method instead of executeWithCache
     return this.rateLimiter.execute({
       ...limiterConfig,
       endpoint: limiterConfig.endpoint

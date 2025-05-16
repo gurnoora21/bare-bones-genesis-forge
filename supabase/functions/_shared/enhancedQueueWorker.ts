@@ -1,3 +1,4 @@
+
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
@@ -12,6 +13,9 @@ export interface WorkerConfig {
   timeoutSeconds?: number;
   processorName?: string;
   logDetailedMetrics?: boolean;
+  sendToDlqOnMaxRetries?: boolean;
+  maxRetries?: number;
+  deadLetterQueue?: string;
 }
 
 /**
@@ -57,7 +61,10 @@ export abstract class EnhancedWorkerBase {
       visibilityTimeoutSeconds = 300,
       timeoutSeconds = 50,
       processorName = this.queueName,
-      logDetailedMetrics = false
+      logDetailedMetrics = false,
+      sendToDlqOnMaxRetries = true,
+      maxRetries = 3,
+      deadLetterQueue = `${this.queueName}_dlq`
     } = config;
 
     try {
@@ -73,66 +80,97 @@ export abstract class EnhancedWorkerBase {
       // Start heartbeat to keep lock alive
       this.startLockHeartbeat(lockKey);
       
-      let batchCount = 0;
-      let continueProcessing = true;
-      
-      while (continueProcessing && batchCount < maxBatches && (Date.now() - startTime) < timeoutSeconds * 1000) {
-        batchCount++;
+      try {
+        let batchCount = 0;
+        let continueProcessing = true;
         
-        console.log(`Starting batch ${batchCount} for processor ${processorName}`);
-        
-        // Read messages from queue
-        const messages = await this.readFromQueue(batchSize, visibilityTimeoutSeconds);
-        
-        if (!messages || messages.length === 0) {
-          console.log(`No messages to process in queue ${this.queueName}`);
-          break;
-        }
-        
-        console.log(`Retrieved ${messages.length} messages from queue ${this.queueName}`);
-        
-        // Process each message
-        for (const message of messages) {
-          try {
-            // Store message ID for acknowledgment
-            if (message.id) {
+        while (continueProcessing && batchCount < maxBatches && (Date.now() - startTime) < timeoutSeconds * 1000) {
+          batchCount++;
+          
+          console.log(`Starting batch ${batchCount} for processor ${processorName}`);
+          
+          // Read messages from queue
+          const messages = await this.readFromQueue(batchSize, visibilityTimeoutSeconds);
+          
+          if (!messages || messages.length === 0) {
+            console.log(`No messages to process in queue ${this.queueName}`);
+            break;
+          }
+          
+          console.log(`Retrieved ${messages.length} messages from queue ${this.queueName}`);
+          
+          // Process each message
+          for (const message of messages) {
+            try {
+              // Ensure message is valid
+              if (!message || !message.id) {
+                console.warn(`Skipping invalid message without ID`);
+                continue;
+              }
+              
+              // Store message ID for acknowledgment
               const messageId = message.id.toString();
               this.messageIds.set(messageId, messageId);
               messageIds.push(messageId);
-            }
-            
-            // Check deduplication
-            const dedupKey = this.getDedupKey(message);
-            if (dedupKey) {
-              const isDuplicate = await this.checkDeduplicate(dedupKey);
+              
+              // Check deduplication
+              const dedupKey = this.getDedupKey(message);
+              let isDuplicate = false;
+              
+              if (dedupKey) {
+                try {
+                  isDuplicate = await this.checkDeduplicate(dedupKey);
+                } catch (dedupError) {
+                  console.warn(`Error checking deduplication: ${dedupError.message}`);
+                  // Continue processing even if dedup check fails
+                }
+              }
+              
               if (isDuplicate) {
                 console.log(`Skipping duplicate message: ${dedupKey}`);
-                await this.deleteMessage(message.id);
+                await this.deleteMessage(messageId);
                 duplicates++;
                 continue;
               }
+              
+              // Process the message
+              console.log(`Processing message ${messageId}`);
+              const result = await this.processMessage(message.message);
+              
+              // Mark deduplication if needed
+              if (dedupKey) {
+                try {
+                  await this.markDeduplicated(dedupKey);
+                } catch (markError) {
+                  console.warn(`Error marking as deduplicated: ${markError.message}`);
+                  // Continue even if marking fails
+                }
+              }
+              
+              // Delete message from queue
+              const deleted = await this.deleteMessage(messageId);
+              if (!deleted) {
+                console.warn(`Failed to delete message ${messageId} after successful processing`);
+              }
+              
+              processed++;
+            } catch (error) {
+              console.error(`Error processing message ${message?.id}:`, error);
+              
+              // Handle message failure with retry or DLQ
+              if (message?.id) {
+                await this.handleMessageFailure(message, error, maxRetries, sendToDlqOnMaxRetries, deadLetterQueue);
+              } else {
+                console.error(`Cannot handle failure for message without ID`);
+              }
+              
+              errors++;
             }
-            
-            // Process the message
-            const result = await this.processMessage(message.message);
-            
-            // Mark deduplication if needed
-            if (dedupKey) {
-              await this.markDeduplicated(dedupKey);
-            }
-            
-            // Delete message from queue
-            await this.deleteMessage(message.id);
-            
-            processed++;
-          } catch (error) {
-            console.error(`Error processing message ${message.id}:`, error);
-            
-            // Handle message failure with retry or DLQ
-            await this.handleMessageFailure(message, error);
-            errors++;
           }
         }
+      } finally {
+        // Always release lock in finally block
+        await this.releaseLock();
       }
       
       // Log completion
@@ -154,7 +192,7 @@ export abstract class EnhancedWorkerBase {
           message_ids: logDetailedMetrics ? messageIds : undefined
         });
       } catch (metricsError) {
-        console.error(`Failed to persist metrics:`, metricsError);
+        console.warn(`Failed to persist metrics: ${metricsError.message}`);
       }
 
       return {
@@ -165,9 +203,23 @@ export abstract class EnhancedWorkerBase {
         processingTimeMs: Date.now() - startTime,
         messageIds: logDetailedMetrics ? messageIds : undefined
       };
-    } finally {
-      // Release lock and stop heartbeat
-      await this.releaseLock();
+    } catch (batchError) {
+      console.error(`Fatal error in batch processing: ${batchError.message}`);
+      
+      // Try to release lock in case of fatal error
+      try {
+        await this.releaseLock();
+      } catch (lockError) {
+        console.warn(`Error releasing lock after fatal error: ${lockError.message}`);
+      }
+      
+      return { 
+        processed, 
+        errors: errors + 1, 
+        duplicates, 
+        skipped,
+        processingTimeMs: Date.now() - startTime
+      };
     }
   }
 
@@ -259,8 +311,7 @@ export abstract class EnhancedWorkerBase {
   /**
    * Send a message to the dead letter queue
    */
-  protected async sendToDLQ(message: any, error: Error): Promise<boolean> {
-    const dlqName = `${this.queueName}_dlq`;
+  protected async sendToDLQ(message: any, error: Error, dlqName: string): Promise<boolean> {
     const messageId = message.id?.toString();
     
     if (!messageId) {
@@ -289,6 +340,7 @@ export abstract class EnhancedWorkerBase {
         return false;
       }
       
+      console.log(`Successfully sent message ${messageId} to DLQ ${dlqName}`);
       return data?.success || false;
     } catch (dlqError) {
       console.error(`Failed to send message ${messageId} to DLQ:`, dlqError);
@@ -299,22 +351,32 @@ export abstract class EnhancedWorkerBase {
   /**
    * Handle a failed message with retries or DLQ
    */
-  protected async handleMessageFailure(message: any, error: Error, maxRetries = 3): Promise<void> {
+  protected async handleMessageFailure(
+    message: any, 
+    error: Error, 
+    maxRetries = 3,
+    sendToDlq = true,
+    dlqName = `${this.queueName}_dlq`
+  ): Promise<void> {
     const messageId = message.id?.toString();
     const retryCount = message.read_ct || 0;
     
     // If max retries reached, send to DLQ
     if (retryCount >= maxRetries) {
-      console.log(`Message ${messageId} failed after ${retryCount} retries, sending to DLQ: ${this.queueName}_dlq`);
-      const sentToDlq = await this.sendToDLQ(message, error);
+      console.log(`Message ${messageId} failed after ${retryCount} retries, sending to DLQ: ${dlqName}`);
       
-      if (sentToDlq) {
-        // If sent to DLQ successfully, delete from original queue
-        await this.deleteMessage(messageId);
+      if (sendToDlq) {
+        const sentToDlq = await this.sendToDLQ(message, error, dlqName);
+        
+        if (sentToDlq) {
+          // If sent to DLQ successfully, delete from original queue
+          await this.deleteMessage(messageId);
+        } else {
+          // If DLQ failed, release it so it can be retried after visibility timeout
+          console.log(`Failed to send message ${messageId} to DLQ, will be retried later`);
+        }
       } else {
-        // If DLQ failed, release it so it can be retried after visibility timeout
-        // Note: We intentionally don't delete here to allow for manual intervention
-        console.log(`Failed to send message ${messageId} to DLQ, will be retried later`);
+        console.log(`DLQ handling disabled, message ${messageId} will remain in queue`);
       }
     } else {
       // For retryable errors, just log and let visibility timeout expire
@@ -361,6 +423,7 @@ export abstract class EnhancedWorkerBase {
         try {
           // Extend TTL by 60 seconds
           await this.redis.expire(this.processingLock, 60);
+          console.log(`Extended lock TTL for ${this.processingLock}`);
         } catch (error) {
           console.error(`Error extending lock TTL:`, error);
         }
@@ -390,6 +453,7 @@ export abstract class EnhancedWorkerBase {
           end
         `, [this.processingLock], [this.workerId]);
         
+        console.log(`Released lock ${this.processingLock}`);
         this.processingLock = null;
       } catch (error) {
         console.error(`Error releasing lock:`, error);
@@ -402,14 +466,42 @@ export abstract class EnhancedWorkerBase {
    */
   protected async persistMetrics(metrics: any): Promise<void> {
     try {
-      // Store metrics in database or redis for monitoring
+      // First try to store in Redis for reliability
       await this.redis.set(
         `metrics:${this.queueName}:${this.workerId}:${Date.now()}`,
         JSON.stringify(metrics),
         { ex: 86400 } // 24 hour TTL
       );
+      
+      // Then try to store in database if available
+      try {
+        // Check if the pipeline_metrics table exists before inserting
+        const { data, error } = await this.supabase
+          .from('pipeline_metrics')
+          .insert({
+            metric_name: `worker_batch_${metrics.processor}`,
+            metric_value: metrics.processing_time_ms,
+            tags: {
+              queue: metrics.queue,
+              processor: metrics.processor,
+              processed: metrics.processed,
+              errors: metrics.errors,
+              worker_id: metrics.worker_id
+            },
+            timestamp: new Date()
+          });
+          
+        if (error) {
+          // Just log the error but don't throw
+          console.warn(`Error inserting to pipeline_metrics: ${error.message}`);
+        }
+      } catch (dbError) {
+        // Just log the error but don't throw
+        console.warn(`Database metrics insertion failed: ${dbError.message}`);
+      }
     } catch (error) {
-      console.error(`Error persisting metrics:`, error);
+      // Log but don't throw so processing can continue
+      console.warn(`Error persisting metrics:`, error);
     }
   }
   

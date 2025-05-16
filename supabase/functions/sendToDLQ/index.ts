@@ -23,14 +23,23 @@ serve(async (req) => {
     // Parse the request body
     const { queue_name, dlq_name, message_id, message, failure_reason, metadata } = await req.json();
     
-    if (!queue_name || !dlq_name || !message_id) {
+    // Validate required parameters
+    if (!queue_name || !dlq_name) {
       return new Response(
-        JSON.stringify({ error: "Missing required parameters" }),
+        JSON.stringify({ error: "Missing required parameters: queue_name and dlq_name" }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
     
-    console.log(`Moving message ${message_id} from ${queue_name} to DLQ ${dlq_name}`);
+    // Ensure we have a valid message_id or message body
+    if (!message_id && !message) {
+      return new Response(
+        JSON.stringify({ error: "Either message_id or message must be provided" }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    console.log(`Moving message ${message_id || 'with no ID'} from ${queue_name} to DLQ ${dlq_name}`);
     
     // First, ensure DLQ exists
     try {
@@ -44,12 +53,15 @@ serve(async (req) => {
       console.log(`Note: DLQ ${dlq_name} might already exist`);
     }
     
+    // Generate a unique ID if none provided
+    const dlqMessageId = message_id || `generated_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    
     // Prepare message with DLQ metadata
     const dlqMessage = {
-      ...message,
+      ...(message || {}),
       _dlq_metadata: {
         source_queue: queue_name,
-        original_message_id: message_id,
+        original_message_id: message_id || 'unknown',
         moved_at: new Date().toISOString(),
         failure_reason: failure_reason || 'Unknown error',
         custom_metadata: metadata || {}
@@ -61,11 +73,12 @@ serve(async (req) => {
       body: {
         queue_name: dlq_name,
         message: dlqMessage,
-        idempotency_key: `dlq:${queue_name}:${message_id}`
+        idempotency_key: `dlq:${queue_name}:${dlqMessageId}`
       }
     });
     
     if (sendError) {
+      console.error(`Failed to send to DLQ: ${sendError.message}`, sendError);
       return new Response(
         JSON.stringify({ error: `Failed to send to DLQ: ${sendError.message}` }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -81,7 +94,7 @@ serve(async (req) => {
           details: {
             source_queue: queue_name,
             dlq_name: dlq_name,
-            source_message_id: message_id,
+            source_message_id: message_id || 'unknown',
             dlq_message_id: sendResult.message_id,
             failure_reason: failure_reason,
             timestamp: new Date().toISOString()

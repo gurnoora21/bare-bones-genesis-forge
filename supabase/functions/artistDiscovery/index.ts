@@ -42,7 +42,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
     // Generate deduplication key
     const dedupKey = `artist_discovery:artist:name:${artistName.toLowerCase()}`;
     
-    // Lookup artist on Spotify
+    // Lookup artist on Spotify using the correct function name
     const searchResponse = await spotifyClient.getArtistByName(artistName);
     
     if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items || searchResponse.artists.items.length === 0) {
@@ -157,7 +157,10 @@ async function processArtistDiscovery() {
       processorName: 'artist-discovery',
       timeoutSeconds: 50,
       visibilityTimeoutSeconds: 900, // 15 minutes
-      logDetailedMetrics: true
+      logDetailedMetrics: true,
+      sendToDlqOnMaxRetries: true,
+      maxRetries: 3,
+      deadLetterQueue: 'artist_discovery_dlq'
     });
     
     return {
