@@ -2,27 +2,21 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
+import { getSpotifyClient } from "../_shared/spotifyClient.ts";
 import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
-import { getQueueHelper } from "../_shared/queueHelper.ts";
-import { SpotifyClient } from "../_shared/spotifyClient.ts";
-import { getDeduplicationService } from "../_shared/deduplication.ts";
 
-// Initialize clients
-const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const supabase = createClient(supabaseUrl, supabaseKey);
-
+// Initialize Redis client
 const redis = new Redis({
   url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
   token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
 });
 
-// Initialize services
-const queueHelper = getQueueHelper(supabase, redis);
-const deduplicationService = getDeduplicationService(redis);
-const spotifyClient = new SpotifyClient();
+// Initialize Supabase client
+const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
+const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+const supabase = createClient(supabaseUrl, supabaseKey);
 
-// CORS headers
+// Common CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -35,130 +29,121 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
   async processMessage(message: any): Promise<any> {
     console.log("Processing artist discovery message:", message);
     
-    // Extract artist info
+    // Extract artist name
     const artistName = message.artistName;
-    const artistId = message.artistId;
     
-    if (!artistName && !artistId) {
-      throw new Error("Message missing both artistName and artistId");
+    if (!artistName) {
+      throw new Error("Message missing artistName");
     }
+    
+    // Get Spotify client
+    const spotifyClient = getSpotifyClient();
     
     // Generate deduplication key
-    const dedupKey = artistId 
-      ? `artist:id:${artistId}` 
-      : `artist:name:${artistName.toLowerCase()}`;
+    const dedupKey = `artist_discovery:artist:name:${artistName.toLowerCase()}`;
     
-    // Check if already processed (extra safety check)
-    const isDuplicate = await deduplicationService.isDuplicate(
-      'artist_discovery', 
-      dedupKey,
-      { logDetails: true }
-    );
+    // Lookup artist on Spotify
+    const searchResponse = await spotifyClient.getArtistByName(artistName);
     
-    if (isDuplicate) {
-      console.log(`Artist ${artistId || artistName} already processed, skipping`);
-      return { status: 'skipped', reason: 'already_processed' };
+    if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items || searchResponse.artists.items.length === 0) {
+      console.log(`No results found for artist "${artistName}"`);
+      return { status: 'completed', result: 'no_results' };
     }
     
-    // Get artist details from Spotify
-    let spotifyArtist;
+    // Get the first result
+    const artist = searchResponse.artists.items[0];
     
-    if (artistId) {
-      console.log(`Fetching artist by ID: ${artistId}`);
-      spotifyArtist = await spotifyClient.getArtistById(artistId);
-    } else {
-      console.log(`Searching for artist: ${artistName}`);
-      // Fix: Use searchArtists (from the SpotifyClient) instead of searchArtist
-      const searchResults = await spotifyClient.getArtistByName(artistName);
-      
-      if (!searchResults || !searchResults.artists || searchResults.artists.items.length === 0) {
-        console.log(`No Spotify results found for artist "${artistName}"`);
-        return { status: 'completed', result: 'no_spotify_results' };
-      }
-      
-      spotifyArtist = searchResults.artists.items[0];
-    }
-    
-    if (!spotifyArtist || !spotifyArtist.id) {
-      throw new Error(`Failed to get valid artist data for ${artistId || artistName}`);
-    }
-    
-    // Convert genres array to JSONB-friendly format if present
-    const metadata = {
-      spotify_url: spotifyArtist.external_urls?.spotify,
-      spotify_uri: spotifyArtist.uri,
-      genres: spotifyArtist.genres || []
-    };
-    
-    // Insert or update artist in database
-    const { data: savedArtist, error: upsertError } = await supabase
-      .from('artists')
-      .upsert({
-        name: spotifyArtist.name,
-        spotify_id: spotifyArtist.id,
-        followers: spotifyArtist.followers?.total || 0,
-        popularity: spotifyArtist.popularity || 0,
-        image_url: spotifyArtist.images && spotifyArtist.images.length > 0 
-          ? spotifyArtist.images[0].url 
-          : null,
-        metadata
-      }, {
-        onConflict: 'spotify_id',
-        returning: 'minimal'
-      })
-      .select('id')
-      .single();
-    
-    if (upsertError) {
-      throw new Error(`Error upserting artist ${spotifyArtist.name}: ${upsertError.message}`);
-    }
-    
-    const dbArtistId = savedArtist?.id;
-    
-    if (!dbArtistId) {
-      throw new Error(`Failed to get artist ID after upsert for ${spotifyArtist.name}`);
-    }
-    
-    console.log(`Successfully saved/updated artist ${spotifyArtist.name} (${dbArtistId})`);
-    
-    // Queue album discovery ONLY AFTER successfully inserting the artist
-    // This way, if album queue fails, we still have the artist record
+    // Process artist details
     try {
-      const albumEnqueued = await queueHelper.enqueue('album_discovery', {
-        artistId: dbArtistId,
-        offset: 0
-      });
-
-      if (!albumEnqueued) {
-        throw new Error(`Failed to queue album discovery for artist ${dbArtistId}`);
+      // Check if artist already exists in database
+      const { data: existingArtist } = await supabase
+        .from('artists')
+        .select('id')
+        .eq('spotify_id', artist.id)
+        .maybeSingle();
+      
+      let artistId;
+      
+      if (existingArtist) {
+        console.log(`Artist ${artist.name} already exists, updating`);
+        artistId = existingArtist.id;
+        
+        // Update the artist
+        await supabase
+          .from('artists')
+          .update({
+            name: artist.name,
+            followers: artist.followers?.total || 0,
+            popularity: artist.popularity || 0,
+            image_url: artist.images?.[0]?.url,
+            metadata: {
+              genres: artist.genres,
+              updated_at: new Date().toISOString()
+            }
+          })
+          .eq('id', artistId);
+      } else {
+        console.log(`Creating new artist: ${artist.name}`);
+        
+        // Insert the artist
+        const { data: newArtist, error: insertError } = await supabase
+          .from('artists')
+          .insert({
+            name: artist.name,
+            spotify_id: artist.id,
+            followers: artist.followers?.total || 0,
+            popularity: artist.popularity || 0,
+            image_url: artist.images?.[0]?.url,
+            metadata: {
+              genres: artist.genres,
+              created_at: new Date().toISOString()
+            }
+          })
+          .select('id')
+          .single();
+          
+        if (insertError) {
+          console.error(`Error inserting artist ${artist.name}:`, insertError);
+          throw insertError;
+        }
+        
+        artistId = newArtist.id;
       }
       
-      console.log(`Successfully queued album discovery for artist ${dbArtistId}`);
+      // Enqueue album discovery for this artist
+      console.log(`Enqueueing album discovery for artist ${artist.name} (${artistId})`);
       
-      // Only mark as processed AFTER successfully enqueuing albums
-      // This ensures failures in queueing will be retried
-      await deduplicationService.markAsProcessed(
-        'artist_discovery', 
-        dedupKey,
-        86400, // 24 hour TTL
-        { entityId: dbArtistId?.toString() }
-      );
+      const queueResult = await supabase.functions.invoke('sendToQueue', {
+        body: {
+          queue_name: 'album_discovery',
+          message: {
+            artistId: artistId,
+            spotifyArtistId: artist.id,
+            artistName: artist.name
+          },
+          idempotency_key: `album_discovery:artist:${artistId}`
+        }
+      });
       
-      return { 
-        status: 'completed', 
-        artistId: dbArtistId,
-        spotifyId: spotifyArtist.id,
-        name: spotifyArtist.name,
-        albumEnqueued: true 
+      if (queueResult.error) {
+        console.error(`Failed to enqueue album discovery:`, queueResult.error);
+      }
+      
+      return {
+        status: 'completed',
+        artistId,
+        spotifyArtistId: artist.id,
+        name: artist.name
       };
+      
     } catch (error) {
-      console.error(`Error queueing album discovery: ${error.message}`);
-      throw error; // Re-throw to ensure the message stays visible for retry
+      console.error(`Error processing artist ${artist.name}:`, error);
+      throw error; // Re-throw for retry logic
     }
   }
 }
 
-// Process a batch of artist discovery messages with self-draining
+// Process a batch of artist discovery messages
 async function processArtistDiscovery() {
   console.log("Starting artist discovery batch processing");
   
@@ -167,14 +152,12 @@ async function processArtistDiscovery() {
     
     // Process multiple batches within the time limit
     const result = await worker.processBatch({
-      maxBatches: 10,         // Process up to 10 batches in one invocation
-      batchSize: 5,           // 5 messages per batch
+      maxBatches: 1,
+      batchSize: 5,
       processorName: 'artist-discovery',
-      timeoutSeconds: 60,     // Timeout per message
-      visibilityTimeoutSeconds: 900, // Increased to 15 minutes per fix #8
-      logDetailedMetrics: true,
-      deadLetterQueue: 'artist_discovery_dlq', // Add DLQ for failed messages
-      maxRetries: 3           // Maximum number of retries before sending to DLQ
+      timeoutSeconds: 50,
+      visibilityTimeoutSeconds: 900, // 15 minutes
+      logDetailedMetrics: true
     });
     
     return {
@@ -183,7 +166,6 @@ async function processArtistDiscovery() {
       duplicates: result.duplicates || 0,
       skipped: result.skipped || 0,
       processingTimeMs: result.processingTimeMs || 0,
-      sentToDlq: result.sentToDlq || 0,
       success: result.errors === 0
     };
   } catch (batchError) {

@@ -32,79 +32,67 @@ serve(async (req) => {
     
     console.log(`Moving message ${message_id} from ${queue_name} to DLQ ${dlq_name}`);
     
-    // Call the database function to move the message
-    const { data, error } = await supabase.rpc('move_to_dead_letter_queue', {
-      source_queue: queue_name,
-      dlq_name: dlq_name,
-      message_id: message_id.toString(),
-      failure_reason: failure_reason || 'Unknown error',
-      metadata: metadata || {}
+    // First, ensure DLQ exists
+    try {
+      await supabase.functions.invoke('sendToQueue', {
+        body: {
+          queue_name: dlq_name,
+          create_only: true
+        }
+      });
+    } catch (createError) {
+      console.log(`Note: DLQ ${dlq_name} might already exist`);
+    }
+    
+    // Prepare message with DLQ metadata
+    const dlqMessage = {
+      ...message,
+      _dlq_metadata: {
+        source_queue: queue_name,
+        original_message_id: message_id,
+        moved_at: new Date().toISOString(),
+        failure_reason: failure_reason || 'Unknown error',
+        custom_metadata: metadata || {}
+      }
+    };
+    
+    // Send to DLQ
+    const { data: sendResult, error: sendError } = await supabase.functions.invoke('sendToQueue', {
+      body: {
+        queue_name: dlq_name,
+        message: dlqMessage,
+        idempotency_key: `dlq:${queue_name}:${message_id}`
+      }
     });
     
-    if (error) {
-      console.error(`Error moving message to DLQ:`, error);
-      
-      // Try manual fallback approach if the function call fails
-      try {
-        // First, ensure DLQ exists
-        const { data: dlqCreate } = await supabase.functions.invoke('sendToQueue', {
-          body: {
-            queue_name: dlq_name,
-            message: {
-              _dlq_test: true
-            },
-            create_only: true
-          }
-        });
-        
-        // Prepare the message with DLQ metadata
-        const dlqMessage = {
-          ...message,
-          _dlq_metadata: {
+    if (sendError) {
+      return new Response(
+        JSON.stringify({ error: `Failed to send to DLQ: ${sendError.message}` }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Record the move in monitoring if possible
+    try {
+      await supabase
+        .from('monitoring_events')
+        .insert({
+          event_type: 'message_moved_to_dlq',
+          details: {
             source_queue: queue_name,
-            original_message_id: message_id,
-            moved_at: new Date().toISOString(),
-            failure_reason: failure_reason || 'Unknown error',
-            custom_metadata: metadata || {}
-          }
-        };
-        
-        // Send to DLQ
-        const { data: sendResult, error: sendError } = await supabase.functions.invoke('sendToQueue', {
-          body: {
-            queue_name: dlq_name,
-            message: dlqMessage,
-            idempotency_key: `dlq:${queue_name}:${message_id}`
+            dlq_name: dlq_name,
+            source_message_id: message_id,
+            dlq_message_id: sendResult.message_id,
+            failure_reason: failure_reason,
+            timestamp: new Date().toISOString()
           }
         });
-        
-        if (sendError) {
-          throw new Error(`Failed to send to DLQ: ${sendError.message}`);
-        }
-        
-        // Delete original message
-        await supabase.functions.invoke('deleteMessage', {
-          body: {
-            queue_name: queue_name,
-            msg_id: message_id
-          }
-        });
-        
-        return new Response(
-          JSON.stringify({ success: true, method: 'fallback', message_id }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-        
-      } catch (fallbackError) {
-        return new Response(
-          JSON.stringify({ error: `Both primary and fallback DLQ methods failed: ${fallbackError.message}` }),
-          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
+    } catch (monitoringError) {
+      console.log(`Note: Could not record monitoring event: ${monitoringError.message}`);
     }
     
     return new Response(
-      JSON.stringify({ success: true, message_id }),
+      JSON.stringify({ success: true, message_id: sendResult.message_id }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     

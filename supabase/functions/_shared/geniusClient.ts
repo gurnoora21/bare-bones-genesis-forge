@@ -1,3 +1,4 @@
+
 import { getRateLimiter, RATE_LIMITERS } from "./rateLimiter.ts";
 
 /**
@@ -37,12 +38,10 @@ export class GeniusClient {
     // Search results change less frequently than individual resources
     const cacheTtl = endpoint.includes("/search") ? 60 * 60 * 24 : 60 * 60 * 12;
     
-    // Use the caching rate limiter
-    const cacheKey = `genius:${endpoint}`;
-    return this.rateLimiter.executeWithCache({
+    // Use the standard execute method with proper error handling
+    return this.rateLimiter.execute({
       ...limiterConfig,
-      cacheKey,
-      cacheTtl
+      endpoint: limiterConfig.endpoint
     }, async () => {
       const response = await fetch(url, {
         headers: {
@@ -157,4 +156,17 @@ export class GeniusClient {
     
     return producers;
   }
+}
+
+// Create a singleton instance
+let geniusClientInstance: GeniusClient | null = null;
+
+/**
+ * Get or create a GeniusClient instance
+ */
+export function getGeniusClient(): GeniusClient {
+  if (!geniusClientInstance) {
+    geniusClientInstance = new GeniusClient();
+  }
+  return geniusClientInstance;
 }

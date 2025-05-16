@@ -55,7 +55,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       const genius = getGeniusClient();
       
       // Search for track on Genius
-      const searchResults = await genius.searchSong(trackName);
+      const searchResults = await genius.search(trackName, track.name);
       
       if (!searchResults || !searchResults.hits || searchResults.hits.length === 0) {
         console.log(`No genius results found for track "${trackName}"`);
@@ -66,7 +66,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       const songId = searchResults.hits[0].result.id;
       
       // Get detailed song info
-      const songDetails = await genius.getSongDetails(songId);
+      const songDetails = await genius.getSong(songId);
       
       if (!songDetails) {
         console.log(`No song details found for song ID ${songId}`);
@@ -74,7 +74,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       }
       
       // Extract producers
-      const producers = extractProducers(songDetails);
+      const producers = genius.extractProducers(songDetails);
       
       // Save producers to database
       if (producers.length > 0) {
@@ -140,7 +140,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
           
           if (!alreadyEnqueued) {
             // Enqueue social enrichment task
-            const queueResult = await supabase.functions.invoke('enqueueMessage', {
+            const queueResult = await supabase.functions.invoke('sendToQueue', {
               body: {
                 queue_name: 'social_enrichment',
                 message: {
@@ -174,53 +174,6 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       throw error; // Re-throw for retry logic
     }
   }
-}
-
-// Helper function to extract producers from Genius song details
-function extractProducers(songDetails: any): Array<any> {
-  const producers = [];
-  
-  try {
-    // Check for producer_artists in song details
-    if (songDetails.producer_artists && Array.isArray(songDetails.producer_artists)) {
-      for (const producer of songDetails.producer_artists) {
-        producers.push({
-          id: producer.id,
-          name: producer.name,
-          url: producer.url,
-          image_url: producer.image_url,
-          confidence: 0.9
-        });
-      }
-    }
-    
-    // Also check for production credits in the song's description
-    if (songDetails.description && songDetails.description.html) {
-      // Extract producers from description text (basic implementation)
-      const description = songDetails.description.html.toLowerCase();
-      if (description.includes('produced by') || description.includes('producer')) {
-        // Extract names after "produced by" (simplified implementation)
-        const matches = description.match(/produced by\s+([^<.,]+)/g);
-        if (matches) {
-          for (const match of matches) {
-            const name = match.replace('produced by', '').trim();
-            // Check if already extracted from producer_artists
-            if (!producers.some(p => p.name.toLowerCase() === name.toLowerCase())) {
-              producers.push({
-                name,
-                confidence: 0.7,
-                source: 'description'
-              });
-            }
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.error('Error extracting producers:', error);
-  }
-  
-  return producers;
 }
 
 // Process a batch of producer identification messages

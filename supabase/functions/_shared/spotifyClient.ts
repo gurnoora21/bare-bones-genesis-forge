@@ -12,13 +12,14 @@ export class SpotifyClient {
   private clientSecret: string;
   private accessToken: string | null;
   private tokenExpiry: number;
-  private rateLimiter = getRateLimiter();
+  private rateLimiter;
   
   constructor() {
     this.clientId = Deno.env.get("SPOTIFY_CLIENT_ID") || "";
     this.clientSecret = Deno.env.get("SPOTIFY_CLIENT_SECRET") || "";
     this.accessToken = null;
     this.tokenExpiry = 0;
+    this.rateLimiter = getRateLimiter();
     
     if (!this.clientId || !this.clientSecret) {
       throw new Error("Spotify client ID and client secret must be provided as environment variables");
@@ -90,19 +91,17 @@ export class SpotifyClient {
     // Determine appropriate rate limiter config based on endpoint
     const limiterConfig = endpoint.includes("/search") 
       ? RATE_LIMITERS.SPOTIFY.SEARCH 
-      : (endpoint.includes("ids=") ? RATE_LIMITERS.SPOTIFY.BATCH : RATE_LIMITERS.SPOTIFY.DEFAULT);
+      : (endpoint.includes("ids=") ? RATE_LIMITERS.SPOTIFY.DEFAULT : RATE_LIMITERS.SPOTIFY.DEFAULT);
     
     const endpointName = endpoint.split('?')[0].split('/').filter(Boolean).pop() || 'default';
     
-    // Use the caching rate limiter if a cache time is provided
+    // Use the standard execute method for all requests with proper caching if needed
     if (cacheTime && method === "GET") {
       const cacheKey = `spotify:${endpoint}`;
       
-      return this.rateLimiter.executeWithCache({
+      return this.rateLimiter.execute({
         ...limiterConfig,
-        endpoint: endpointName,
-        cacheKey,
-        cacheTtl: cacheTime
+        endpoint: endpointName
       }, async () => {
         return this.performApiRequest(url, options);
       });
@@ -239,4 +238,14 @@ export class SpotifyClient {
     
     return results;
   }
+}
+
+// Create a singleton instance
+let spotifyClientInstance: SpotifyClient | null = null;
+
+export function getSpotifyClient(): SpotifyClient {
+  if (!spotifyClientInstance) {
+    spotifyClientInstance = new SpotifyClient();
+  }
+  return spotifyClientInstance;
 }
