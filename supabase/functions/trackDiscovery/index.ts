@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
@@ -311,10 +310,13 @@ async function processTracks(
   const { albumId, albumName, artistId, offset = 0 } = msg;
   console.log(`Processing tracks for album ${albumName} (ID: ${albumId}) at offset ${offset}`);
   
+  // Acquire distributed lock to prevent duplicate processing
+  const lockKey = `album:${albumId}:offset:${offset}`;
+  let hasLock = false;
+  
   try {
-    // Acquire distributed lock to prevent duplicate processing
-    const lockKey = `album:${albumId}:offset:${offset}`;
-    const hasLock = await acquireProcessingLock('album_tracks', lockKey);
+    // Acquire lock with proper tracking
+    hasLock = await acquireProcessingLock('album_tracks', lockKey);
     
     if (!hasLock) {
       console.log(`Another process is handling album ${albumName} offset ${offset}, skipping`);
@@ -393,6 +395,21 @@ async function processTracks(
     
     console.log(`${tracksToProcess.length} tracks have the artist as primary artist`);
 
+    // Early return with proper lock cleanup if no tracks to process
+    if (tracksToProcess.length === 0) {
+      console.log(`No primary artist tracks found for artist ${artist.name} in album ${albumName}`);
+      
+      // Mark this batch as processed even with zero tracks
+      try {
+        const processedKey = `processed:album:${albumId}:offset:${offset}`;
+        await redis.set(processedKey, 'true', { ex: 86400 }); // 24 hour TTL
+      } catch (redisError) {
+        console.warn("Failed to set processed flag in Redis:", redisError);
+      }
+      
+      return { processed: 0, skipped: true, reason: "no_primary_tracks" };
+    }
+
     // Get detailed track info in batches of 50 (Spotify API limit)
     let processedCount = 0;
     let errorCount = 0;
@@ -421,203 +438,106 @@ async function processTracks(
           continue;
         }
         
-        // Process each track in batch
-        for (const track of trackDetails) {
-          try {
-            // First check if this specific track has already been processed using Redis
-            const trackKey = `processed:track:${track.id}`;
-            let skipTrack = false;
-            
-            try {
-              skipTrack = await redis.exists(trackKey) === 1;
-              if (skipTrack) {
-                console.log(`Track ${track.name} (${track.id}) already processed according to Redis, skipping`);
-                processedCount++;
-                continue;
-              }
-            } catch (redisError) {
-              // If Redis check fails, continue with processing
-              console.warn(`Redis check failed for track ${track.id}:`, redisError);
+        // Process track batch atomically using the database function
+        try {
+          // Convert tracks to the format expected by the SQL function
+          const tracksForBatch = trackDetails.map(track => ({
+            name: track.name,
+            spotify_id: track.id,
+            duration_ms: track.duration_ms,
+            popularity: track.popularity,
+            spotify_preview_url: track.preview_url,
+            metadata: {
+              disc_number: track.disc_number,
+              track_number: track.track_number,
+              artists: track.artists,
+              updated_at: new Date().toISOString()
             }
-            
-            // Validate track data
-            if (!track || !track.id || !track.name) {
-              console.error(`Invalid track data received:`, track);
-              await logWorkerIssue(
-                supabase,
-                "trackDiscovery", 
-                "data_validation", 
-                "Invalid track data", 
-                { track }
-              );
-              errorCount++;
-              continue;
+          }));
+          
+          // Execute atomic batch processing
+          const { data: batchResult, error: batchError } = await supabase.rpc(
+            'process_track_batch',
+            {
+              p_track_data: tracksForBatch,
+              p_album_id: albumId,
+              p_artist_id: artistId
             }
-            
-            // Debug track object
-            console.log(`Processing track: ${track.name} (ID: ${track.id})`);
-            console.log(`Track data validation successful for ${track.name}`);
-            
-            // Normalize the track name for deduplication
-            const normalizedName = normalizeTrackName(track.name);
-            
-            if (!normalizedName) {
-              console.warn(`Normalized name is empty for track ${track.name}, skipping`);
-              errorCount++;
-              continue;
-            }
-            
-            // Check if normalized track already exists
-            const { data: existingNormalizedTrack } = await supabase
-              .from('normalized_tracks')
-              .select('id')
-              .eq('artist_id', artist.id)
-              .eq('normalized_name', normalizedName)
-              .maybeSingle();
-            
-            // Prepare track data for insertion
-            const trackData = {
-              album_id: album.id,
-              spotify_id: track.id,
-              name: track.name,
-              duration_ms: track.duration_ms,
-              popularity: track.popularity,
-              spotify_preview_url: track.preview_url,
-              metadata: {
-                disc_number: track.disc_number,
-                track_number: track.track_number,
-                artists: track.artists,
-                updated_at: new Date().toISOString()
-              }
-            };
-            
-            console.log(`Ready to upsert track data: ${JSON.stringify({
-              id: track.id,
-              name: track.name,
-              album_id: album.id
-            })}`);
-            
-            // Store track in database with explicit conflict handling
-            const { data: insertedTrack, error: insertError } = await supabase
-              .from('tracks')
-              .upsert(trackData, {
-                onConflict: 'spotify_id',
-                ignoreDuplicates: false
-              })
-              .select('id')
-              .single();
-
-            if (insertError) {
-              console.error(`Error upserting track ${track.name} (${track.id}):`, insertError);
-              await logWorkerIssue(
-                supabase,
-                "trackDiscovery", 
-                "database_error", 
-                `Failed to insert track: ${track.name}`, 
-                { 
-                  error: insertError, 
-                  track_spotify_id: track.id,
-                  trackData: trackData
-                }
-              );
-              errorCount++;
-              continue;
-            }
-            
-            console.log(`Successfully inserted/updated track: ${track.name} (DB ID: ${insertedTrack.id})`);
-            processedTrackIds.push(insertedTrack.id);
-
-            // Create normalized track entry if it doesn't exist
-            if (!existingNormalizedTrack) {
-              const { error: normalizedError } = await supabase
-                .from('normalized_tracks')
-                .upsert({
-                  artist_id: artist.id,
-                  normalized_name: normalizedName,
-                  representative_track_id: insertedTrack.id
-                }, {
-                  onConflict: 'artist_id,normalized_name'
-                });
-                
-              if (normalizedError) {
-                console.error(`Error upserting normalized track for ${track.name}:`, normalizedError);
-                await logWorkerIssue(
-                  supabase,
-                  "trackDiscovery", 
-                  "database_error", 
-                  `Error creating normalized track for ${track.name}`, 
-                  { error: normalizedError }
-                );
-              } else {
-                console.log(`Created normalized track entry for: ${normalizedName}`);
-              }
-            }
-
-            // Mark this track as processed in Redis
-            try {
-              await redis.set(trackKey, 'true', { ex: 86400 }); // 24 hour TTL
-            } catch (redisError) {
-              // Non-fatal if Redis fails
-              console.warn(`Failed to mark track ${track.id} as processed in Redis:`, redisError);
-            }
-
-            // Enqueue producer identification with idempotency check
-            const producerMsg = {
-              trackId: insertedTrack.id,
-              trackName: track.name,
-              albumId: album.id,
-              artistId: artist.id
-            };
-            
-            // Check if producer identification was already enqueued
-            const producerKey = `enqueued:producer:${insertedTrack.id}`;
-            let alreadyEnqueued = false;
-            
-            try {
-              alreadyEnqueued = await redis.exists(producerKey) === 1;
-            } catch (redisError) {
-              // If Redis check fails, continue with enqueuing
-              console.warn(`Redis check failed for producer identification:`, redisError);
-            }
-            
-            if (!alreadyEnqueued) {
-              try {
-                await supabase.functions.invoke("sendToQueue", {
-                  body: {
-                    queue_name: "producer_identification",
-                    message: producerMsg
-                  }
-                });
-                
-                console.log(`Enqueued producer identification for track: ${track.name}`);
-                
-                // Mark as enqueued in Redis
-                try {
-                  await redis.set(producerKey, 'true', { ex: 86400 }); // 24 hour TTL
-                } catch (redisError) {
-                  // Non-fatal if Redis fails
-                  console.warn(`Failed to mark producer identification as enqueued:`, redisError);
-                }
-              } catch (enqueueError) {
-                console.error(`Error enqueueing producer identification for ${track.name}:`, enqueueError);
-                errorCount++;
-              }
-            } else {
-              console.log(`Producer identification already enqueued for track ${track.name}, skipping`);
-            }
-            
-            processedCount++;
-          } catch (trackError) {
-            console.error(`Error processing individual track ${track?.name || 'unknown'}:`, trackError);
-            await logWorkerIssue(
-              supabase,
-              "trackDiscovery", 
-              "track_processing", 
-              `Error processing track ${track?.name || 'unknown'}: ${trackError.message}`, 
-              { error: trackError.message, track: track }
-            );
-            errorCount++;
+          );
+          
+          if (batchError) {
+            throw new Error(`Error processing track batch: ${batchError.message}`);
           }
+          
+          // Process results
+          if (batchResult.error) {
+            console.error(`Error from track batch processing: ${batchResult.error}`);
+            errorCount += batch.length;
+          } else {
+            console.log(`Successfully processed ${batchResult.processed} tracks in batch`);
+            processedCount += batchResult.processed;
+            
+            // Extract track IDs for producer identification
+            if (batchResult.results) {
+              const resultArray = Array.isArray(batchResult.results) 
+                ? batchResult.results 
+                : [batchResult.results];
+                
+              for (const track of resultArray) {
+                if (track.track_id) {
+                  processedTrackIds.push(track.track_id);
+                  
+                  // Enqueue producer identification
+                  const producerMsg = {
+                    trackId: track.track_id,
+                    trackName: track.name,
+                    albumId: albumId,
+                    artistId: artistId
+                  };
+                  
+                  // Check if producer identification was already enqueued
+                  const producerKey = `enqueued:producer:${track.track_id}`;
+                  let alreadyEnqueued = false;
+                  
+                  try {
+                    alreadyEnqueued = await redis.exists(producerKey) === 1;
+                  } catch (redisError) {
+                    console.warn(`Redis check failed for producer identification:`, redisError);
+                  }
+                  
+                  if (!alreadyEnqueued) {
+                    try {
+                      await supabase.functions.invoke("sendToQueue", {
+                        body: {
+                          queue_name: "producer_identification",
+                          message: producerMsg
+                        }
+                      });
+                      
+                      // Mark as enqueued in Redis
+                      try {
+                        await redis.set(producerKey, 'true', { ex: 86400 }); // 24 hour TTL
+                      } catch (redisError) {
+                        console.warn(`Failed to mark producer identification as enqueued:`, redisError);
+                      }
+                    } catch (enqueueError) {
+                      console.error(`Error enqueueing producer identification:`, enqueueError);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (batchProcessError) {
+          console.error(`Error in atomic batch processing:`, batchProcessError);
+          await logWorkerIssue(
+            supabase,
+            "trackDiscovery", 
+            "batch_processing", 
+            `Error in atomic processing: ${batchProcessError.message}`, 
+            { error: batchProcessError.message }
+          );
+          errorCount += batch.length;
         }
       } catch (batchError) {
         console.error(`Error processing batch of tracks:`, batchError);
@@ -714,6 +634,28 @@ async function processTracks(
     }
     
     throw error; // Re-throw to ensure proper error handling in the parent function
+  } finally {
+    // Always release lock and remove processing flag, regardless of success or error
+    if (hasLock) {
+      try {
+        // Remove processing flag on completion or error
+        const processingKey = `processing:album:${albumId}:offset:${offset}`;
+        await redis.del(processingKey);
+      } catch (redisError) {
+        console.warn("Failed to remove processing flag:", redisError);
+      }
+      
+      // Clear lock no matter what
+      console.log(`Releasing lock for album ${albumId} offset ${offset}`);
+      try {
+        await supabase.rpc('release_processing_lock', {
+          p_entity_type: 'album_tracks',
+          p_entity_id: lockKey
+        });
+      } catch (lockError) {
+        console.warn(`Failed to release lock: ${lockError.message}`);
+      }
+    }
   }
 }
 

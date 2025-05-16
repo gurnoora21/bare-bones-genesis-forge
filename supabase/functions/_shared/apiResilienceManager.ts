@@ -54,6 +54,9 @@ export class ApiResilienceManager {
   private circuitBreakerFactory: ReturnType<typeof createCircuitBreakerFactory>;
   private circuitBreakers: Record<string, RedisCircuitBreaker> = {};
   
+  // Default reset window increased to 90 seconds (1.5x Spotify's 60-second ban window)
+  private DEFAULT_RESET_TIMEOUT_MS = 90000; // 1.5x Spotify ban window
+  
   constructor(redis: Redis) {
     this.redis = redis;
     this.circuitBreakerFactory = createCircuitBreakerFactory(redis);
@@ -95,7 +98,7 @@ export class ApiResilienceManager {
       this.circuitBreakers[serviceName] = this.circuitBreakerFactory.create({
         name: serviceName,
         failureThreshold: config.failureThreshold || 5,
-        resetTimeout: config.resetTimeoutMs || 30000,
+        resetTimeout: config.resetTimeoutMs || this.DEFAULT_RESET_TIMEOUT_MS, // Using increased default
         maxRetries: config.maxRetries || 3,
         timeout: 10000, // Default timeout in milliseconds
       });
@@ -192,7 +195,7 @@ export class ApiResilienceManager {
     return {
       name: serviceName,
       failureThreshold: 5,
-      resetTimeoutMs: 30000,
+      resetTimeoutMs: this.DEFAULT_RESET_TIMEOUT_MS, // Using increased default
       maxRetries: 3,
       baseDelayMs: 100,
       maxDelayMs: 5000,

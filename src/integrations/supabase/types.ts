@@ -661,6 +661,16 @@ export type Database = {
         Args: { worker_name: string }
         Returns: Json
       }
+      move_to_dead_letter_queue: {
+        Args: {
+          source_queue: string
+          dlq_name: string
+          message_id: string
+          failure_reason: string
+          metadata?: Json
+        }
+        Returns: boolean
+      }
       pg_advisory_lock_exists: {
         Args: { p_key: string }
         Returns: boolean
@@ -744,6 +754,14 @@ export type Database = {
         }
         Returns: Json
       }
+      purge_dlq_messages: {
+        Args: {
+          dlq_name: string
+          older_than_days?: number
+          max_messages?: number
+        }
+        Returns: number
+      }
       purge_old_monitoring_events: {
         Args: { retention_days?: number }
         Returns: number
@@ -781,6 +799,10 @@ export type Database = {
       }
       release_processing_lock: {
         Args: { p_entity_type: string; p_entity_id: string }
+        Returns: boolean
+      }
+      reprocess_from_dlq: {
+        Args: { dlq_name: string; message_id: string; override_body?: Json }
         Returns: boolean
       }
       reset_entity_processing_state: {

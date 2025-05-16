@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -348,7 +347,7 @@ async function processAlbumDiscovery() {
       batchSize: 5,           // 5 messages per batch
       processorName: 'album-discovery',
       timeoutSeconds: 60,     // Timeout per message
-      visibilityTimeoutSeconds: 300, // 5 minute visibility timeout
+      visibilityTimeoutSeconds: 900, // Increased to 15 minutes per fix #8
       logDetailedMetrics: true,
       deadLetterQueue: DLQ_CONFIG.queueName,  // Enable DLQ for poison messages
       maxRetries: DLQ_CONFIG.maxRetries       // Number of retries before sending to DLQ

@@ -11,6 +11,7 @@ export class QueueHelper {
   private supabase: SupabaseClient;
   private deduplicationService: DeduplicationService;
   private queueManager: PgQueueManager;
+  private redis?: Redis;
   
   constructor(supabase?: SupabaseClient, redis?: Redis) {
     if (supabase) {
@@ -21,6 +22,8 @@ export class QueueHelper {
         Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
       );
     }
+    
+    this.redis = redis;
     
     if (redis) {
       this.deduplicationService = getDeduplicationService(redis);
@@ -52,8 +55,23 @@ export class QueueHelper {
     const key = dedupKey || generatedKey;
     
     try {
-      // Check for duplicates if deduplication service is available
-      if (this.deduplicationService) {
+      // Fast-path deduplication check using atomic Redis SETNX+EX if Redis is available
+      if (this.redis) {
+        // Use single Redis call for both check and setting with TTL
+        // nx: true means only set if key doesn't exist (deduplication)
+        // ex: 3600 sets expiry to 1 hour
+        const result = await this.redis.set(`dedup:${queueName}:${key}`, entityId || '1', { 
+          nx: true, 
+          ex: 3600 
+        });
+        
+        // If result is not "OK", key already exists (duplicate message)
+        if (result !== "OK") {
+          console.log(`Skipping enqueue for duplicate message with key ${key} in queue ${queueName}`);
+          return false;
+        }
+      } else if (this.deduplicationService) {
+        // Fall back to old method if no direct Redis access
         const isDuplicate = await this.deduplicationService.isDuplicate(
           queueName, 
           key, 
@@ -140,17 +158,14 @@ export class QueueHelper {
         messageId = await this.queueManager.sendMessage(queueName, messageToSend);
       }
       
-      // If message was enqueued successfully, mark as processed in deduplication service
-      if (messageId && this.deduplicationService) {
+      // For backward compatibility - ensure state is recorded in deduplication service too
+      if (messageId && this.deduplicationService && !this.redis) {
         await this.deduplicationService.markAsProcessed(
           queueName, 
           key, 
           3600, // 1 hour TTL for enqueued flags
           { entityId: entityId }
         );
-        
-        console.log(`Successfully enqueued message in ${queueName} with ID ${messageId}, dedupKey: ${key}`);
-        return true;
       }
       
       if (!messageId) {
@@ -158,6 +173,7 @@ export class QueueHelper {
         return false;
       }
       
+      console.log(`Successfully enqueued message in ${queueName} with ID ${messageId}, dedupKey: ${key}`);
       return true;
     } catch (error) {
       console.error(`Error enqueueing message to ${queueName}:`, error);

@@ -1,3 +1,4 @@
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
@@ -53,7 +54,7 @@ export function createEnhancedWorker<T extends {}>(queueName: string, supabase: 
         maxRuntimeMs = 120000, // 2 minutes by default
         processorName = 'default-processor',
         timeoutSeconds = 30,
-        visibilityTimeoutSeconds = 60,
+        visibilityTimeoutSeconds = 900, // Increased to 15 minutes as per fix #8
         logDetailedMetrics = false,
         deadLetterQueue, // new option
         maxRetries = 3  // new option with default
