@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -31,11 +32,9 @@ const corsHeaders = {
 };
 
 // Define the artist worker implementation
-class ArtistDiscoveryWorker extends createEnhancedWorker<any> {
-  constructor() {
-    super('artist_discovery', supabase, redis);
-  }
-  
+const EnhancedWorker = createEnhancedWorker('artist_discovery', supabase, redis);
+
+class ArtistDiscoveryWorker extends EnhancedWorker {
   async processMessage(message: any): Promise<any> {
     console.log("Processing artist discovery message:", message);
     
@@ -169,9 +168,8 @@ async function processArtistDiscovery() {
     const worker = new ArtistDiscoveryWorker();
     
     // Process multiple batches within the time limit
-    const result = await worker.drainQueue({
+    const result = await worker.processBatch({
       maxBatches: 10,         // Process up to 10 batches in one invocation
-      maxRuntimeMs: 240000,   // 4 minute runtime limit (below 5-min cron)
       batchSize: 5,           // 5 messages per batch
       processorName: 'artist-discovery',
       timeoutSeconds: 60,     // Timeout per message
@@ -182,9 +180,9 @@ async function processArtistDiscovery() {
     return {
       processed: result.processed,
       errors: result.errors,
-      duplicates: result.duplicates,
-      skipped: result.skipped,
-      processingTimeMs: result.processingTimeMs,
+      duplicates: result.duplicates || 0,
+      skipped: result.skipped || 0,
+      processingTimeMs: result.processingTimeMs || 0,
       success: result.errors === 0
     };
   } catch (batchError) {
