@@ -28,7 +28,8 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
     this.metrics = new MetricsCollector(this.supabase, {
       bufferSize: 10,
       autoFlushIntervalMs: 60000, // Flush metrics every minute
-      logger: this.logger
+      logger: this.logger,
+      fallbackLogEnabled: true
     });
   }
   
@@ -38,7 +39,10 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
   async processBatch(options: ProcessOptions): Promise<{ 
     processed: number, 
     errors: number, 
-    messages: any[] 
+    messages: any[],
+    duplicates?: number,
+    skipped?: number,
+    processingTimeMs?: number
   }> {
     const startTime = Date.now();
     const batchId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
@@ -60,6 +64,8 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
         batchId,
         processed: result.processed,
         errors: result.errors,
+        duplicates: result.duplicates || 0,
+        skipped: result.skipped || 0,
         duration,
         queue: this.queue
       });
@@ -74,16 +80,28 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
       );
       
       // Capture queue metrics in database
-      await this.recordQueueMetrics({
-        batchId,
-        operation: options.processorName || 'processBatch',
-        batchSize: options.batchSize || 5,
-        successCount: result.processed,
-        errorCount: result.errors,
-        processingTimeMs: duration
-      });
+      try {
+        await this.recordQueueMetrics({
+          batchId,
+          operation: options.processorName || 'processBatch',
+          batchSize: options.batchSize || 5,
+          successCount: result.processed,
+          errorCount: result.errors,
+          processingTimeMs: duration
+        }).catch(err => {
+          this.logger.warn("Failed to record queue metrics", { error: err.message });
+        });
+      } catch (error) {
+        this.logger.warn("Error recording queue metrics", { error: error?.message });
+      }
       
-      return result;
+      // Add processing time and any missing fields to result
+      return {
+        ...result,
+        duplicates: result.duplicates || 0,
+        skipped: result.skipped || 0, 
+        processingTimeMs: duration
+      };
     } catch (error) {
       const duration = Date.now() - startTime;
       
@@ -95,20 +113,24 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
       });
       
       // Record incident if serious error
-      await this.recordWorkerIssue(
-        'batch_processing_failed',
-        'error',
-        `Batch processing failed: ${error.message}`,
-        {
-          error: {
-            message: error.message,
-            stack: error.stack
-          },
-          batchId,
-          queue: this.queue,
-          duration
-        }
-      );
+      try {
+        await this.recordWorkerIssue(
+          'batch_processing_failed',
+          'error',
+          `Batch processing failed: ${error.message}`,
+          {
+            error: {
+              message: error.message,
+              stack: error.stack
+            },
+            batchId,
+            queue: this.queue,
+            duration
+          }
+        ).catch(() => {/* ignore recording error */});
+      } catch (issueError) {
+        this.logger.warn("Failed to record worker issue", { error: issueError?.message });
+      }
       
       // Make sure to flush metrics despite error
       await this.metrics.flush().catch(() => {/* ignore flush error */});
@@ -122,17 +144,19 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
    * Override the processMessage to add logging and metrics
    */
   async processMessage(message: T): Promise<any> {
-    const messageId = typeof message === 'object' && message ? 
-      (message as any).id || 
-      (message as any)._id || 
-      `msg_${Math.random().toString(36).substring(2, 9)}` : 
-      `msg_${Math.random().toString(36).substring(2, 9)}`;
+    // Generate a message ID if none exists
+    const messageId = this.getMessageId(message);
     
     // Create message-specific logger
     const msgLogger = this.logger.withContext({
       messageId,
       queue: this.queue
     });
+    
+    // Skip invalid messages without required fields
+    if (!this.validateMessage(message, msgLogger)) {
+      return { skipped: true, reason: "invalid_message" };
+    }
     
     msgLogger.info(`Processing message from ${this.queue}`, {
       messageType: typeof message,
@@ -174,6 +198,46 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
   }
   
   /**
+   * Validate that a message has the required fields
+   */
+  protected validateMessage(message: T, logger: StructuredLogger): boolean {
+    // Check message is an object
+    if (!message || typeof message !== 'object') {
+      logger.error("Skipping invalid message: not an object");
+      return false;
+    }
+    
+    // Check if message has an ID for tracking
+    const messageId = this.getMessageId(message);
+    if (!messageId) {
+      logger.error("Skipping invalid message without ID");
+      return false;
+    }
+    
+    return true;
+  }
+  
+  /**
+   * Get a message ID from various possible sources
+   */
+  protected getMessageId(message: any): string {
+    if (!message) return `unknown_${Date.now()}`;
+    
+    // Try various common ID fields
+    if (typeof message === 'object') {
+      return message.id || 
+             message._id || 
+             message.messageId || 
+             message.msg_id || 
+             message.message_id || 
+             `generated_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    }
+    
+    // Fallback to a generated ID
+    return `fallback_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  }
+  
+  /**
    * Abstract method that subclasses must implement to process a message
    */
   abstract handleMessage(message: T, logger: StructuredLogger): Promise<any>;
@@ -190,6 +254,21 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
     processingTimeMs: number;
   }): Promise<void> {
     try {
+      // First, make sure the table exists
+      await this.supabase.rpc('raw_sql_query', {
+        sql_query: `CREATE TABLE IF NOT EXISTS queue_metrics (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          queue_name TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          batch_size INTEGER,
+          success_count INTEGER,
+          error_count INTEGER,
+          processing_time_ms INTEGER,
+          metadata JSONB DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ DEFAULT now()
+        )`
+      });
+      
       await this.supabase.from('queue_metrics').insert({
         queue_name: this.queue,
         operation: data.operation,
@@ -202,6 +281,7 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
     } catch (error) {
       // Log error but don't fail the processing
       this.logger.error("Failed to record queue metrics", error);
+      throw error; // Let caller handle further
     }
   }
   
@@ -215,7 +295,24 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
     details: any = {}
   ): Promise<void> {
     try {
-      await this.supabase.from('monitoring.worker_issues').insert({
+      // First, ensure the table exists
+      await this.supabase.rpc('raw_sql_query', {
+        sql_query: `
+          CREATE TABLE IF NOT EXISTS worker_issues (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            worker_name TEXT NOT NULL, 
+            issue_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details JSONB,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now(),
+            resolved BOOLEAN DEFAULT FALSE
+          )
+        `
+      });
+      
+      await this.supabase.from('worker_issues').insert({
         worker_name: this.workerName,
         issue_type: issueType,
         severity,
@@ -225,6 +322,7 @@ export abstract class EnhancedWorkerBase<T = any> extends EnhancedIdempotentWork
     } catch (error) {
       // Log error but don't fail the processing
       this.logger.error("Failed to record worker issue", error);
+      throw error; // Let caller handle further
     }
   }
 }

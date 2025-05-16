@@ -1,3 +1,4 @@
+
 /**
  * Metrics Collector for storing pipeline performance metrics
  * Aggregates metrics and persists them to Postgres for analysis
@@ -19,15 +20,20 @@ export class MetricsCollector {
   private flushInterval: number | null = null;
   private lastFlushTime: number = Date.now();
   private flushInProgress: boolean = false;
+  private fallbackLogEnabled: boolean = true;
+  private consecutiveErrors: number = 0;
+  private maxConsecutiveErrors: number = 3;
   
   constructor(supabase: any, options: { 
     bufferSize?: number, 
     autoFlushIntervalMs?: number,
-    logger?: StructuredLogger 
+    logger?: StructuredLogger,
+    fallbackLogEnabled?: boolean
   } = {}) {
     this.supabase = supabase;
     this.logger = options.logger || new StructuredLogger({ service: 'metrics-collector' });
     this.bufferSize = options.bufferSize || 10;
+    this.fallbackLogEnabled = options.fallbackLogEnabled !== false;
     
     // Set up auto-flush if interval is provided
     if (options.autoFlushIntervalMs) {
@@ -151,6 +157,9 @@ export class MetricsCollector {
       
       if (this.supabase) {
         try {
+          // First, make sure the table exists
+          await this.ensurePipelineMetricsTable();
+          
           // Insert metrics into database
           const { error } = await this.supabase
             .from('pipeline_metrics')
@@ -160,12 +169,16 @@ export class MetricsCollector {
             // Instead of putting metrics back in buffer, we'll just log the error
             // This prevents repeated failure loops
             this.logger.warn("Failed to persist metrics", { error: error.message });
+            this.consecutiveErrors++;
             
             // As a fallback, we'll persist metrics to Redis if available
             await this.persistToFallback(metricsToFlush);
             
             return false;
           }
+          
+          // Reset error counter on success
+          this.consecutiveErrors = 0;
         } catch (error) {
           // Handle case where supabase client is invalid or table doesn't exist
           this.logger.warn("Error persisting metrics to database", { 
@@ -173,6 +186,7 @@ export class MetricsCollector {
             retryCount: metricsToFlush.length 
           });
           
+          this.consecutiveErrors++;
           await this.persistToFallback(metricsToFlush);
           
           return false;
@@ -188,10 +202,51 @@ export class MetricsCollector {
       return true;
     } catch (error) {
       this.logger.warn("Exception persisting metrics", { error: error.message });
+      this.consecutiveErrors++;
       await this.persistToFallback(metricsToFlush);
       return false;
     } finally {
       this.flushInProgress = false;
+    }
+  }
+  
+  /**
+   * Ensure the pipeline_metrics table exists
+   */
+  private async ensurePipelineMetricsTable(): Promise<void> {
+    if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+      // If we've failed too many times in a row, don't try to create the table
+      // This prevents spamming the database with failed requests
+      return;
+    }
+    
+    try {
+      // Check if the monitoring schema exists
+      await this.supabase.rpc('raw_sql_query', {
+        sql_query: `CREATE SCHEMA IF NOT EXISTS monitoring;`
+      });
+      
+      // Try to create the table if it doesn't exist
+      await this.supabase.rpc('raw_sql_query', {
+        sql_query: `
+          CREATE TABLE IF NOT EXISTS monitoring.pipeline_metrics (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            metric_name TEXT NOT NULL,
+            metric_value DOUBLE PRECISION NOT NULL,
+            tags JSONB DEFAULT '{}'::jsonb,
+            timestamp TIMESTAMPTZ DEFAULT now(),
+            created_at TIMESTAMPTZ DEFAULT now()
+          );
+          
+          CREATE INDEX IF NOT EXISTS idx_pipeline_metrics_name 
+            ON monitoring.pipeline_metrics(metric_name);
+          CREATE INDEX IF NOT EXISTS idx_pipeline_metrics_timestamp 
+            ON monitoring.pipeline_metrics(timestamp);
+        `
+      });
+    } catch (error) {
+      this.logger.warn("Error ensuring pipeline_metrics table", { error: error.message });
+      // Continue - we'll try to insert anyway
     }
   }
   
@@ -201,6 +256,10 @@ export class MetricsCollector {
    */
   private async persistToFallback(metrics: MetricPoint[]): Promise<void> {
     try {
+      if (!this.fallbackLogEnabled && this.consecutiveErrors < this.maxConsecutiveErrors) {
+        return; // Skip fallback logging if disabled and we haven't failed too many times
+      }
+      
       // Log metrics to console as a fallback
       const summary = {
         count: metrics.length,

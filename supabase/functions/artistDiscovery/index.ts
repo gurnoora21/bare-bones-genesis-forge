@@ -4,6 +4,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { getSpotifyClient } from "../_shared/spotifyClient.ts";
 import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
+import { StructuredLogger } from "../_shared/structuredLogger.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -26,35 +27,51 @@ const corsHeaders = {
 const EnhancedWorker = createEnhancedWorker('artist_discovery', supabase, redis);
 
 class ArtistDiscoveryWorker extends EnhancedWorker {
-  async processMessage(message: any): Promise<any> {
-    console.log("Processing artist discovery message:", message);
+  /**
+   * Validate message before processing
+   */
+  protected validateMessage(message: any, logger: StructuredLogger): boolean {
+    // First run the base validation
+    if (!super.validateMessage(message, logger)) {
+      return false;
+    }
+    
+    // Check for artistName field
+    if (!message.artistName) {
+      logger.error("Message missing artistName", { message });
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * Process an artist discovery message
+   */
+  async handleMessage(message: any, logger: StructuredLogger): Promise<any> {
+    logger.info("Processing artist discovery message", { artistName: message.artistName });
     
     // Extract artist name
     const artistName = message.artistName;
     
-    if (!artistName) {
-      throw new Error("Message missing artistName");
-    }
-    
-    // Get Spotify client
-    const spotifyClient = getSpotifyClient();
-    
     // Generate deduplication key
     const dedupKey = `artist_discovery:artist:name:${artistName.toLowerCase()}`;
     
-    // Lookup artist on Spotify using the correct function name
-    const searchResponse = await spotifyClient.getArtistByName(artistName);
-    
-    if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items || searchResponse.artists.items.length === 0) {
-      console.log(`No results found for artist "${artistName}"`);
-      return { status: 'completed', result: 'no_results' };
-    }
-    
-    // Get the first result
-    const artist = searchResponse.artists.items[0];
-    
-    // Process artist details
     try {
+      // Get Spotify client
+      const spotifyClient = getSpotifyClient();
+      
+      // Lookup artist on Spotify
+      const searchResponse = await spotifyClient.getArtistByName(artistName);
+      
+      if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items || searchResponse.artists.items.length === 0) {
+        logger.info(`No results found for artist "${artistName}"`);
+        return { status: 'completed', result: 'no_results' };
+      }
+      
+      // Get the first result
+      const artist = searchResponse.artists.items[0];
+      
       // Check if artist already exists in database
       const { data: existingArtist } = await supabase
         .from('artists')
@@ -65,7 +82,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
       let artistId;
       
       if (existingArtist) {
-        console.log(`Artist ${artist.name} already exists, updating`);
+        logger.info(`Artist ${artist.name} already exists, updating`);
         artistId = existingArtist.id;
         
         // Update the artist
@@ -83,7 +100,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
           })
           .eq('id', artistId);
       } else {
-        console.log(`Creating new artist: ${artist.name}`);
+        logger.info(`Creating new artist: ${artist.name}`);
         
         // Insert the artist
         const { data: newArtist, error: insertError } = await supabase
@@ -103,7 +120,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
           .single();
           
         if (insertError) {
-          console.error(`Error inserting artist ${artist.name}:`, insertError);
+          logger.error(`Error inserting artist ${artist.name}:`, insertError);
           throw insertError;
         }
         
@@ -111,7 +128,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
       }
       
       // Enqueue album discovery for this artist
-      console.log(`Enqueueing album discovery for artist ${artist.name} (${artistId})`);
+      logger.info(`Enqueueing album discovery for artist ${artist.name} (${artistId})`);
       
       const queueResult = await supabase.functions.invoke('sendToQueue', {
         body: {
@@ -126,7 +143,8 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
       });
       
       if (queueResult.error) {
-        console.error(`Failed to enqueue album discovery:`, queueResult.error);
+        logger.error(`Failed to enqueue album discovery:`, queueResult.error);
+        // Continue anyway, at least the artist was stored
       }
       
       return {
@@ -135,9 +153,8 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
         spotifyArtistId: artist.id,
         name: artist.name
       };
-      
     } catch (error) {
-      console.error(`Error processing artist ${artist.name}:`, error);
+      logger.error(`Error processing artist ${artistName}:`, error);
       throw error; // Re-throw for retry logic
     }
   }
@@ -145,7 +162,8 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
 
 // Process a batch of artist discovery messages
 async function processArtistDiscovery() {
-  console.log("Starting artist discovery batch processing");
+  const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  console.log(`[${executionId}] Starting artist discovery batch processing`);
   
   try {
     const worker = new ArtistDiscoveryWorker();
@@ -163,6 +181,8 @@ async function processArtistDiscovery() {
       deadLetterQueue: 'artist_discovery_dlq'
     });
     
+    console.log(`[${executionId}] Total messages processed: ${result.processed}, errors: ${result.errors}, duplicates: ${result.duplicates || 0}, skipped: ${result.skipped || 0}`);
+    
     return {
       processed: result.processed,
       errors: result.errors,
@@ -172,7 +192,7 @@ async function processArtistDiscovery() {
       success: result.errors === 0
     };
   } catch (batchError) {
-    console.error("Fatal error in artist discovery batch:", batchError);
+    console.error(`[${executionId}] Fatal error in artist discovery batch:`, batchError);
     return { 
       error: batchError.message,
       success: false
