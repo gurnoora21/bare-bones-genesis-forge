@@ -7,7 +7,7 @@ interface QueueMessage {
   message: any;
 }
 
-interface DrainQueueResult {
+interface BatchResult {
   processed: number;
   errors: number;
   duplicates: number;
@@ -17,7 +17,7 @@ interface DrainQueueResult {
   dlqErrors: number;
 }
 
-interface DrainQueueOptions {
+interface ProcessBatchOptions {
   maxBatches?: number;
   batchSize?: number;
   maxRuntimeMs?: number;
@@ -29,25 +29,21 @@ interface DrainQueueOptions {
   maxRetries?: number;
 }
 
-interface EnhancedQueueWorker {
-  new(queueName: string, supabase: any, redis: any): {
-    drainQueue(options: DrainQueueOptions): Promise<DrainQueueResult>;
-  };
-}
-
-export function createEnhancedWorker<T extends {}>(queueName: string, supabase: any, redis: any) {
+export function createEnhancedWorker(queueName: string, supabase: any, redis: any) {
   return class EnhancedQueueWorker {
-    private queueName: string;
+    protected queueName: string;
     protected supabase: any;
     protected redis: any;
+    protected workerId: string;
 
-    constructor(queueName: string, supabase: any, redis: any) {
+    constructor() {
       this.queueName = queueName;
       this.supabase = supabase;
       this.redis = redis;
+      this.workerId = `worker_${queueName}_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
     }
 
-    async drainQueue(options: DrainQueueOptions): Promise<DrainQueueResult> {
+    async processBatch(options: ProcessBatchOptions): Promise<BatchResult> {
       const {
         maxBatches = 5,
         batchSize = 10,
@@ -199,7 +195,7 @@ export function createEnhancedWorker<T extends {}>(queueName: string, supabase: 
     }
 
     // Abstract method to be implemented by subclasses
-    async processMessage(message: T): Promise<any> {
+    async processMessage(message: any): Promise<any> {
       throw new Error("Method not implemented.");
     }
 
