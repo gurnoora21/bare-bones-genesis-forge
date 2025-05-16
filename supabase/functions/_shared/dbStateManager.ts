@@ -1,442 +1,351 @@
-
 /**
  * Database State Manager
- * Implements the database side of our state management approach
+ * Implements the database side of state management
  */
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { ProcessingState, LockOptions, StateTransitionResult } from "./stateManager.ts";
+import { ProcessingState, StateTransitionResult, LockOptions, StateCheckOptions } from "./stateManager.ts";
 
 export class DbStateManager {
   private supabase: any;
-  private circuitBreakerState = {
-    failures: 0,
-    lastFailure: 0,
-    isOpen: false
-  };
   
-  constructor(supabaseClient?: any) {
-    // Initialize Supabase client if not provided
-    if (supabaseClient) {
-      this.supabase = supabaseClient;
-    } else {
-      this.supabase = createClient(
-        Deno.env.get("SUPABASE_URL") || "",
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || ""
-      );
-    }
+  constructor(supabaseClient: any) {
+    this.supabase = supabaseClient;
   }
-  
+
   /**
-   * Attempts to acquire a processing lock in database
-   * This updates the processing_status table but not the actual advisory lock
-   * Used for visibility and tracking purposes
+   * Acquires a processing lock in the database
    */
   async acquireProcessingLock(
     entityType: string,
     entityId: string,
     options: LockOptions = {}
   ): Promise<boolean> {
-    const {
-      timeoutMinutes = 30,
-      allowRetry = true,
-      correlationId = `lock_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
-      retries = 1
-    } = options;
+    const { allowRetry = true } = options;
     
-    // Check if circuit breaker is open
-    if (this.isCircuitOpen()) {
-      console.warn(`[${correlationId}] Database circuit breaker open, skipping lock acquisition`);
-      return false;
-    }
+    let attempts = 0;
+    const maxRetries = allowRetry ? 3 : 1;
     
-    let attemptCount = 0;
-    
-    while (attemptCount <= retries) {
+    while (attempts < maxRetries) {
+      attempts++;
+      
       try {
-        // Try to update processing status
-        const { data, error } = await this.supabase.rpc(
-          'acquire_processing_lock',
-          {
-            p_entity_type: entityType,
-            p_entity_id: entityId,
-            p_timeout_minutes: timeoutMinutes,
-            p_correlation_id: correlationId
-          }
-        );
+        const { data, error } = await this.supabase.rpc('acquire_processing_lock', {
+          p_entity_type: entityType,
+          p_entity_id: entityId
+        });
         
-        if (error) {
-          console.error(`[${correlationId}] Database lock error: ${error.message}`);
-          this.incrementCircuitFailure();
+        if (!error && data === true) {
+          return true; // Lock acquired successfully
+        } else {
+          console.warn(`Attempt ${attempts}: Failed to acquire lock for ${entityType}:${entityId}: ${error?.message || 'Unknown error'}`);
           
-          // Try again if retries are allowed
-          if (allowRetry && attemptCount < retries) {
-            attemptCount++;
-            await new Promise(resolve => setTimeout(resolve, 500 * attemptCount));
-            continue;
+          // If retry is allowed, wait before retrying
+          if (allowRetry && attempts < maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, 200 * attempts));
           }
-          
-          return false;
         }
+      } catch (err) {
+        console.error(`Attempt ${attempts}: Error acquiring lock for ${entityType}:${entityId}: ${err.message}`);
         
-        // Reset circuit breaker on success
-        this.resetCircuitBreaker();
-        
-        // Return lock acquisition result
-        return data === true;
-      } catch (error) {
-        console.error(`[${correlationId}] Exception acquiring db lock: ${error.message}`);
-        this.incrementCircuitFailure();
-        
-        // Try again if retries are allowed
-        if (allowRetry && attemptCount < retries) {
-          attemptCount++;
-          await new Promise(resolve => setTimeout(resolve, 500 * attemptCount));
-          continue;
+        // If retry is allowed, wait before retrying
+        if (allowRetry && attempts < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, 200 * attempts));
         }
-        
-        return false;
       }
     }
     
-    return false;
+    return false; // Failed to acquire lock after all attempts
   }
-
+  
   /**
-   * Get entity state from database
+   * Updates a lock's heartbeat timestamp
+   * Used to keep track of active locks
    */
-  async getEntityState(entityType: string, entityId: string): Promise<ProcessingState | null> {
+  async updateHeartbeat(
+    entityType: string,
+    entityId: string
+  ): Promise<boolean> {
     try {
-      const { data, error } = await this.supabase
-        .from('processing_status')
-        .select('state')
-        .eq('entity_type', entityType)
-        .eq('entity_id', entityId)
-        .maybeSingle();
+      // Call RPC to update the lock's heartbeat
+      const { data, error } = await this.supabase.rpc('update_lock_heartbeat', {
+        p_entity_type: entityType,
+        p_entity_id: entityId,
+        p_heartbeat_time: new Date().toISOString()
+      });
       
       if (error) {
-        console.error(`Error getting entity state: ${error.message}`);
-        return null;
+        console.warn(`Failed to update heartbeat for ${entityType}:${entityId}: ${error.message}`);
+        return false;
       }
       
-      return data && data.state ? data.state as ProcessingState : null;
-    } catch (error) {
-      console.error(`Failed to get entity state: ${error.message}`);
-      return null;
+      return true;
+    } catch (err) {
+      console.error(`Error updating lock heartbeat: ${err.message}`);
+      return false;
     }
   }
   
   /**
-   * Updates entity state in database
+   * Check if a lock is stale based on its last heartbeat
+   */
+  async isLockStale(
+    entityType: string,
+    entityId: string,
+    staleCutoffMinutes: number
+  ): Promise<boolean> {
+    try {
+      // Call RPC to check if lock is stale
+      const { data, error } = await this.supabase.rpc('is_lock_stale', {
+        p_entity_type: entityType,
+        p_entity_id: entityId,
+        p_cutoff_minutes: staleCutoffMinutes
+      });
+      
+      if (error) {
+        console.warn(`Failed to check stale lock for ${entityType}:${entityId}: ${error.message}`);
+        return false;
+      }
+      
+      return data === true;
+    } catch (err) {
+      console.error(`Error checking stale lock: ${err.message}`);
+      return false;
+    }
+  }
+  
+  /**
+   * Find all stale locks in the system
+   */
+  async findStaleLocks(staleCutoffMinutes: number = 30): Promise<{ data?: any[], error?: any }> {
+    try {
+      return await this.supabase.rpc('find_stale_locks', {
+        p_cutoff_minutes: staleCutoffMinutes
+      });
+    } catch (err) {
+      return { error: err };
+    }
+  }
+  
+  /**
+   * Force release a lock without checking ownership
+   * Used for stale lock cleanup
+   */
+  async forceReleaseLock(
+    entityType: string,
+    entityId: string
+  ): Promise<boolean> {
+    try {
+      const { data, error } = await this.supabase.rpc('force_release_lock', {
+        p_entity_type: entityType,
+        p_entity_id: entityId
+      });
+      
+      if (error) {
+        console.error(`Failed to force release lock for ${entityType}:${entityId}: ${error.message}`);
+        return false;
+      }
+      
+      return true;
+    } catch (err) {
+      console.error(`Error forcing lock release: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Updates the state of an entity in the database
    */
   async updateEntityState(
     entityType: string,
     entityId: string,
-    state: ProcessingState,
+    newState: ProcessingState,
     errorMessage: string | null = null,
     metadata: Record<string, any> = {}
   ): Promise<StateTransitionResult> {
-    // Check if circuit breaker is open
-    if (this.isCircuitOpen()) {
-      return { 
-        success: false, 
-        error: "Database circuit breaker open" 
-      };
-    }
-    
     try {
-      // Add timestamp to metadata
-      const enhancedMetadata = {
-        ...metadata,
-        updated_at: new Date().toISOString()
-      };
-      
-      // Get current state first to return for change tracking
-      const currentState = await this.getEntityState(entityType, entityId);
-      
-      // Update database state
-      const { data, error } = await this.supabase
-        .from('processing_status')
-        .upsert({
+      const { data, error } = await this.supabase.from('processing_status').upsert(
+        {
           entity_type: entityType,
           entity_id: entityId,
-          state: state,
-          last_processed_at: new Date().toISOString(),
-          last_error: errorMessage,
-          metadata: enhancedMetadata,
-          updated_at: new Date().toISOString()
-        }, {
-          onConflict: 'entity_type,entity_id'
-        })
-        .select('state');
+          state: newState,
+          last_updated: new Date().toISOString(),
+          error_message: errorMessage,
+          metadata: metadata
+        },
+        { onConflict: 'entity_type,entity_id', returning: 'minimal' }
+      ).select();
       
       if (error) {
-        console.error(`Error updating entity state: ${error.message}`);
-        this.incrementCircuitFailure();
+        console.error(`Failed to update state for ${entityType}:${entityId} to ${newState}: ${error.message}`);
         return {
           success: false,
-          error: error.message
+          error: error.message,
+          previousState: undefined,
+          newState
         };
       }
       
-      // Reset circuit breaker on success
-      this.resetCircuitBreaker();
-      
       return {
         success: true,
-        previousState: currentState || undefined,
-        newState: state,
-        source: 'database'
+        newState
       };
     } catch (error) {
-      console.error(`Failed to update entity state: ${error.message}`);
-      this.incrementCircuitFailure();
-      
+      console.error(`Error updating state for ${entityType}:${entityId}: ${error.message}`);
       return {
         success: false,
-        error: error.message
+        error: `Error updating state: ${error.message}`,
+        previousState: undefined,
+        newState
       };
     }
   }
   
   /**
-   * Checks if entity is in specific state in database
-   */
-  async isInState(
-    entityType: string,
-    entityId: string,
-    state: ProcessingState
-  ): Promise<boolean> {
-    // Check if circuit breaker is open
-    if (this.isCircuitOpen()) {
-      return false;
-    }
-    
-    try {
-      const { data, error } = await this.supabase
-        .from('processing_status')
-        .select('state')
-        .eq('entity_type', entityType)
-        .eq('entity_id', entityId)
-        .maybeSingle();
-      
-      if (error) {
-        console.error(`Error checking entity state: ${error.message}`);
-        this.incrementCircuitFailure();
-        return false;
-      }
-      
-      // Reset circuit breaker on success
-      this.resetCircuitBreaker();
-      
-      return data && data.state === state;
-    } catch (error) {
-      console.error(`Failed to check entity state: ${error.message}`);
-      this.incrementCircuitFailure();
-      return false;
-    }
-  }
-  
-  /**
-   * Checks if entity is already processed
-   */
-  async isProcessed(
-    entityType: string,
-    entityId: string
-  ): Promise<boolean> {
-    return await this.isInState(entityType, entityId, ProcessingState.COMPLETED);
-  }
-  
-  /**
-   * Marks an entity as completed
-   */
-  async markAsCompleted(
-    entityType: string,
-    entityId: string,
-    metadata: Record<string, any> = {}
-  ): Promise<StateTransitionResult> {
-    return await this.updateEntityState(
-      entityType,
-      entityId,
-      ProcessingState.COMPLETED,
-      null,
-      metadata
-    );
-  }
-  
-  /**
-   * Marks an entity as failed
-   */
-  async markAsFailed(
-    entityType: string,
-    entityId: string,
-    errorMessage: string,
-    metadata: Record<string, any> = {}
-  ): Promise<StateTransitionResult> {
-    return await this.updateEntityState(
-      entityType,
-      entityId,
-      ProcessingState.FAILED,
-      errorMessage,
-      metadata
-    );
-  }
-  
-  /**
-   * Releases a processing lock (updates database state only)
+   * Release a processing lock
    */
   async releaseLock(
     entityType: string,
     entityId: string
   ): Promise<boolean> {
-    // Check if circuit breaker is open
-    if (this.isCircuitOpen()) {
-      return false;
-    }
-    
     try {
-      const { error } = await this.supabase.rpc(
-        'release_processing_lock',
-        {
-          p_entity_type: entityType,
-          p_entity_id: entityId
-        }
-      );
+      const { data, error } = await this.supabase.rpc('release_processing_lock', {
+        p_entity_type: entityType,
+        p_entity_id: entityId
+      });
       
       if (error) {
-        console.error(`Database lock release error: ${error.message}`);
-        this.incrementCircuitFailure();
+        console.error(`Failed to release lock for ${entityType}:${entityId}: ${error.message}`);
         return false;
       }
       
-      // Reset circuit breaker on success
-      this.resetCircuitBreaker();
-      
       return true;
-    } catch (error) {
-      console.error(`Failed to release processing lock: ${error.message}`);
-      this.incrementCircuitFailure();
+    } catch (err) {
+      console.error(`Error releasing lock: ${err.message}`);
       return false;
-    }
-  }
-  
-  /**
-   * Find inconsistent or stale states in the database
-   */
-  async findInconsistentStates(
-    entityType?: string,
-    olderThanMinutes: number = 60
-  ) {
-    // Check if circuit breaker is open
-    if (this.isCircuitOpen()) {
-      return [];
-    }
-    
-    try {
-      const { data, error } = await this.supabase.rpc(
-        'find_inconsistent_states',
-        {
-          p_entity_type: entityType || null,
-          p_older_than_minutes: olderThanMinutes
-        }
-      );
-      
-      if (error) {
-        console.error(`Error finding inconsistent states: ${error.message}`);
-        this.incrementCircuitFailure();
-        return [];
-      }
-      
-      // Reset circuit breaker on success
-      this.resetCircuitBreaker();
-      
-      return data || [];
-    } catch (error) {
-      console.error(`Failed to find inconsistent states: ${error.message}`);
-      this.incrementCircuitFailure();
-      return [];
     }
   }
   
   /**
    * Reset stuck processing states
    */
-  async resetStuckProcessingStates(olderThanMinutes: number = 60) {
-    // Check if circuit breaker is open
-    if (this.isCircuitOpen()) {
-      return { success: false, error: "Database circuit breaker open" };
-    }
-    
+  async resetStuckProcessingStates(
+    olderThanMinutes: number = 30
+  ): Promise<{ data?: any[], error?: any }> {
     try {
-      const { data, error } = await this.supabase
-        .from('processing_status')
-        .update({
-          state: ProcessingState.PENDING,
-          metadata: {
-            auto_reset: {
-              reset_at: new Date().toISOString(),
-              reason: 'Stuck in IN_PROGRESS state'
-            }
-          },
-          updated_at: new Date().toISOString(),
-          last_processed_at: new Date().toISOString()
-        })
-        .eq('state', ProcessingState.IN_PROGRESS)
-        .lt('last_processed_at', new Date(Date.now() - (olderThanMinutes * 60 * 1000)).toISOString())
-        .select();
+      const { data, error } = await this.supabase.rpc('reset_stuck_states', {
+        p_older_than_minutes: olderThanMinutes
+      });
       
       if (error) {
-        console.error(`Error resetting stuck states: ${error.message}`);
-        this.incrementCircuitFailure();
-        return { success: false, error: error.message };
+        console.error(`Failed to reset stuck processing states: ${error.message}`);
+        return { error };
       }
       
-      // Reset circuit breaker on success
-      this.resetCircuitBreaker();
-      
-      return { success: true, data };
-    } catch (error) {
-      console.error(`Failed to reset stuck states: ${error.message}`);
-      this.incrementCircuitFailure();
-      return { success: false, error: error.message };
+      return { data };
+    } catch (err) {
+      console.error(`Error resetting stuck processing states: ${err.message}`);
+      return { error: err };
     }
   }
   
   /**
-   * Circuit breaker implementation
+   * Finds inconsistent states between database and Redis
    */
-  private incrementCircuitFailure(): void {
-    const now = Date.now();
-    
-    // Reset counter if last failure was more than 60 seconds ago
-    if (now - this.circuitBreakerState.lastFailure > 60000) {
-      this.circuitBreakerState.failures = 1;
-    } else {
-      this.circuitBreakerState.failures++;
-    }
-    
-    this.circuitBreakerState.lastFailure = now;
-    
-    // Trip circuit breaker after 5 consecutive failures
-    if (this.circuitBreakerState.failures >= 5 && !this.circuitBreakerState.isOpen) {
-      this.circuitBreakerState.isOpen = true;
+  async findInconsistentStates(
+    entityType?: string,
+    olderThanMinutes: number = 60
+  ): Promise<any[]> {
+    try {
+      const { data, error } = await this.supabase.rpc('find_inconsistent_states', {
+        p_entity_type: entityType,
+        p_older_than_minutes: olderThanMinutes
+      });
       
-      // Auto-reset after 30 seconds
-      setTimeout(() => {
-        console.log("Database circuit breaker auto-reset");
-        this.resetCircuitBreaker();
-      }, 30000);
+      if (error) {
+        console.error(`Failed to find inconsistent states: ${error.message}`);
+        return [];
+      }
       
-      console.warn(`Database circuit breaker tripped. Will auto-reset in 30 seconds`);
+      return data || [];
+    } catch (err) {
+      console.error(`Error finding inconsistent states: ${err.message}`);
+      return [];
     }
   }
   
-  private isCircuitOpen(): boolean {
-    return this.circuitBreakerState.isOpen;
+  /**
+   * Get current state of an entity
+   */
+  async getEntityState(
+    entityType: string,
+    entityId: string
+  ): Promise<ProcessingState | null> {
+    try {
+      const { data, error } = await this.supabase
+        .from('processing_status')
+        .select('state')
+        .eq('entity_type', entityType)
+        .eq('entity_id', entityId)
+        .single();
+      
+      if (error) {
+        // If no row is found, return null
+        if (error.message.includes('No rows found')) {
+          return null;
+        }
+        
+        console.error(`Error getting state for ${entityType}:${entityId}: ${error.message}`);
+        return null;
+      }
+      
+      return data?.state || null;
+    } catch (err) {
+      console.error(`Error getting state for ${entityType}:${entityId}: ${err.message}`);
+      return null;
+    }
   }
   
-  private resetCircuitBreaker(): void {
-    this.circuitBreakerState.failures = 0;
-    this.circuitBreakerState.isOpen = false;
+  /**
+   * Checks if entity is in specific state
+   */
+  async isInState(
+    entityType: string,
+    entityId: string,
+    state: ProcessingState
+  ): Promise<boolean> {
+    try {
+      const { data, error } = await this.supabase
+        .from('processing_status')
+        .select('state')
+        .eq('entity_type', entityType)
+        .eq('entity_id', entityId)
+        .eq('state', state)
+        .single();
+      
+      if (error) {
+        // If no row is found, it's not in the state
+        if (error.message.includes('No rows found')) {
+          return false;
+        }
+        
+        console.error(`Error checking state for ${entityType}:${entityId}: ${error.message}`);
+        return false;
+      }
+      
+      return !!data;
+    } catch (err) {
+      console.error(`Error checking state for ${entityType}:${entityId}: ${err.message}`);
+      return false;
+    }
+  }
+  
+  /**
+   * Checks if entity has been processed
+   */
+  async isProcessed(
+    entityType: string,
+    entityId: string
+  ): Promise<boolean> {
+    return this.isInState(entityType, entityId, ProcessingState.COMPLETED);
   }
 }

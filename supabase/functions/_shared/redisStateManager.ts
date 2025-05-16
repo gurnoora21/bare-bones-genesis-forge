@@ -1,4 +1,3 @@
-
 /**
  * Redis State Manager
  * Implements the Redis side of our dual-system approach
@@ -13,6 +12,10 @@ interface CircuitBreakerConfig {
   resetTimeoutMs: number;
   healthCheckIntervalMs: number;
   maxConsecutiveFailures: number;
+  // New: Track current backoff duration
+  currentBackoffMs: number;
+  maxBackoffMs: number;
+  initialBackoffMs: number;
 }
 
 export class RedisStateManager {
@@ -26,12 +29,16 @@ export class RedisStateManager {
     lastHealthCheck: 0,
     healthChecksPassed: 0
   };
-  // Default circuit breaker configuration
+  // Default circuit breaker configuration with exponential backoff
   private circuitBreakerConfig: CircuitBreakerConfig = {
     failureThreshold: 5,
     resetTimeoutMs: 30000,
     healthCheckIntervalMs: 5000,
-    maxConsecutiveFailures: 3
+    maxConsecutiveFailures: 3,
+    // New: Initial 60s timeout, max 15min timeout
+    initialBackoffMs: 60000,
+    currentBackoffMs: 60000,
+    maxBackoffMs: 900000 // 15 minutes
   };
   // Map to track active heartbeat intervals
   private activeHeartbeats = new Map<string, number>();
@@ -48,6 +55,13 @@ export class RedisStateManager {
     
     // Auto-check health periodically
     this.setupPeriodicHealthCheck();
+  }
+  
+  /**
+   * Access to Redis instance
+   */
+  get redisClient(): Redis {
+    return this.redis;
   }
   
   /**
@@ -185,6 +199,93 @@ export class RedisStateManager {
     } catch (error) {
       console.error(`Error acquiring Redis lock: ${error.message}`);
       this.incrementCircuitFailure();
+      return false;
+    }
+  }
+  
+  /**
+   * Extend the TTL of an existing lock
+   * Used for heartbeat functionality
+   */
+  async extendLock(
+    entityType: string,
+    entityId: string,
+    ttlSeconds: number = 60
+  ): Promise<boolean> {
+    // Check if circuit breaker is open
+    if (this.isCircuitOpen()) {
+      return false;
+    }
+    
+    try {
+      const lockKey = `lock:${entityType}:${entityId}`;
+      const heartbeatKey = `heartbeat:${entityType}:${entityId}`;
+      
+      // Check if the lock exists first
+      const exists = await this.redis.exists(lockKey);
+      if (exists !== 1) {
+        return false;
+      }
+      
+      // Extend the TTL of the existing lock
+      const extended = await this.redis.expire(lockKey, ttlSeconds);
+      
+      // Also extend the heartbeat key if it exists
+      await this.redis.expire(heartbeatKey, ttlSeconds);
+      
+      // Update the lastHeartbeat timestamp in the lock data
+      try {
+        const lockData = await this.redis.get(lockKey);
+        if (lockData) {
+          const parsedData = JSON.parse(lockData as string);
+          parsedData.lastHeartbeat = new Date().toISOString();
+          await this.redis.set(lockKey, JSON.stringify(parsedData), { xx: true, ex: ttlSeconds });
+        }
+      } catch (parseErr) {
+        console.warn(`Failed to update lock heartbeat timestamp: ${parseErr.message}`);
+      }
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
+      return extended === 1;
+    } catch (error) {
+      console.error(`Error extending Redis lock TTL: ${error.message}`);
+      this.incrementCircuitFailure();
+      return false;
+    }
+  }
+  
+  /**
+   * Force release a lock that might be stale
+   * Used by cleanup procedures
+   */
+  async forceReleaseLock(
+    entityType: string,
+    entityId: string
+  ): Promise<boolean> {
+    try {
+      const lockKey = `lock:${entityType}:${entityId}`;
+      const heartbeatKey = `heartbeat:${entityType}:${entityId}`;
+      
+      // Delete the lock keys
+      await this.redis.del(lockKey);
+      await this.redis.del(heartbeatKey);
+      
+      // Also update the state to indicate no longer in progress
+      const stateKey = `state:${entityType}:${entityId}`;
+      await this.redis.set(stateKey, JSON.stringify({
+        state: ProcessingState.PENDING,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          forceReleased: true,
+          releasedAt: new Date().toISOString()
+        }
+      }), { ex: getEnvironmentTTL() });
+      
+      return true;
+    } catch (error) {
+      console.error(`Error force releasing Redis lock: ${error.message}`);
       return false;
     }
   }
@@ -469,7 +570,7 @@ export class RedisStateManager {
   }
   
   /**
-   * Enhanced circuit breaker implementation with health check probes
+   * Enhanced circuit breaker implementation with exponential backoff
    */
   private incrementCircuitFailure(): void {
     const now = Date.now();
@@ -494,16 +595,46 @@ export class RedisStateManager {
     if (shouldTrip && !this.circuitBreakerState.isOpen) {
       this.circuitBreakerState.isOpen = true;
       
+      // Calculate backoff timeout (doubles each time the circuit trips again recently)
+      if (now - this.circuitBreakerState.lastFailure < config.resetTimeoutMs * 5) {
+        // Double the backoff if we're retripping quickly
+        config.currentBackoffMs = Math.min(
+          config.maxBackoffMs,
+          config.currentBackoffMs * 2
+        );
+      } else {
+        // Reset to initial backoff if it's been a while since last trip
+        config.currentBackoffMs = config.initialBackoffMs;
+      }
+      
+      // Log circuit breaker state change with timeout
+      console.warn(
+        `Redis circuit breaker OPEN at ${new Date().toISOString()} ` +
+        `for ${config.currentBackoffMs / 1000}s after ` +
+        `${this.circuitBreakerState.consecutiveFailures} consecutive failures`
+      );
+      
+      // Log to worker_issues table if available
+      try {
+        this.logCircuitEvent('OPEN', config.currentBackoffMs / 1000);
+      } catch (logErr) {
+        // Ignore logging errors
+      }
+      
       // Schedule health checks
       this.scheduleHealthCheck();
-      
-      console.warn(
-        `Redis circuit breaker tripped. ` +
-        `Consecutive failures: ${this.circuitBreakerState.consecutiveFailures}, ` +
-        `Total failures: ${this.circuitBreakerState.failures}. ` +
-        `Will perform health checks every ${config.healthCheckIntervalMs}ms`
-      );
     }
+  }
+  
+  /**
+   * Log circuit breaker events to worker_issues
+   */
+  private async logCircuitEvent(state: string, timeoutSeconds: number): Promise<void> {
+    // This method would call the worker_issues table logging if available
+    // Implementation depends on how worker_issues logging is set up
+    console.log(
+      `CircuitBreaker ${state} at ${new Date().toISOString()} for ${timeoutSeconds}s`
+    );
   }
   
   /**
@@ -533,6 +664,9 @@ export class RedisStateManager {
           if (this.circuitBreakerState.healthChecksPassed >= 3) {
             console.log(`Redis circuit breaker reset after ${this.circuitBreakerState.healthChecksPassed} successful health checks`);
             this.resetCircuitBreaker();
+            
+            // Log state change
+            this.logCircuitEvent('CLOSED', 0);
           } else {
             // Schedule another health check
             this.scheduleHealthCheck();
@@ -551,9 +685,17 @@ export class RedisStateManager {
   }
   
   private resetCircuitBreaker(): void {
+    // Log state change if was previously open
+    if (this.circuitBreakerState.isOpen) {
+      this.logCircuitEvent('CLOSED', 0);
+    }
+    
     this.circuitBreakerState.failures = 0;
     this.circuitBreakerState.consecutiveFailures = 0;
     this.circuitBreakerState.isOpen = false;
     this.circuitBreakerState.healthChecksPassed = 0;
+    
+    // Note: We don't reset currentBackoffMs here, so it maintains its value
+    // for the next time the circuit trips (exponential backoff strategy)
   }
 }

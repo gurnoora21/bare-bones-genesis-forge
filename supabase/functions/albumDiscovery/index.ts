@@ -1,438 +1,334 @@
 
-import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
-import { getQueueHelper } from "../_shared/queueHelper.ts";
-import { getDeduplicationService } from "../_shared/deduplication.ts";
 import { SpotifyClient } from "../_shared/spotifyClient.ts";
+import { DeduplicationService, getDeduplicationService } from "../_shared/deduplication.ts";
+import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
+import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 
-// Initialize clients
-const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const supabase = createClient(supabaseUrl, supabaseKey);
-
+// Initialize Redis client
 const redis = new Redis({
   url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
   token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
 });
 
-// Initialize services
-const queueHelper = getQueueHelper(supabase, redis);
-const deduplicationService = getDeduplicationService(redis);
-const spotifyClient = new SpotifyClient(
-  Deno.env.get("SPOTIFY_CLIENT_ID") || "",
-  Deno.env.get("SPOTIFY_CLIENT_SECRET") || ""
-);
-
-// Define DLQ configuration
-const DLQ_CONFIG = {
-  queueName: "album_discovery_dlq",
-  maxRetries: 3,
-  retryDelayMs: 5000, // 5 seconds between retries
+interface AlbumDiscoveryMsg {
+  artistId: string;
+  artistName: string;
+  offset?: number;
 }
 
-// CORS headers
+// Common CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Define the album discovery worker implementation
-class AlbumDiscoveryWorker extends createEnhancedWorker<any> {
-  constructor() {
-    super('album_discovery', supabase, redis);
+// Maximum retries for a message before sending to DLQ
+const MAX_RETRIES = 3;
+
+serve(async (req) => {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
   }
+
+  // Initialize Supabase client
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
   
-  async processMessage(message: any): Promise<any> {
-    console.log("Processing album discovery message:", message);
+  // Initialize services
+  const spotifyClient = new SpotifyClient();
+  const deduplicationService = getDeduplicationService(redis);
+  const queueHelper = getQueueHelper(supabase, redis);
+  const metrics = getDeduplicationMetrics(redis);
+
+  try {
+    console.log("Starting album discovery process");
     
-    // Extract album job info
-    const artistId = message.artistId;
-    const offset = message.offset || 0;
-    
-    if (!artistId) {
-      throw new Error("Message missing artistId");
+    // Direct RPC call to pg_dequeue for better performance
+    const { data: queueData, error } = await supabase.rpc('pg_dequeue', { 
+      queue_name: "album_discovery",
+      batch_size: 5,
+      visibility_timeout: 900 // 15 minutes
+    });
+
+    if (error) {
+      console.error("Error reading from queue:", error);
+      return new Response(JSON.stringify({ error: error.message }), { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
     }
+
+    // Parse messages
+    const messages = queueData ? JSON.parse(queueData) : [];
     
+    if (!messages || messages.length === 0) {
+      console.log("No messages to process in album_discovery queue");
+      return new Response(JSON.stringify({ processed: 0, message: "No messages to process" }), { 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+
+    console.log(`Found ${messages.length} messages to process in album_discovery queue`);
+    
+    // Process in background to avoid edge function timeout
+    const response = new Response(JSON.stringify({ 
+      processing: true, 
+      message_count: messages.length 
+    }), { 
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    });
+
+    // Process messages in background to avoid CPU timeout
+    EdgeRuntime.waitUntil((async () => {
+      // Track success/error counts for metrics
+      let successCount = 0;
+      let errorCount = 0;
+      let dedupedCount = 0;
+      let sentToDlqCount = 0;
+      
+      // Process each message independently
+      for (const message of messages) {
+        try {
+          let msg: AlbumDiscoveryMsg;
+          if (typeof message.message === 'string') {
+            msg = JSON.parse(message.message) as AlbumDiscoveryMsg;
+          } else {
+            msg = message.message as AlbumDiscoveryMsg;
+          }
+          
+          const messageId = message.id || message.msg_id;
+          if (!messageId) {
+            console.error("Message ID is undefined or null, cannot process this message safely");
+            errorCount++;
+            continue;
+          }
+          
+          // Process the message with isolated error handling
+          const result = await processAlbumMessage(
+            supabase, spotifyClient, deduplicationService, queueHelper, 
+            msg, messageId, message.attempts || 0
+          );
+          
+          // Track metrics based on result
+          if (result.success) {
+            successCount++;
+            
+            // Delete the message after successful processing
+            await queueHelper.deleteMessage("album_discovery", messageId);
+          } else if (result.deduped) {
+            dedupedCount++;
+            
+            // Delete the message if it was a duplicate
+            await queueHelper.deleteMessage("album_discovery", messageId);
+          } else if (result.sentToDlq) {
+            sentToDlqCount++;
+            
+            // Message already deleted by sendToDLQ
+          } else {
+            errorCount++;
+            
+            // Only send to DLQ if max retries exceeded
+            const attempts = message.attempts || 0;
+            if (attempts >= MAX_RETRIES) {
+              await queueHelper.sendToDLQ(
+                "album_discovery", 
+                messageId, 
+                msg, 
+                result.error || "Max retries exceeded",
+                { attempts }
+              );
+            }
+          }
+        } catch (messageError) {
+          console.error(`Error processing message:`, messageError);
+          errorCount++;
+        }
+      }
+
+      // Record final metrics
+      console.log(`Completed background processing: ${successCount} successful, ${dedupedCount} deduplicated, ${errorCount} failed, ${sentToDlqCount} sent to DLQ`);
+      
+      try {
+        await supabase.from('queue_metrics').insert({
+          queue_name: "album_discovery",
+          operation: "batch_processing",
+          processed_count: messages.length,
+          success_count: successCount,
+          error_count: errorCount,
+          details: { 
+            timestamp: new Date().toISOString(),
+            deduplicated_count: dedupedCount,
+            sent_to_dlq_count: sentToDlqCount
+          }
+        });
+      } catch (metricsError) {
+        console.error("Failed to record metrics:", metricsError);
+      }
+    })());
+    
+    return response;
+  } catch (error) {
+    console.error("Unexpected error in album discovery worker:", error);
+    return new Response(JSON.stringify({ error: error.message }), 
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+});
+
+/**
+ * Process a single album discovery message with isolated error handling
+ */
+async function processAlbumMessage(
+  supabase: any,
+  spotifyClient: SpotifyClient,
+  deduplicationService: DeduplicationService,
+  queueHelper: QueueHelper,
+  msg: AlbumDiscoveryMsg,
+  messageId: string,
+  attempts: number
+): Promise<{
+  success: boolean;
+  deduped?: boolean;
+  sentToDlq?: boolean;
+  error?: string;
+}> {
+  const { artistId, artistName, offset = 0 } = msg;
+  console.log(`Processing albums for artist ${artistName} (ID: ${artistId}) at offset ${offset}`);
+  
+  try {
     // Generate deduplication key
-    const dedupKey = `artist:${artistId}:albums:offset:${offset}`;
+    const dedupKey = `artist:${artistId}:offset:${offset}`;
     
-    // Check if already processed (extra safety)
+    // Check for deduplication
     const isDuplicate = await deduplicationService.isDuplicate(
-      'album_discovery', 
+      'album_discovery',
       dedupKey,
       { logDetails: true },
       { entityId: artistId }
     );
     
     if (isDuplicate) {
-      console.log(`Album page for artist ${artistId} at offset ${offset} already processed, skipping`);
-      return { status: 'skipped', reason: 'already_processed' };
+      console.log(`Albums for artist ${artistId} at offset ${offset} already processed, skipping`);
+      return { success: true, deduped: true };
     }
     
-    // Get artist details from database
+    // Check if artist exists in DB
     const { data: artist, error: artistError } = await supabase
       .from('artists')
-      .select('id, name, spotify_id')
+      .select('id, name')
       .eq('id', artistId)
       .single();
     
     if (artistError || !artist) {
-      throw new Error(`Error fetching artist ${artistId}: ${artistError?.message || 'Artist not found'}`);
+      console.error(`Artist not found with ID: ${artistId}`);
+      return { success: false, error: `Artist not found: ${artistId}` };
     }
     
-    if (!artist.spotify_id) {
-      throw new Error(`Artist ${artistId} has no Spotify ID`);
-    }
+    // Fetch albums from Spotify in an isolated transaction
+    console.log(`Fetching albums from Spotify for artist ${artistName} (ID: ${artistId})`);
+    const albumsData = await spotifyClient.getArtistAlbums(artistId, offset);
+    console.log(`Found ${albumsData.items.length} albums for artist ${artistName} (total: ${albumsData.total})`);
     
-    console.log(`Fetching albums for artist ${artist.name} (${artist.spotify_id}) at offset ${offset}`);
-    
-    // Get albums from Spotify
-    const albumsData = await spotifyClient.getArtistAlbums(artist.spotify_id, {
-      limit: 50,
-      offset: offset,
-      include_groups: "album,single,compilation"
+    // Process inside a transaction
+    await supabase.transaction(async (tx: any) => {
+      // Process each album
+      for (const album of albumsData.items) {
+        try {
+          // Check if album already exists
+          const { data: existingAlbum } = await tx
+            .from('albums')
+            .select('id')
+            .eq('spotify_id', album.id)
+            .maybeSingle();
+          
+          if (existingAlbum) {
+            console.log(`Album ${album.name} (${album.id}) already exists, skipping`);
+            continue;
+          }
+          
+          // Insert album
+          const { data: newAlbum, error: insertError } = await tx
+            .from('albums')
+            .insert({
+              name: album.name,
+              spotify_id: album.id,
+              release_date: album.release_date,
+              album_type: album.album_type,
+              total_tracks: album.total_tracks,
+              metadata: {
+                images: album.images,
+                uri: album.uri,
+                markets: album.available_markets,
+                updated_at: new Date().toISOString()
+              }
+            })
+            .select('id')
+            .single();
+          
+          if (insertError) {
+            console.error(`Error inserting album ${album.name}:`, insertError);
+            continue;
+          }
+          
+          // Create artist-album relationship
+          await tx.from('artist_albums').insert({
+            artist_id: artistId,
+            album_id: newAlbum.id,
+            is_primary_artist: true
+          });
+          
+          // Enqueue track discovery for this album
+          await queueHelper.enqueue(
+            'track_discovery',
+            {
+              albumId: newAlbum.id,
+              albumName: album.name,
+              artistId: artistId
+            },
+            `album:${newAlbum.id}`
+          );
+        } catch (albumError) {
+          // Log error but continue with next album
+          console.error(`Error processing album ${album.name}:`, albumError);
+        }
+      }
     });
     
-    if (!albumsData || !albumsData.items) {
-      console.log(`No albums found for artist ${artist.name} at offset ${offset}`);
+    // Handle pagination - enqueue next page if needed
+    if (albumsData.items.length > 0 && offset + albumsData.items.length < albumsData.total) {
+      const newOffset = offset + albumsData.items.length;
+      console.log(`Enqueueing next page of albums for artist ${artistName} with offset ${newOffset}`);
       
-      // Mark as processed even with zero results (valid end of pagination)
-      await deduplicationService.markAsProcessed(
-        'album_discovery', 
-        dedupKey,
-        86400, // 24 hour TTL
-        { entityId: artistId }
+      await queueHelper.enqueue(
+        'album_discovery',
+        { 
+          artistId, 
+          artistName, 
+          offset: newOffset 
+        },
+        `artist:${artistId}:offset:${newOffset}`
       );
-      
-      return { status: 'completed', albumsProcessed: 0, message: 'No albums returned from Spotify' };
     }
     
-    console.log(`Found ${albumsData.items.length} albums for artist ${artist.name}`);
-    
-    // Process metrics
-    const results = {
-      albumsProcessed: 0,
-      tracksQueued: 0,
-      nextPagesQueued: 0,
-      errors: 0
-    };
-    
-    // Process each album
-    for (const album of albumsData.items) {
-      try {
-        if (!album.id || !album.name) {
-          console.warn(`Skipping album with missing data:`, album);
-          continue;
-        }
-        
-        // Prepare album data
-        const albumData = {
-          artist_id: artist.id,
-          name: album.name,
-          spotify_id: album.id,
-          release_date: album.release_date || null,
-          cover_url: album.images && album.images.length > 0 ? album.images[0].url : null,
-          metadata: {
-            album_type: album.album_type,
-            total_tracks: album.total_tracks,
-            spotify_url: album.external_urls?.spotify,
-            label: album.label,
-            copyrights: album.copyrights
-          }
-        };
-        
-        // Insert or update album
-        const { data: savedAlbum, error: albumError } = await supabase
-          .from('albums')
-          .upsert(albumData, {
-            onConflict: 'spotify_id',
-            returning: 'minimal'
-          })
-          .select('id')
-          .single();
-        
-        if (albumError) {
-          // Log to worker_issues for consistent error tracking
-          await this.logWorkerIssue(
-            'database_error',
-            `Error upserting album ${album.name}: ${albumError.message}`,
-            { 
-              album_name: album.name,
-              spotify_id: album.id,
-              artist_id: artist.id 
-            }
-          );
-          results.errors++;
-          continue;
-        }
-        
-        const dbAlbumId = savedAlbum?.id;
-        
-        if (!dbAlbumId) {
-          await this.logWorkerIssue(
-            'data_error',
-            `Failed to get album ID after upsert for ${album.name}`,
-            {
-              album_name: album.name,
-              spotify_id: album.id
-            }
-          );
-          results.errors++;
-          continue;
-        }
-        
-        console.log(`Successfully saved/updated album ${album.name} (${dbAlbumId})`);
-        results.albumsProcessed++;
-        
-        // Queue track discovery for this album
-        const trackEnqueued = await queueHelper.enqueue('track_discovery', {
-          albumId: dbAlbumId,
-          albumName: album.name,
-          artistId: artist.id,
-          offset: 0
-        });
-        
-        if (trackEnqueued) {
-          console.log(`Successfully queued track discovery for album ${dbAlbumId}`);
-          results.tracksQueued++;
-        } else {
-          await this.logWorkerIssue(
-            'queue_error',
-            `Failed to queue track discovery for album ${dbAlbumId}`,
-            {
-              album_id: dbAlbumId,
-              album_name: album.name
-            }
-          );
-          results.errors++;
-        }
-      } catch (albumError) {
-        console.error(`Error processing album ${album.name}:`, albumError);
-        await this.logWorkerIssue(
-          'processing_error',
-          `Error processing album: ${albumError.message}`,
-          {
-            album_name: album.name || 'unknown'
-          }
-        );
-        results.errors++;
-      }
-    }
-    
-    // Check if there are more albums to fetch (pagination)
-    if (albumsData.next) {
-      // Queue the next page
-      const nextOffset = offset + albumsData.items.length;
-      const nextPageKey = `artist:${artistId}:albums:offset:${nextOffset}`;
-      
-      const nextPageEnqueued = await queueHelper.enqueue('album_discovery', {
-        artistId: artistId,
-        offset: nextOffset
-      }, nextPageKey);
-      
-      if (nextPageEnqueued) {
-        console.log(`Queued next album page for artist ${artist.name} at offset ${nextOffset}`);
-        results.nextPagesQueued++;
-      } else {
-        await this.logWorkerIssue(
-          'queue_error',
-          `Failed to queue next album page for artist ${artist.name}`,
-          {
-            artist_id: artistId,
-            next_offset: nextOffset
-          }
-        );
-        results.errors++;
-      }
-    }
-    
-    // Mark this page as processed
+    // Mark this batch as processed
     await deduplicationService.markAsProcessed(
-      'album_discovery', 
+      'album_discovery',
       dedupKey,
       86400, // 24 hour TTL
       { entityId: artistId }
     );
     
-    return { 
-      status: 'completed',
-      ...results
-    };
-  }
-  
-  // Helper to standardize worker issue logging
-  private async logWorkerIssue(
-    issueType: string, 
-    message: string, 
-    details?: Record<string, any>
-  ): Promise<void> {
-    try {
-      await this.supabase.from('worker_issues').insert({
-        worker_name: 'albumDiscovery',
-        issue_type: issueType,
-        message: message,
-        details: details || {},
-        created_at: new Date().toISOString()
-      });
-    } catch (error) {
-      console.error(`Failed to log worker issue: ${error.message}`);
-    }
-  }
-  
-  // Helper method to send to DLQ after max retries
-  async sendToDLQ(
-    messageId: string, 
-    message: any, 
-    failureReason: string
-  ): Promise<boolean> {
-    try {
-      console.log(`Moving message ${messageId} to DLQ due to: ${failureReason}`);
-      
-      // Try to use the DB function to move to DLQ
-      const { data, error } = await this.supabase.rpc('move_to_dead_letter_queue', {
-        source_queue: 'album_discovery',
-        dlq_name: DLQ_CONFIG.queueName,
-        message_id: messageId,
-        failure_reason: failureReason,
-        metadata: {
-          worker_name: 'albumDiscovery',
-          failed_at: new Date().toISOString(),
-          retries: DLQ_CONFIG.maxRetries
-        }
-      });
-      
-      if (error) {
-        console.error(`Error moving message to DLQ: ${error.message}`);
-        
-        // Fallback: direct send to DLQ if function fails
-        await this.supabase.functions.invoke("sendToQueue", {
-          body: {
-            queue_name: DLQ_CONFIG.queueName,
-            message: {
-              ...message,
-              _dlq_metadata: {
-                source_queue: 'album_discovery',
-                original_message_id: messageId,
-                moved_at: new Date().toISOString(),
-                failure_reason: failureReason,
-                move_method: 'direct_fallback'
-              }
-            }
-          }
-        });
-        
-        return true;
-      }
-      
-      return data === true;
-    } catch (error) {
-      console.error(`Failed to send message to DLQ: ${error.message}`);
-      return false;
-    }
-  }
-}
-
-// Process albums with self-draining capabilities
-async function processAlbumDiscovery() {
-  console.log("Starting album discovery batch processing");
-  
-  try {
-    const worker = new AlbumDiscoveryWorker();
-    
-    // Process multiple batches within the time limit with DLQ support
-    const result = await worker.drainQueue({
-      maxBatches: 8,          // Process up to 8 batches in one invocation
-      maxRuntimeMs: 240000,   // 4 minute runtime limit (below Edge Function timeout)
-      batchSize: 5,           // 5 messages per batch
-      processorName: 'album-discovery',
-      timeoutSeconds: 60,     // Timeout per message
-      visibilityTimeoutSeconds: 900, // Increased to 15 minutes per fix #8
-      logDetailedMetrics: true,
-      deadLetterQueue: DLQ_CONFIG.queueName,  // Enable DLQ for poison messages
-      maxRetries: DLQ_CONFIG.maxRetries       // Number of retries before sending to DLQ
-    });
-    
-    // Check if there were errors and if they exceeded retries, send to DLQ
-    if (result.errors > 0 && result.lastFailedMessage) {
-      console.log(`Message had errors after ${DLQ_CONFIG.maxRetries} retries, sending to DLQ`);
-      
-      const worker = new AlbumDiscoveryWorker();
-      await worker.sendToDLQ(
-        result.lastFailedMessage.id,
-        result.lastFailedMessage.message,
-        `Failed after ${DLQ_CONFIG.maxRetries} retries: ${result.lastFailedMessage.error || 'Unknown error'}`
-      );
-    }
-    
-    return {
-      processed: result.processed,
-      errors: result.errors,
-      duplicates: result.duplicates,
-      skipped: result.skipped,
-      processingTimeMs: result.processingTimeMs,
-      sentToDlq: result.sentToDlq || 0,
-      success: result.errors === 0
-    };
-  } catch (batchError) {
-    console.error("Fatal error in album discovery batch:", batchError);
-    return { 
-      error: batchError.message,
-      success: false
-    };
-  }
-}
-
-// Handle HTTP requests
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
-  
-  try {
-    // Process the batch in the background using EdgeRuntime.waitUntil
-    const resultPromise = processAlbumDiscovery();
-    
-    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
-      EdgeRuntime.waitUntil(resultPromise);
-      
-      // Return immediately with acknowledgment
-      return new Response(
-        JSON.stringify({ message: "Album discovery batch processing started" }),
-        { 
-          headers: { 
-            ...corsHeaders, 
-            'Content-Type': 'application/json' 
-          } 
-        }
-      );
-    } else {
-      // If EdgeRuntime.waitUntil is not available, wait for completion
-      const result = await resultPromise;
-      
-      return new Response(
-        JSON.stringify(result),
-        { 
-          headers: { 
-            ...corsHeaders, 
-            'Content-Type': 'application/json' 
-          } 
-        }
-      );
-    }
+    return { success: true };
   } catch (error) {
-    console.error("Error in album discovery handler:", error);
-    
-    return new Response(
-      JSON.stringify({ error: error.message, success: false }),
-      { 
-        status: 500,
-        headers: { 
-          ...corsHeaders, 
-          'Content-Type': 'application/json' 
-        } 
-      }
-    );
+    console.error(`Error processing albums for artist ${artistName}:`, error);
+    return { 
+      success: false, 
+      error: error instanceof Error ? error.message : String(error)
+    };
   }
-});
+}

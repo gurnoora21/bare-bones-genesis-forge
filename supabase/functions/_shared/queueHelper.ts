@@ -1,4 +1,3 @@
-
 // Adding acquireProcessingLock to queueHelper.ts exports
 // (This is to fix the error in trackDiscovery.ts)
 
@@ -16,6 +15,7 @@ export interface QueueHelper {
   deleteMessage(queueName: string, messageId: string): Promise<boolean>;
   resetVisibility(queueName: string, messageId: string): Promise<boolean>;
   moveToDeadLetterQueue(sourceQueue: string, dlqName: string, messageId: string, reason: string): Promise<boolean>;
+  sendToDLQ(queueName: string, messageId: string, message: any, reason: string, metadata?: Record<string, any>): Promise<boolean>;
 }
 
 /**
@@ -179,6 +179,68 @@ export function getQueueHelper(supabase: any, redis: Redis): QueueHelper {
         await metrics.recordQueueOperation(dlqName, "move_to_dlq", false);
         return false;
       }
+    },
+    
+    /**
+     * Enhanced version of moveToDeadLetterQueue that handles both PGMQ format and
+     * provides standardized DLQ format with error details
+     */
+    sendToDLQ: async (queueName: string, messageId: string, message: any, reason: string, metadata: Record<string, any> = {}): Promise<boolean> => {
+      try {
+        // Format for DLQ is standardized across all workers
+        const dlqName = `${queueName}_dlq`;
+        const dlqPayload = {
+          original_queue: queueName,
+          original_message_id: messageId,
+          original_message: message,
+          error_reason: reason,
+          failure_timestamp: new Date().toISOString(),
+          attempts: metadata.attempts || 1,
+          metadata: {
+            ...metadata,
+            worker_id: Deno.env.get("WORKER_ID") || "unknown",
+            moved_to_dlq_at: new Date().toISOString()
+          }
+        };
+        
+        // Enqueue to DLQ through the dedicated Edge Function
+        const { data, error } = await supabase.functions.invoke("sendToQueue", {
+          body: { queue_name: dlqName, message: dlqPayload }
+        });
+        
+        if (error) {
+          console.error(`Failed to send message ${messageId} to DLQ ${dlqName}:`, error);
+          await metrics.recordQueueOperation(dlqName, "send_to_dlq", false);
+          return false;
+        }
+        
+        // Delete the original message
+        await deleteMessageWithRetries(supabase, queueName, messageId);
+        
+        // Record DLQ metric
+        await metrics.recordQueueOperation(dlqName, "send_to_dlq", true);
+        
+        // Record in worker_issues table for visibility
+        await logWorkerIssue(
+          supabase,
+          queueName,
+          "sent_to_dlq",
+          `Message ${messageId} sent to DLQ ${dlqName}: ${reason}`,
+          { 
+            messageId, 
+            originalQueue: queueName,
+            dlqName,
+            reason,
+            timestamp: new Date().toISOString()
+          }
+        );
+        
+        return true;
+      } catch (error) {
+        console.error(`Error sending message ${messageId} to DLQ:`, error);
+        await metrics.recordQueueOperation(`${queueName}_dlq`, "send_to_dlq", false);
+        return false;
+      }
     }
   };
 }
@@ -256,9 +318,18 @@ export async function processQueueMessageSafely(
       ttlSeconds: number;
       strictMatching?: boolean;
     };
+    sendToDlqOnMaxRetries?: boolean;
+    dlqName?: string;
   } = {}
 ): Promise<any | { deduplication: true, result: any } | false> {
-  const { maxRetries = 1, circuitBreaker = false, deduplication } = options;
+  const { 
+    maxRetries = 1, 
+    circuitBreaker = false, 
+    deduplication,
+    sendToDlqOnMaxRetries = false,
+    dlqName
+  } = options;
+  
   let attempts = 0;
   
   // Check for duplication if function provided
@@ -345,6 +416,65 @@ export async function processQueueMessageSafely(
   
   // All retries failed
   console.error(`All ${maxRetries + 1} processing attempts failed for message ${messageId}`);
+  
+  // Move to DLQ if enabled and all retries failed
+  if (sendToDlqOnMaxRetries) {
+    const actualDlqName = dlqName || `${queueName}_dlq`;
+    try {
+      // Get the message data to send to DLQ
+      const { data: messageData } = await supabase.rpc('get_queue_message', {
+        queue_name: queueName,
+        message_id: messageId
+      });
+      
+      if (messageData) {
+        // Parse the message body if it's a string
+        let messageBody;
+        try {
+          messageBody = typeof messageData.message === 'string' ? 
+            JSON.parse(messageData.message) : messageData.message;
+        } catch (parseErr) {
+          messageBody = messageData.message;
+        }
+        
+        // Send to DLQ
+        await supabase.functions.invoke("sendToQueue", {
+          body: { 
+            queue_name: actualDlqName,
+            message: {
+              original_queue: queueName,
+              original_message_id: messageId,
+              original_message: messageBody,
+              error_reason: lastError?.message || "Max retries exceeded",
+              failure_timestamp: new Date().toISOString(),
+              attempts: maxRetries + 1,
+              metadata: {
+                worker_id: Deno.env.get("WORKER_ID") || "unknown",
+                moved_to_dlq_at: new Date().toISOString(),
+                last_error: lastError?.message,
+                last_error_stack: lastError?.stack
+              }
+            }
+          }
+        });
+        
+        // Delete the original message after sending to DLQ
+        await deleteMessageWithRetries(supabase, queueName, messageId);
+        
+        // Log the issue
+        await logWorkerIssue(supabase, queueName, "sent_to_dlq", 
+          `Message ${messageId} sent to DLQ ${actualDlqName} after ${maxRetries + 1} attempts`, 
+          { lastError: lastError?.message, stack: lastError?.stack }
+        );
+        
+        return { sentToDlq: true, queue: actualDlqName };
+      }
+    } catch (dlqError) {
+      console.error(`Failed to send message ${messageId} to DLQ: ${dlqError.message}`);
+      // Don't rethrow, we still want to log the original issue below
+    }
+  }
+  
   await logWorkerIssue(supabase, queueName, "processing_failed", 
     `Failed to process message ${messageId} after ${maxRetries + 1} attempts`, 
     { lastError: lastError?.message, stack: lastError?.stack }

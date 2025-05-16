@@ -1,4 +1,3 @@
-
 /**
  * Enhanced State Manager
  * Provides a reliable and efficient way to manage distributed state and locks
@@ -20,12 +19,22 @@ interface TransactionContext {
   correlationId?: string;
 }
 
+// Track heartbeat intervals for cleanup
+interface HeartbeatContext {
+  intervalId: number;
+  entityType: string;
+  entityId: string;
+  workerId: string;
+}
+
 export class EnhancedStateManager {
   private dbStateManager: DbStateManager;
   private pgLockManager: PgLockManager;
   private redisStateManager: RedisStateManager | null = null;
   private useRedisCache: boolean = false;
   private activeTransactions: Map<string, TransactionContext> = new Map();
+  // New: Track active heartbeats for cleanup
+  private activeHeartbeats: Map<string, HeartbeatContext> = new Map();
   
   constructor(supabaseClient?: any, redisClient?: Redis, useRedisCache = false) {
     // Initialize database state manager
@@ -140,13 +149,14 @@ export class EnhancedStateManager {
       correlationId = generateCorrelationId('lock'),
       retries = 1,
       timeoutSeconds = 0,
-      timeoutMinutes
+      timeoutMinutes,
+      heartbeatIntervalSeconds = 15  // New: Default heartbeat interval of 15s
     } = options;
     
     // Convert timeoutMinutes to seconds if provided
     const effectiveTimeoutSeconds = timeoutMinutes 
       ? timeoutMinutes * 60 
-      : timeoutSeconds;
+      : timeoutSeconds || 300; // Default to 5 minutes if not specified
     
     console.log(`[${correlationId}] Attempting to acquire lock for ${entityType}:${entityId}`);
     
@@ -205,6 +215,50 @@ export class EnhancedStateManager {
           // Redis errors are non-critical since advisory lock is source of truth
           console.warn(`[${correlationId}] Redis cache update failed (non-critical): ${redisErr.message}`);
         }
+      }
+      
+      // New: Set up heartbeat mechanism to keep the lock fresh
+      const workerId = Deno.env.get("WORKER_ID") || 
+                     `worker_${Math.random().toString(36).substring(2, 10)}`;
+      
+      // Generate a unique heartbeat key for this lock
+      const heartbeatKey = `${entityType}:${entityId}`;
+      
+      // Clean up any existing heartbeat for this entity (should not happen, but safety first)
+      this.stopHeartbeat(heartbeatKey);
+      
+      // Start a new heartbeat interval that will extend both PG and Redis locks
+      if (heartbeatIntervalSeconds > 0) {
+        const intervalId = setInterval(async () => {
+          try {
+            // Extend PG advisory lock (if needed)
+            await this.pgLockManager.extendLock(entityType, entityId);
+            
+            // Update heartbeat timestamp in database
+            await this.dbStateManager.updateHeartbeat(entityType, entityId);
+            
+            // Extend Redis lock TTL if configured
+            if (this.useRedisCache && this.redisStateManager) {
+              await this.redisStateManager.extendLock(
+                entityType,
+                entityId,
+                effectiveTimeoutSeconds
+              );
+            }
+            
+            console.log(`[${correlationId}] Heartbeat sent for ${entityType}:${entityId}`);
+          } catch (heartbeatErr) {
+            console.error(`[${correlationId}] Heartbeat failed for ${entityType}:${entityId}: ${heartbeatErr.message}`);
+          }
+        }, heartbeatIntervalSeconds * 1000);
+        
+        // Store the interval ID for later cleanup
+        this.activeHeartbeats.set(heartbeatKey, {
+          intervalId,
+          entityType,
+          entityId,
+          workerId
+        });
       }
       
       // Commit the transaction
@@ -389,6 +443,19 @@ export class EnhancedStateManager {
   }
   
   /**
+   * Stop heartbeat for a specific entity
+   */
+  private stopHeartbeat(heartbeatKey: string): void {
+    const heartbeatContext = this.activeHeartbeats.get(heartbeatKey);
+    
+    if (heartbeatContext) {
+      clearInterval(heartbeatContext.intervalId);
+      this.activeHeartbeats.delete(heartbeatKey);
+      console.log(`Stopped heartbeat for ${heartbeatContext.entityType}:${heartbeatContext.entityId}`);
+    }
+  }
+  
+  /**
    * Release a processing lock
    */
   async releaseLock(
@@ -402,6 +469,10 @@ export class EnhancedStateManager {
     const transactionId = this.beginTransaction(entityType, entityId, correlationId);
     
     try {
+      // Stop heartbeat for this entity
+      const heartbeatKey = `${entityType}:${entityId}`;
+      this.stopHeartbeat(heartbeatKey);
+      
       // Step 1: Release the advisory lock (source of truth)
       const pgSuccess = await this.pgLockManager.releaseLock(entityType, entityId);
       
@@ -461,6 +532,7 @@ export class EnhancedStateManager {
   
   /**
    * Clean up stale locks
+   * Handles stale locks by allowing other workers to acquire them if they're old enough
    */
   async cleanupStaleLocks(olderThanMinutes: number = 30): Promise<number> {
     let cleanedCount = 0;
@@ -470,12 +542,40 @@ export class EnhancedStateManager {
       cleanedCount = await this.pgLockManager.cleanupStaleLocks(olderThanMinutes);
       
       // Also reset any stuck IN_PROGRESS states in the processing_status table
-      const { data, error } = await this.dbStateManager.resetStuckProcessingStates(olderThanMinutes);
+      const { data: staleLocks, error } = await this.dbStateManager.findStaleLocks(olderThanMinutes);
       
       if (error) {
-        console.error(`Failed to reset stuck processing states: ${error}`);
-      } else if (data) {
-        cleanedCount += data.length;
+        console.error(`Failed to find stale locks: ${error}`);
+      } else if (staleLocks && staleLocks.length > 0) {
+        console.log(`Found ${staleLocks.length} stale locks to clean up`);
+        
+        // Process each stale lock
+        for (const lock of staleLocks) {
+          try {
+            // Check if the lock is still valid (has recent heartbeat)
+            const isStale = await this.dbStateManager.isLockStale(
+              lock.entity_type,
+              lock.entity_id,
+              olderThanMinutes
+            );
+            
+            if (isStale) {
+              console.log(`Cleaning up stale lock for ${lock.entity_type}:${lock.entity_id}`);
+              
+              // Force release the stale lock
+              await this.dbStateManager.forceReleaseLock(lock.entity_type, lock.entity_id);
+              
+              // If Redis is enabled, also clear there
+              if (this.useRedisCache && this.redisStateManager) {
+                await this.redisStateManager.forceReleaseLock(lock.entity_type, lock.entity_id);
+              }
+              
+              cleanedCount++;
+            }
+          } catch (lockError) {
+            console.error(`Error cleaning up stale lock ${lock.entity_type}:${lock.entity_id}: ${lockError.message}`);
+          }
+        }
       }
       
       return cleanedCount;
