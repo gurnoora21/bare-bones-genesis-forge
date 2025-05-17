@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 
@@ -13,6 +12,14 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Add this function at the top of the file, after imports
+function normalizeQueueName(queueName: string): string {
+  // Remove any existing prefixes
+  const baseName = queueName.replace(/^(pgmq\.|q_)/, '');
+  // Return the normalized name without any prefix
+  return baseName;
+}
+
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
@@ -20,94 +27,60 @@ serve(async (req) => {
   }
   
   try {
-    // Parse the request body
-    const { queue_name, message, idempotency_key, create_only } = await req.json();
+    const { queue_name, message, priority } = await req.json();
     
-    if (!queue_name) {
+    if (!queue_name || !message) {
       return new Response(
-        JSON.stringify({ error: "Missing queue_name parameter" }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        JSON.stringify({ error: 'Missing required parameters' }),
+        { status: 400 }
       );
     }
-    
-    // First, ensure the queue exists
-    try {
-      // Register the queue using a database function
-      await supabase.rpc('register_queue', {
-        p_queue_name: queue_name,
-        p_display_name: queue_name,
-        p_description: `Queue for ${queue_name} messages`,
-        p_active: true
-      });
-    } catch (createError) {
-      // Queue might already exist, which is fine
-      console.log(`Note: Queue ${queue_name} might already exist: ${createError.message}`);
-    }
-    
-    // If create_only flag is set, we only want to create the queue
-    if (create_only) {
-      return new Response(
-        JSON.stringify({ success: true, queue_created: queue_name }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    if (!message) {
-      return new Response(
-        JSON.stringify({ error: "Missing message parameter" }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    console.log(`Sending message to queue ${queue_name}`);
-    
-    // Send to queue using pg_enqueue
-    const { data: messageId, error } = await supabase.rpc('pg_enqueue', {
-      queue_name: queue_name,
-      message_body: {
-        ...message,
-        _idempotencyKey: idempotency_key || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
-      }
+
+    // Normalize the queue name
+    const normalizedQueueName = normalizeQueueName(queue_name);
+    console.log(`DEBUG: Normalized queue name: ${normalizedQueueName}`);
+
+    // Ensure queue exists
+    const { error: createError } = await supabase.rpc('pgmq_create_queue', {
+      queue_name: normalizedQueueName
     });
-    
-    if (error) {
-      // Try alternative method
-      try {
-        const { data: altSendResult } = await supabase.rpc('pg_send_text', {
-          queue_name: queue_name,
-          msg_text: JSON.stringify({
-            ...message,
-            _idempotencyKey: idempotency_key || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
-          })
-        });
-        
-        return new Response(
-          JSON.stringify({ success: true, message_id: altSendResult, method: 'pg_send_text' }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-        
-      } catch (altError) {
-        return new Response(
-          JSON.stringify({ error: `All queue sending methods failed: ${error.message} / ${altError.message}` }),
-          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
+
+    if (createError) {
+      console.error('Error creating queue:', createError);
+      return new Response(
+        JSON.stringify({ error: 'Failed to create queue' }),
+        { status: 500 }
+      );
     }
-    
+
+    // Send message to queue
+    const { data, error } = await supabase.rpc('pgmq_send', {
+      queue_name: normalizedQueueName,
+      message: message,
+      priority: priority || 0
+    });
+
+    if (error) {
+      console.error('Error sending message:', error);
+      return new Response(
+        JSON.stringify({ error: 'Failed to send message' }),
+        { status: 500 }
+      );
+    }
+
     return new Response(
-      JSON.stringify({ success: true, message_id: messageId }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      JSON.stringify({ 
+        success: true, 
+        message_id: data.message_id,
+        queue_name: normalizedQueueName
+      }),
+      { status: 200 }
     );
-    
   } catch (error) {
-    console.error("Error in sendToQueue handler:", error);
-    
+    console.error('Unexpected error:', error);
     return new Response(
-      JSON.stringify({ error: error.message }),
-      { 
-        status: 500, 
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      }
+      JSON.stringify({ error: 'Internal server error' }),
+      { status: 500 }
     );
   }
 });
