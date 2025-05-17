@@ -91,76 +91,132 @@ async function getQueueDepths(): Promise<Record<string, any>> {
 // Get recent metrics from queue_metrics table
 async function getRecentMetrics(hoursBack: number = 24): Promise<any> {
   try {
+    // FIX: Query monitoring.pipeline_metrics instead of queue_metrics
     const { data, error } = await supabase
-      .from('queue_metrics')
+      .from('monitoring.pipeline_metrics')
       .select('*')
-      .gte('created_at', new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString())
-      .order('created_at', { ascending: false });
+      .gte('timestamp', new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString())
+      .order('timestamp', { ascending: false });
     
     if (error) {
-      throw new Error(`Error fetching recent metrics: ${error.message}`);
-    }
-    
-    // Group by queue_name for analysis
-    const metricsByQueue: Record<string, any[]> = {};
-    
-    for (const metric of (data || [])) {
-      if (!metricsByQueue[metric.queue_name]) {
-        metricsByQueue[metric.queue_name] = [];
+      // If schema-qualified name doesn't work, try using raw SQL
+      try {
+        const { data: sqlData, error: sqlError } = await supabase.rpc('raw_sql_query', {
+          sql_query: `
+            SELECT * FROM monitoring.pipeline_metrics 
+            WHERE timestamp >= NOW() - interval '${hoursBack} hours'
+            ORDER BY timestamp DESC
+          `
+        });
+        
+        if (sqlError) {
+          throw new Error(`SQL query error: ${sqlError.message}`);
+        }
+        
+        return processMetricsData(sqlData || []);
+      } catch (sqlQueryError) {
+        throw new Error(`Error fetching metrics via SQL: ${sqlQueryError.message}`);
       }
-      metricsByQueue[metric.queue_name].push(metric);
     }
     
-    // Calculate summary stats per queue
-    const summaryStats: Record<string, any> = {};
-    
-    for (const [queueName, metrics] of Object.entries(metricsByQueue)) {
-      const totalProcessed = metrics.reduce((sum, m) => sum + (m.processed_count || 0), 0);
-      const totalErrors = metrics.reduce((sum, m) => sum + (m.error_count || 0), 0);
-      const avgProcessingTime = metrics.reduce((sum, m) => {
-        const processingTime = m.details?.processing_time_ms || 0;
-        return processingTime > 0 ? sum + processingTime : sum;
-      }, 0) / (metrics.length || 1);
-      
-      summaryStats[queueName] = {
-        metrics_count: metrics.length,
-        total_processed: totalProcessed,
-        total_errors: totalErrors,
-        error_rate: totalProcessed > 0 ? (totalErrors / totalProcessed) : 0,
-        avg_processing_time_ms: Math.round(avgProcessingTime),
-        last_run: metrics[0]?.created_at
-      };
-    }
-    
-    return {
-      summary: summaryStats,
-      recent_metrics: metricsByQueue
-    };
+    return processMetricsData(data || []);
   } catch (error) {
     console.error(`Error fetching metrics: ${error.message}`);
     return { error: error.message };
   }
 }
 
+// Helper function to process metrics data
+function processMetricsData(data: any[]): any {
+  // Group metrics by name and queue for analysis
+  const metricsByName: Record<string, any[]> = {};
+  const metricsByQueue: Record<string, any[]> = {};
+  
+  for (const metric of data) {
+    // Group by metric name
+    const name = metric.metric_name;
+    if (!metricsByName[name]) {
+      metricsByName[name] = [];
+    }
+    metricsByName[name].push(metric);
+    
+    // Group by queue if that info is in tags
+    const queueName = metric.tags?.queue;
+    if (queueName) {
+      if (!metricsByQueue[queueName]) {
+        metricsByQueue[queueName] = [];
+      }
+      metricsByQueue[queueName].push(metric);
+    }
+  }
+  
+  // Calculate summary stats per queue
+  const summaryStats: Record<string, any> = {};
+  
+  for (const [queueName, metrics] of Object.entries(metricsByQueue)) {
+    // Filter metrics related to processing
+    const processingMetrics = metrics.filter(m => 
+      m.metric_name.includes('worker_batch') || 
+      m.metric_name.includes('queue_processing')
+    );
+    
+    if (processingMetrics.length === 0) continue;
+    
+    const totalProcessed = processingMetrics.reduce((sum, m) => {
+      const processed = m.tags?.processed || 0;
+      return sum + (typeof processed === 'number' ? processed : parseInt(processed) || 0);
+    }, 0);
+    
+    const totalErrors = processingMetrics.reduce((sum, m) => {
+      const errors = m.tags?.errors || 0;
+      return sum + (typeof errors === 'number' ? errors : parseInt(errors) || 0);
+    }, 0);
+    
+    const avgProcessingTime = processingMetrics.reduce((sum, m) => {
+      return sum + (m.metric_value || 0);
+    }, 0) / (processingMetrics.length || 1);
+    
+    summaryStats[queueName] = {
+      metrics_count: processingMetrics.length,
+      total_processed: totalProcessed,
+      total_errors: totalErrors,
+      error_rate: totalProcessed > 0 ? (totalErrors / totalProcessed) : 0,
+      avg_processing_time_ms: Math.round(avgProcessingTime),
+      last_run: processingMetrics[0]?.timestamp || processingMetrics[0]?.created_at
+    };
+  }
+  
+  return {
+    summary: summaryStats,
+    by_name: metricsByName,
+    by_queue: metricsByQueue
+  };
+}
+
 // Get recent worker issues
 async function getWorkerIssues(hoursBack: number = 24, limit: number = 100): Promise<any> {
   try {
-    const { data, error } = await supabase
-      .from('worker_issues')
-      .select('*')
-      .gte('created_at', new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString())
-      .order('created_at', { ascending: false })
-      .limit(limit);
+    // FIX: Properly reference the monitoring schema
+    const { data, error } = await supabase.rpc('raw_sql_query', {
+      sql_query: `
+        SELECT * FROM monitoring.worker_issues
+        WHERE created_at >= NOW() - interval '${hoursBack} hours'
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `
+    });
     
     if (error) {
       throw new Error(`Error fetching worker issues: ${error.message}`);
     }
     
+    const issues = data || [];
+    
     // Group by worker_name and issue_type
     const issuesByWorker: Record<string, any> = {};
     const issuesByType: Record<string, number> = {};
     
-    for (const issue of (data || [])) {
+    for (const issue of issues) {
       // Count by worker
       if (!issuesByWorker[issue.worker_name]) {
         issuesByWorker[issue.worker_name] = {
@@ -179,10 +235,10 @@ async function getWorkerIssues(hoursBack: number = 24, limit: number = 100): Pro
     }
     
     return {
-      total_issues: data?.length || 0,
+      total_issues: issues.length || 0,
       by_worker: issuesByWorker,
       by_type: issuesByType,
-      recent_issues: data?.slice(0, 10) // Just return most recent 10 for display
+      recent_issues: issues.slice(0, 10) // Just return most recent 10 for display
     };
   } catch (error) {
     console.error(`Error fetching worker issues: ${error.message}`);
@@ -201,7 +257,7 @@ async function getScalingRecommendations(): Promise<any> {
     // For each standard queue, analyze and make recommendations
     for (const queue of standardQueues) {
       const depth = queueDepths[queue]?.count || 0;
-      const metrics = recentMetrics.summary[queue];
+      const metrics = recentMetrics.summary?.[queue];
       
       // Skip if no metrics data available
       if (!metrics) {

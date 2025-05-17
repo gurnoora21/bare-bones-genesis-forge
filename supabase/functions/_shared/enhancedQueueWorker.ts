@@ -1,4 +1,3 @@
-
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 
@@ -102,14 +101,14 @@ export abstract class EnhancedWorkerBase {
           // Process each message
           for (const message of messages) {
             try {
-              // Ensure message is valid
-              if (!message || !message.id) {
-                console.warn(`Skipping invalid message without ID`);
+              // Ensure message is valid and extract ID - FIX: Improved message ID extraction
+              const messageId = this.getMessageId(message);
+              if (!messageId) {
+                console.warn(`Skipping invalid message without ID:`, JSON.stringify(message).substring(0, 200));
                 continue;
               }
               
               // Store message ID for acknowledgment
-              const messageId = message.id.toString();
               this.messageIds.set(messageId, messageId);
               messageIds.push(messageId);
               
@@ -133,9 +132,17 @@ export abstract class EnhancedWorkerBase {
                 continue;
               }
               
+              // FIX: Extract the actual message content - improved message extraction
+              const messageContent = this.extractMessageContent(message);
+              if (!messageContent) {
+                console.warn(`Failed to extract message content from:`, JSON.stringify(message).substring(0, 200));
+                errors++;
+                continue;
+              }
+              
               // Process the message
               console.log(`Processing message ${messageId}`);
-              const result = await this.processMessage(message.message);
+              const result = await this.processMessage(messageContent);
               
               // Mark deduplication if needed
               if (dedupKey) {
@@ -155,10 +162,18 @@ export abstract class EnhancedWorkerBase {
               
               processed++;
             } catch (error) {
-              console.error(`Error processing message ${message?.id}:`, error);
+              console.error(`Error processing message:`, error);
+              
+              // Get message ID safely (with error handling)
+              let messageId: string | undefined;
+              try {
+                messageId = this.getMessageId(message);
+              } catch (idError) {
+                console.error(`Failed to get message ID for error handling:`, idError);
+              }
               
               // Handle message failure with retry or DLQ
-              if (message?.id) {
+              if (messageId) {
                 await this.handleMessageFailure(message, error, maxRetries, sendToDlqOnMaxRetries, deadLetterQueue);
               } else {
                 console.error(`Cannot handle failure for message without ID`);
@@ -238,6 +253,54 @@ export abstract class EnhancedWorkerBase {
     }
     return null;
   }
+
+  /**
+   * FIX: New helper method to safely extract message ID from different message formats
+   */
+  protected getMessageId(message: any): string | undefined {
+    if (!message) return undefined;
+    
+    // Direct ID field - most common case
+    if (message.id) return message.id.toString();
+    
+    // msg_id field - alternate format
+    if (message.msg_id) return message.msg_id.toString();
+    
+    // Nested inside message.message object
+    if (message.message && typeof message.message === 'object') {
+      if (message.message.id) return message.message.id.toString();
+      if (message.message.msg_id) return message.message.msg_id.toString();
+    }
+    
+    // Check for messageId field - alternate naming
+    if (message.messageId) return message.messageId.toString();
+    
+    console.warn("Unable to extract message ID from:", JSON.stringify(message).substring(0, 200));
+    return undefined;
+  }
+  
+  /**
+   * FIX: New helper method to extract the actual message content
+   */
+  protected extractMessageContent(message: any): any {
+    // If there's a message property that is an object or string, use that
+    if (message.message) {
+      // If it's a string, try to parse it as JSON
+      if (typeof message.message === 'string') {
+        try {
+          return JSON.parse(message.message);
+        } catch (e) {
+          // If not valid JSON, return as is
+          return message.message;
+        }
+      }
+      // If already an object, return it
+      return message.message;
+    }
+    
+    // If no message property, use the whole message
+    return message;
+  }
   
   /**
    * Check if message has been processed before (deduplication)
@@ -312,7 +375,7 @@ export abstract class EnhancedWorkerBase {
    * Send a message to the dead letter queue
    */
   protected async sendToDLQ(message: any, error: Error, dlqName: string): Promise<boolean> {
-    const messageId = message.id?.toString();
+    const messageId = this.getMessageId(message);
     
     if (!messageId) {
       console.error(`Cannot send to DLQ: Message ID is undefined`);
@@ -358,8 +421,13 @@ export abstract class EnhancedWorkerBase {
     sendToDlq = true,
     dlqName = `${this.queueName}_dlq`
   ): Promise<void> {
-    const messageId = message.id?.toString();
+    const messageId = this.getMessageId(message);
     const retryCount = message.read_ct || 0;
+    
+    if (!messageId) {
+      console.error("Cannot handle message failure: Unable to extract message ID");
+      return;
+    }
     
     // If max retries reached, send to DLQ
     if (retryCount >= maxRetries) {
@@ -473,28 +541,31 @@ export abstract class EnhancedWorkerBase {
         { ex: 86400 } // 24 hour TTL
       );
       
-      // Then try to store in database if available
+      // FIX: Use raw_sql_query to ensure correct schema reference
       try {
-        // Check if the pipeline_metrics table exists before inserting
-        const { data, error } = await this.supabase
-          .from('pipeline_metrics')
-          .insert({
-            metric_name: `worker_batch_${metrics.processor}`,
-            metric_value: metrics.processing_time_ms,
-            tags: {
+        await this.supabase.rpc('raw_sql_query', {
+          sql_query: `
+            INSERT INTO monitoring.pipeline_metrics
+            (metric_name, metric_value, tags, timestamp)
+            VALUES (
+              $1, 
+              $2, 
+              $3::jsonb, 
+              NOW()
+            )
+          `,
+          params: JSON.stringify([
+            `worker_batch_${metrics.processor}`,
+            metrics.processing_time_ms,
+            JSON.stringify({
               queue: metrics.queue,
               processor: metrics.processor,
               processed: metrics.processed,
               errors: metrics.errors,
               worker_id: metrics.worker_id
-            },
-            timestamp: new Date()
-          });
-          
-        if (error) {
-          // Just log the error but don't throw
-          console.warn(`Error inserting to pipeline_metrics: ${error.message}`);
-        }
+            })
+          ])
+        });
       } catch (dbError) {
         // Just log the error but don't throw
         console.warn(`Database metrics insertion failed: ${dbError.message}`);

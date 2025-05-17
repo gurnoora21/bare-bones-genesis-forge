@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -29,17 +28,17 @@ const EnhancedWorker = createEnhancedWorker('artist_discovery', supabase, redis)
 class ArtistDiscoveryWorker extends EnhancedWorker {
   /**
    * Validate message before processing
+   * FIX: Improved message validation and debug logging
    */
   protected validateMessage(message: any, logger: StructuredLogger): boolean {
     // Log received message structure to help with debugging
     logger.debug("Validating artist discovery message", { 
       messageType: typeof message, 
-      messageStructure: typeof message === 'object' ? Object.keys(message) : 'not_object',
-      originalMessage: message
+      messageContent: typeof message === 'object' ? JSON.stringify(message).substring(0, 300) : 'not_object'
     });
     
-    // First run the base validation
-    if (!super.validateMessage(message, logger)) {
+    if (!message) {
+      logger.error("Message is null or undefined");
       return false;
     }
     
@@ -53,6 +52,18 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
         originalKeys: Object.keys(message),
         extractedKeys: Object.keys(artistMessage)
       });
+    } else if (typeof message.message === 'string') {
+      // Try to parse string message as JSON
+      try {
+        const parsed = JSON.parse(message.message);
+        artistMessage = parsed;
+        logger.debug("Parsed string message to JSON", {
+          parsedKeys: Object.keys(parsed)
+        });
+      } catch (e) {
+        logger.warn("Failed to parse message string as JSON", { error: e.message });
+        // Continue with the original message
+      }
     }
     
     // Check for artistName field
@@ -66,13 +77,33 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
 
   /**
    * Process an artist discovery message
+   * FIX: Improved handling of message structures
    */
   async handleMessage(message: any, logger: StructuredLogger): Promise<any> {
-    // Handle case where message is wrapped in a message property (common from queue)
+    // Handle different message formats more robustly
     let artistMessage = message;
-    if (message.message && typeof message.message === 'object') {
-      artistMessage = message.message;
-      logger.debug("Using nested artist message object", { extractedMessage: artistMessage });
+    
+    // Extract the message content from different possible formats
+    if (message.message) {
+      if (typeof message.message === 'object') {
+        artistMessage = message.message;
+      } else if (typeof message.message === 'string') {
+        try {
+          artistMessage = JSON.parse(message.message);
+        } catch (e) {
+          logger.warn("Failed to parse message string as JSON", { error: e.message });
+          // Keep original message
+        }
+      }
+    }
+    
+    // Log the extracted message for debugging
+    logger.debug("Processing with extracted message", { extractedMessage: artistMessage });
+    
+    // Ensure we have the artistName
+    if (!artistMessage?.artistName) {
+      logger.error("Missing artistName in message", { message: artistMessage });
+      throw new Error("Missing artistName in message");
     }
     
     const artistName = artistMessage.artistName;

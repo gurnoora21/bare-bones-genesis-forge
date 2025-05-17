@@ -1,4 +1,3 @@
-
 /**
  * Metrics Collector for storing pipeline performance metrics
  * Aggregates metrics and persists them to Postgres for analysis
@@ -162,58 +161,33 @@ export class MetricsCollector {
           await this.ensurePipelineMetricsTable();
           
           // Insert metrics into database with proper schema prefix
-          const { data, error } = await this.supabase
-            .from('monitoring.pipeline_metrics')
-            .insert(metricsRows);
-            
-          if (error) {
-            // Try alternative approach with raw SQL if normal insert fails
-            try {
-              // Using raw_sql_query RPC to create the insert statement
-              await this.supabase.rpc('raw_sql_query', {
-                sql_query: `
-                  INSERT INTO monitoring.pipeline_metrics
-                  (metric_name, metric_value, tags, timestamp)
-                  SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(
-                    metric_name TEXT,
-                    metric_value DOUBLE PRECISION,
-                    tags JSONB,
-                    timestamp TIMESTAMPTZ
-                  )
-                `,
-                params: JSON.stringify(metricsRows)
-              });
-              
-              // Reset error counter on success
-              this.consecutiveErrors = 0;
-              return true;
-            } catch (sqlError) {
-              // Log the specific SQL error
-              this.logger.warn("Failed to insert metrics via SQL", { 
-                error: sqlError.message,
-                originalError: error.message
-              });
-              this.consecutiveErrors++;
-              
-              // Fall back to local logging
-              await this.persistToFallback(metricsToFlush);
-              return false;
-            }
-          }
+          // IMPORTANT FIX: Use raw_sql_query RPC to ensure schema is specified correctly
+          await this.supabase.rpc('raw_sql_query', {
+            sql_query: `
+              INSERT INTO monitoring.pipeline_metrics
+              (metric_name, metric_value, tags, timestamp)
+              SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(
+                metric_name TEXT,
+                metric_value DOUBLE PRECISION,
+                tags JSONB,
+                timestamp TIMESTAMPTZ
+              )
+            `,
+            params: JSON.stringify(metricsRows)
+          });
           
           // Reset error counter on success
           this.consecutiveErrors = 0;
           return true;
         } catch (error) {
-          // Handle case where supabase client is invalid or table doesn't exist
-          this.logger.warn("Error persisting metrics to database", { 
-            error: error.message, 
-            retryCount: metricsToFlush.length 
+          // Log the specific error
+          this.logger.warn("Failed to insert metrics to monitoring.pipeline_metrics", { 
+            error: error.message
           });
-          
           this.consecutiveErrors++;
-          await this.persistToFallback(metricsToFlush);
           
+          // Fall back to local logging
+          await this.persistToFallback(metricsToFlush);
           return false;
         }
       } else {
