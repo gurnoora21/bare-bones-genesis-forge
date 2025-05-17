@@ -1,4 +1,5 @@
 
+
 -- Create a dedicated function to correctly detect and use the right queue table
 CREATE OR REPLACE FUNCTION public.get_queue_table_name_safe(p_queue_name TEXT)
 RETURNS TEXT LANGUAGE plpgsql SECURITY DEFINER AS $$
@@ -69,3 +70,4 @@ BEGIN
   END;
 END;
 $$;
+

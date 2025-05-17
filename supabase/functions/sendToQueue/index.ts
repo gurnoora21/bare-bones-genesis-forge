@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 
@@ -51,50 +52,96 @@ serve(async (req) => {
 
     // Ensure queue exists
     console.log(`[${executionId}] Creating queue if not exists...`);
-    const { error: createError } = await supabase.rpc('pgmq_create_queue', {
-      queue_name: normalizedQueueName
-    });
-
-    if (createError) {
-      console.error(`[${executionId}] Error creating queue:`, createError);
-      return new Response(
-        JSON.stringify({ 
-          error: 'Failed to create queue',
-          details: createError.message
-        }),
-        { status: 500, headers: corsHeaders }
-      );
+    try {
+      // Try to create the queue directly with proper pgmq schema
+      const { error: createError } = await supabase.rpc('pgmq_create', {
+        queue_name: normalizedQueueName
+      });
+      
+      if (createError && createError.message.includes('function "pgmq_create"')) {
+        // If pgmq_create doesn't exist, try pgmq.create via raw SQL
+        const { error: createRawError } = await supabase.rpc('raw_sql_query', {
+          sql_query: `SELECT pgmq.create($1)`,
+          params: JSON.stringify([normalizedQueueName])
+        });
+        
+        if (createRawError) {
+          console.error(`[${executionId}] Error creating queue with raw SQL:`, createRawError);
+          // Continue anyway - might exist already
+        }
+      } else if (createError) {
+        console.error(`[${executionId}] Error creating queue:`, createError);
+        // Continue anyway - might exist already
+      }
+    } catch (createErr) {
+      console.error(`[${executionId}] Exception creating queue:`, createErr);
+      // Continue anyway - might exist already
     }
+    
     console.log(`[${executionId}] Queue created or already exists`);
 
     // Send message to queue
     console.log(`[${executionId}] Sending message to queue...`);
-    const { data, error } = await supabase.rpc('pgmq_send', {
-      queue_name: normalizedQueueName,
-      message: message,
-      priority: priority || 0
-    });
+    try {
+      // Try using pgmq.send directly with the proper schema
+      const { data, error } = await supabase.rpc('pg_send_text', {
+        queue_name: normalizedQueueName,
+        msg_text: typeof message === 'string' ? message : JSON.stringify(message)
+      });
 
-    if (error) {
-      console.error(`[${executionId}] Error sending message:`, error);
+      if (error) {
+        console.error(`[${executionId}] Error with pg_send_text:`, error);
+        
+        // Fall back to raw SQL to call pgmq.send directly
+        const { data: rawData, error: rawError } = await supabase.rpc('raw_sql_query', {
+          sql_query: `SELECT send FROM pgmq.send($1, $2::jsonb) AS send`,
+          params: JSON.stringify([
+            normalizedQueueName, 
+            typeof message === 'string' ? message : JSON.stringify(message)
+          ])
+        });
+        
+        if (rawError) {
+          console.error(`[${executionId}] Error sending message with raw SQL:`, rawError);
+          return new Response(
+            JSON.stringify({ 
+              error: 'Failed to send message',
+              details: rawError.message
+            }),
+            { status: 500, headers: corsHeaders }
+          );
+        }
+        
+        console.log(`[${executionId}] Message sent successfully via raw SQL, ID:`, rawData);
+        return new Response(
+          JSON.stringify({ 
+            success: true, 
+            message_id: rawData?.result,
+            queue_name: normalizedQueueName
+          }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+
+      console.log(`[${executionId}] Message sent successfully, ID: ${data}`);
+      return new Response(
+        JSON.stringify({ 
+          success: true, 
+          message_id: data,
+          queue_name: normalizedQueueName
+        }),
+        { status: 200, headers: corsHeaders }
+      );
+    } catch (sendError) {
+      console.error(`[${executionId}] Exception sending message:`, sendError);
       return new Response(
         JSON.stringify({ 
           error: 'Failed to send message',
-          details: error.message
+          details: sendError.message
         }),
         { status: 500, headers: corsHeaders }
       );
     }
-
-    console.log(`[${executionId}] Message sent successfully, ID: ${data.message_id}`);
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message_id: data.message_id,
-        queue_name: normalizedQueueName
-      }),
-      { status: 200, headers: corsHeaders }
-    );
   } catch (error) {
     console.error(`[${executionId}] Unexpected error:`, error);
     return new Response(

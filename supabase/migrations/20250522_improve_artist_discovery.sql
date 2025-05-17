@@ -1,4 +1,5 @@
 
+
 -- Create a more reliable function that directly uses pgmq.send for artist discovery
 -- This will ensure the message gets created in the queue without any intermediate steps
 CREATE OR REPLACE FUNCTION public.start_artist_discovery(artist_name TEXT)
@@ -47,3 +48,4 @@ EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'Error checking/creating queue: %', SQLERRM;
 END;
 $$;
+

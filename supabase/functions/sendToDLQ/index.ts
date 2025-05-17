@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 
@@ -35,27 +36,33 @@ serve(async (req) => {
     if (!queue_name || !dlq_name || !message_id || !message) {
       return new Response(
         JSON.stringify({ error: 'Missing required parameters' }),
-        { status: 400 }
+        { status: 400, headers: corsHeaders }
       );
     }
 
     // Normalize the queue names
     const normalizedQueueName = normalizeQueueName(queue_name);
     const normalizedDLQName = normalizeQueueName(dlq_name);
-    console.log(`DEBUG: Normalized queue names - source: ${normalizedQueueName}, DLQ: ${normalizedDLQName}`);
+    console.log(`[${executionId}] Normalized queue names - source: ${normalizedQueueName}, DLQ: ${normalizedDLQName}`);
 
     // Ensure DLQ exists
-    const { error: createError } = await supabase.rpc('pgmq_create_queue', {
-      queue_name: normalizedDLQName
-    });
-
-    if (createError) {
-      console.error('Error creating DLQ:', createError);
-      return new Response(
-        JSON.stringify({ error: 'Failed to create DLQ' }),
-        { status: 500 }
-      );
+    try {
+      // Try to create the queue directly with proper pgmq schema
+      const { error: createError } = await supabase.rpc('raw_sql_query', {
+        sql_query: `SELECT pgmq.create($1)`,
+        params: JSON.stringify([normalizedDLQName])
+      });
+      
+      if (createError) {
+        console.error(`[${executionId}] Error creating DLQ with raw SQL:`, createError);
+        // Continue anyway - might exist already
+      }
+    } catch (createErr) {
+      console.error(`[${executionId}] Exception creating DLQ:`, createErr);
+      // Continue anyway - might exist already
     }
+    
+    console.log(`[${executionId}] DLQ created or already exists`);
 
     // Prepare the DLQ message
     const dlqMessage = {
@@ -68,33 +75,72 @@ serve(async (req) => {
     };
 
     // Send message to DLQ
-    const { data, error } = await supabase.rpc('pgmq_send', {
-      queue_name: normalizedDLQName,
-      message: dlqMessage,
-      priority: 0 // DLQ messages are always high priority
-    });
+    try {
+      // Try using pg_send_text directly with the proper schema
+      const { data, error } = await supabase.rpc('pg_send_text', {
+        queue_name: normalizedDLQName,
+        msg_text: JSON.stringify(dlqMessage)
+      });
 
-    if (error) {
-      console.error('Error sending to DLQ:', error);
+      if (error) {
+        console.error(`[${executionId}] Error with pg_send_text:`, error);
+        
+        // Fall back to raw SQL to call pgmq.send directly
+        const { data: rawData, error: rawError } = await supabase.rpc('raw_sql_query', {
+          sql_query: `SELECT send FROM pgmq.send($1, $2::jsonb) AS send`,
+          params: JSON.stringify([
+            normalizedDLQName, 
+            JSON.stringify(dlqMessage)
+          ])
+        });
+        
+        if (rawError) {
+          console.error(`[${executionId}] Error sending message with raw SQL:`, rawError);
+          return new Response(
+            JSON.stringify({ error: 'Failed to send to DLQ', details: rawError }),
+            { status: 500, headers: corsHeaders }
+          );
+        }
+        
+        console.log(`[${executionId}] Message sent to DLQ successfully via raw SQL`);
+        return new Response(
+          JSON.stringify({ 
+            success: true, 
+            message_id: rawData?.result,
+            dlq_name: normalizedDLQName
+          }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+
+      console.log(`[${executionId}] Message sent to DLQ successfully, ID: ${data}`);
       return new Response(
-        JSON.stringify({ error: 'Failed to send to DLQ' }),
-        { status: 500 }
+        JSON.stringify({ 
+          success: true, 
+          message_id: data,
+          dlq_name: normalizedDLQName
+        }),
+        { status: 200, headers: corsHeaders }
+      );
+    } catch (sendError) {
+      console.error(`[${executionId}] Exception sending message to DLQ:`, sendError);
+      return new Response(
+        JSON.stringify({ 
+          error: 'Failed to send to DLQ',
+          details: sendError.message
+        }),
+        { status: 500, headers: corsHeaders }
       );
     }
-
+  } catch (error) {
+    console.error(`[${executionId}] Unexpected error:`, error);
     return new Response(
       JSON.stringify({ 
-        success: true, 
-        message_id: data.message_id,
-        dlq_name: normalizedDLQName
+        error: 'Internal server error',
+        details: error.message,
+        stack: error.stack
       }),
-      { status: 200 }
-    );
-  } catch (error) {
-    console.error('Unexpected error:', error);
-    return new Response(
-      JSON.stringify({ error: 'Internal server error' }),
-      { status: 500 }
+      { status: 500, headers: corsHeaders }
     );
   }
 });

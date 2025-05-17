@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -6,6 +7,7 @@ import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
 import { StructuredLogger } from "../_shared/structuredLogger.ts";
 import { EnhancedWorkerBase } from "../_shared/enhancedWorkerBase.ts";
 import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
+import { safeStringify, logDebug } from "../_shared/debugHelper.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -142,24 +144,64 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
       }
       
       // Enqueue album discovery for this artist - use consistent dedup key format
+      const albumDedupKey = `album_discovery:artist:${artist.id}:offset:0`;  // Consistent format for deduplication key
       logger.info(`DEBUG: About to enqueue album discovery for artist ${artist.name} (${artist.id})`);
       
       try {
+        // Log the exact dedup key being used
+        logDebug("AlbumDiscovery", "Using deduplication key", albumDedupKey);
+        
+        // Prepare message with more details for better debugging
+        const albumMessage = {
+          spotifyId: artist.id,
+          artistName: artist.name,
+          artistId: artistId,
+          enqueueTime: new Date().toISOString(),
+          requestId: `album-discovery-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
+        };
+        
+        // Try to enqueue the album discovery message
         const enqueueResult = await queueHelper.enqueue(
           'album_discovery',
-          {
-            spotifyId: artist.id,
-            artistName: artist.name
-          },
-          `album_discovery:artist:${artist.id}:offset:0`  // Consistent format for deduplication key
+          albumMessage,
+          albumDedupKey,
+          { ttl: 86400 * 7 } // 7 day TTL to avoid duplicate processing
         );
         
-        logger.info(`DEBUG: Album discovery enqueue result:`, { 
-          success: true,
-          artistName: artist.name,
-          artistId: artist.id,
-          enqueueResult
-        });
+        if (enqueueResult) {
+          logger.info(`DEBUG: Album discovery enqueue result:`, { 
+            success: true,
+            artistName: artist.name,
+            artistId: artist.id,
+            enqueueResult
+          });
+        } else {
+          // If enqueue failed (null result), try direct database function
+          logger.warn(`DEBUG: Failed to enqueue via queueHelper, trying direct database method`, {
+            artistName: artist.name,
+            artistId: artist.id
+          });
+          
+          // Try direct SQL insert as a fallback
+          const { data: directData, error: directError } = await this.supabase.rpc('raw_sql_query', {
+            sql_query: `SELECT pgmq.send($1, $2::jsonb)`,
+            params: JSON.stringify(['album_discovery', JSON.stringify(albumMessage)])
+          });
+          
+          if (directError) {
+            logger.error(`DEBUG: Direct SQL enqueue also failed:`, {
+              error: directError.message,
+              artistName: artist.name,
+              artistId: artist.id
+            });
+          } else {
+            logger.info(`DEBUG: Direct SQL enqueue succeeded:`, {
+              result: directData,
+              artistName: artist.name,
+              artistId: artist.id
+            });
+          }
+        }
       } catch (enqueueError) {
         logger.error(`DEBUG: Failed to enqueue album discovery:`, {
           error: enqueueError.message,
@@ -167,7 +209,9 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
           artistId: artist.id,
           stack: enqueueError.stack
         });
-        throw enqueueError;
+        
+        // Don't throw here - we don't want to fail the artist discovery just because
+        // we couldn't enqueue the album discovery
       }
       
       return { 

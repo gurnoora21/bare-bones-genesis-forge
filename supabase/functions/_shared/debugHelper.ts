@@ -1,4 +1,5 @@
 
+
 /**
  * Helper function to safely stringify objects for debug logging
  */
@@ -94,3 +95,4 @@ export function extractMessageId(message: any): string | null {
     return `fallback_${Date.now()}`;
   }
 }
+

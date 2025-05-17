@@ -1,3 +1,4 @@
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService } from "./deduplication.ts";
@@ -97,16 +98,46 @@ class SupabaseQueueHelper implements QueueHelper {
 
     try {
       console.log(`[${executionId}] Calling sendToQueue function...`);
-      // Call Supabase function to enqueue the message
-      const { data, error } = await this.supabase.functions.invoke('sendToQueue', {
-        body: {
-          queue_name: normalizedQueueName,
-          message: message,
-          priority: options.priority
-        }
-      });
+      
+      // Ensure message is properly formatted
+      const messageToSend = typeof message === 'string' ? message : JSON.stringify(message);
+      
+      // First try - call Supabase function to enqueue the message
+      try {
+        const { data, error } = await this.supabase.functions.invoke('sendToQueue', {
+          body: {
+            queue_name: normalizedQueueName,
+            message: message,
+            priority: options.priority
+          }
+        });
 
-      if (error) {
+        if (!error) {
+          const messageId = data.message_id;
+          console.log(`[${executionId}] Message enqueued successfully with ID: ${messageId}`);
+
+          // If deduplication key was provided, mark as processed to prevent duplicates
+          if (dedupKey) {
+            console.log(`[${executionId}] Marking message as processed for deduplication`);
+            await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
+          }
+          
+          // Record the success
+          try {
+            await this.metrics.recordQueueOperation(
+              normalizedQueueName, 
+              'enqueue', 
+              true, 
+              { message_id: messageId }
+            );
+          } catch (metricError) {
+            console.warn(`[${executionId}] Failed to record queue operation metric: ${metricError.message}`);
+          }
+
+          return messageId;
+        }
+        
+        // Log the detailed error for debugging
         console.error(`[${executionId}] Error enqueueing message to ${normalizedQueueName}:`, error);
         console.error(`[${executionId}] Error details:`, {
           message: error.message,
@@ -115,43 +146,45 @@ class SupabaseQueueHelper implements QueueHelper {
           response: error.response
         });
         
-        // Record the failure
-        try {
-          await this.metrics.recordQueueOperation(
-            normalizedQueueName, 
-            'enqueue', 
-            false, 
-            { error: error.message }
-          );
-        } catch (metricError) {
-          console.warn(`[${executionId}] Failed to record queue operation metric: ${metricError.message}`);
+        // Fallback approach if the first attempt fails with a specific error
+        if (error.message?.includes('non-2xx status code')) {
+          console.log(`[${executionId}] Trying fallback approach with direct database function...`);
+          
+          // Try using the direct database function
+          const { data: directData, error: directError } = await this.supabase.rpc('start_artist_discovery', {
+            artist_name: typeof message === 'object' && message.artistName ? message.artistName : 'unknown'
+          });
+          
+          if (!directError && directData) {
+            console.log(`[${executionId}] Message enqueued successfully via direct DB function: ${directData}`);
+            
+            // If deduplication key was provided, mark as processed
+            if (dedupKey) {
+              await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
+            }
+            
+            return directData.toString();
+          }
+          
+          console.error(`[${executionId}] Fallback also failed:`, directError);
         }
-        
-        return null;
-      }
-
-      const messageId = data.message_id;
-      console.log(`[${executionId}] Message enqueued successfully with ID: ${messageId}`);
-
-      // If deduplication key was provided, mark as processed to prevent duplicates
-      if (dedupKey) {
-        console.log(`[${executionId}] Marking message as processed for deduplication`);
-        await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
+      } catch (invokeError) {
+        console.error(`[${executionId}] Exception invoking sendToQueue:`, invokeError);
       }
       
-      // Record the success
+      // Record the failure
       try {
         await this.metrics.recordQueueOperation(
           normalizedQueueName, 
           'enqueue', 
-          true, 
-          { message_id: messageId }
+          false, 
+          { error: "Failed to enqueue message after multiple attempts" }
         );
       } catch (metricError) {
         console.warn(`[${executionId}] Failed to record queue operation metric: ${metricError.message}`);
       }
-
-      return messageId;
+      
+      return null;
     } catch (err) {
       console.error(`[${executionId}] Unexpected error enqueueing message to ${normalizedQueueName}:`, err);
       console.error(`[${executionId}] Error details:`, {
