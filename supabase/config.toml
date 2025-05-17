@@ -38,12 +38,6 @@ file_size_limit = "50MiB"
 enabled = true
 site_url = "http://localhost:3000"
 
-[auth.email]
-enabled = true
-
-[auth.sms]
-enabled = true
-
 [auth.external.github]
 enabled = true
 client_id = "env(SUPABASE_AUTH_GITHUB_CLIENT_ID)"
@@ -53,9 +47,6 @@ url = "env(SUPABASE_AUTH_GITHUB_URL)"
 [analytics]
 enabled = false
 port = 54327
-
-[experimental]
-trace = false
 
 # Configure Edge Functions
 [functions]
