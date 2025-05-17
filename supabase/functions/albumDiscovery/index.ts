@@ -133,12 +133,22 @@ serve(async (req) => {
             successCount++;
             
             // Delete the message after successful processing
-            await queueHelper.deleteMessage("album_discovery", messageId);
+            try {
+              await queueHelper.deleteMessage("album_discovery", messageId);
+            } catch (deleteErr) {
+              console.error(`Error deleting message ${messageId} after successful processing:`, deleteErr);
+              // Continue processing despite delete error
+            }
           } else if (result.deduped) {
             dedupedCount++;
             
             // Delete the message if it was a duplicate
-            await queueHelper.deleteMessage("album_discovery", messageId);
+            try {
+              await queueHelper.deleteMessage("album_discovery", messageId);
+            } catch (deleteErr) {
+              console.error(`Error deleting duplicate message ${messageId}:`, deleteErr);
+              // Continue processing despite delete error
+            }
           } else if (result.sentToDlq) {
             sentToDlqCount++;
             
@@ -149,13 +159,18 @@ serve(async (req) => {
             // Only send to DLQ if max retries exceeded
             const attempts = message.attempts || 0;
             if (attempts >= MAX_RETRIES) {
-              await queueHelper.sendToDLQ(
-                "album_discovery", 
-                messageId, 
-                msg, 
-                result.error || "Max retries exceeded",
-                { attempts }
-              );
+              try {
+                await queueHelper.sendToDLQ(
+                  "album_discovery", 
+                  messageId, 
+                  msg, 
+                  result.error || "Max retries exceeded",
+                  { attempts }
+                );
+              } catch (dlqErr) {
+                console.error(`Error sending message ${messageId} to DLQ:`, dlqErr);
+                // Continue processing despite DLQ error
+              }
             }
           }
         } catch (messageError) {

@@ -95,6 +95,54 @@ export class DeduplicationMetrics {
   }
   
   /**
+   * Record a queue operation (send, delete, etc)
+   */
+  async recordQueueOperation(
+    queue: string,
+    operation: string,
+    success: boolean,
+    details?: Record<string, any>
+  ): Promise<boolean> {
+    if (this.isCircuitOpen()) return false;
+    
+    try {
+      const date = new Date().toISOString().split('T')[0];
+      const key = `metrics:queue_ops:${date}:${queue}`;
+      
+      // Increment operation counter
+      await this.redis.hincrby(key, `${operation}:${success ? 'success' : 'failure'}`, 1);
+      
+      // Store recent operation details if provided
+      if (details) {
+        const recentKey = `metrics:recent_ops:${queue}:${operation}`;
+        await this.redis.lpush(recentKey, JSON.stringify({
+          timestamp: new Date().toISOString(),
+          success,
+          ...details
+        }));
+        
+        // Trim to last 100 operations
+        await this.redis.ltrim(recentKey, 0, 99);
+        
+        // Set expiration (7 days)
+        await this.redis.expire(recentKey, 60 * 60 * 24 * 7);
+      }
+      
+      // Set expiration (30 days)
+      await this.redis.expire(key, 60 * 60 * 24 * 30);
+      
+      // Reset circuit breaker on success
+      this.resetCircuitBreaker();
+      
+      return true;
+    } catch (error) {
+      this.incrementCircuitFailure();
+      console.error(`Error recording queue operation metric: ${error.message}`);
+      return false;
+    }
+  }
+  
+  /**
    * Record a failed message processing attempt
    */
   async recordFailure(
