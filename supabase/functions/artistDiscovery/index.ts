@@ -5,6 +5,7 @@ import { getSpotifyClient } from "../_shared/spotifyClient.ts";
 import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
 import { StructuredLogger } from "../_shared/structuredLogger.ts";
 import { EnhancedWorkerBase } from "../_shared/enhancedWorkerBase.ts";
+import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -16,6 +17,9 @@ const redis = new Redis({
 const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
 const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
 const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Initialize QueueHelper
+const queueHelper = getQueueHelper(supabase, redis);
 
 // Common CORS headers
 const corsHeaders = {
@@ -140,21 +144,14 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
       // Enqueue album discovery for this artist
       logger.info(`Enqueueing album discovery for artist ${artist.name} (${artist.id})`);
       
-      const queueResult = await this.supabase.functions.invoke('sendToQueue', {
-        body: {
-          queue_name: 'album_discovery',
-          message: {
-            spotifyId: artist.id,
-            artistName: artist.name
-          },
-          idempotency_key: `album_discovery:artist:${artist.id}`
-        }
-      });
-      
-      if (queueResult.error) {
-        logger.error(`Error enqueueing album discovery:`, queueResult.error);
-        throw queueResult.error;
-      }
+      await queueHelper.enqueue(
+        'album_discovery',
+        {
+          spotifyId: artist.id,
+          artistName: artist.name
+        },
+        `album_discovery:artist:${artist.id}`
+      );
       
       return { 
         status: 'completed',
