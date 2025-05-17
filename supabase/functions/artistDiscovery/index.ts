@@ -138,17 +138,16 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
       }
       
       // Enqueue album discovery for this artist
-      logger.info(`Enqueueing album discovery for artist ${artist.name} (${artistId})`);
+      logger.info(`Enqueueing album discovery for artist ${artist.name} (${artist.id})`);
       
       const queueResult = await this.supabase.functions.invoke('sendToQueue', {
         body: {
           queue_name: 'album_discovery',
           message: {
-            artistId: artistId,
-            spotifyArtistId: artist.id,
+            spotifyId: artist.id,
             artistName: artist.name
           },
-          idempotency_key: `album_discovery:artist:${artistId}`
+          idempotency_key: `album_discovery:artist:${artist.id}`
         }
       });
       

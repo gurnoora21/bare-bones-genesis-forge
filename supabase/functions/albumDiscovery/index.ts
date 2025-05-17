@@ -13,7 +13,7 @@ const redis = new Redis({
 });
 
 interface AlbumDiscoveryMsg {
-  artistId: string;
+  spotifyId: string;
   artistName: string;
   offset?: number;
 }
@@ -209,41 +209,41 @@ async function processAlbumMessage(
   sentToDlq?: boolean;
   error?: string;
 }> {
-  const { artistId, artistName, offset = 0 } = msg;
-  console.log(`Processing albums for artist ${artistName} (ID: ${artistId}) at offset ${offset}`);
+  const { spotifyId, artistName, offset = 0 } = msg;
+  console.log(`Processing albums for artist ${artistName} (Spotify ID: ${spotifyId}) at offset ${offset}`);
   
   try {
     // Generate deduplication key
-    const dedupKey = `artist:${artistId}:offset:${offset}`;
+    const dedupKey = `artist:${spotifyId}:offset:${offset}`;
     
     // Check for deduplication
     const isDuplicate = await deduplicationService.isDuplicate(
       'album_discovery',
       dedupKey,
       { logDetails: true },
-      { entityId: artistId }
+      { entityId: spotifyId }
     );
     
     if (isDuplicate) {
-      console.log(`Albums for artist ${artistId} at offset ${offset} already processed, skipping`);
+      console.log(`Albums for artist ${spotifyId} at offset ${offset} already processed, skipping`);
       return { success: true, deduped: true };
     }
     
     // Check if artist exists in DB
     const { data: artist, error: artistError } = await supabase
       .from('artists')
-      .select('id, name')
-      .eq('id', artistId)
+      .select('id, name, spotify_id')
+      .eq('spotify_id', spotifyId)
       .single();
     
     if (artistError || !artist) {
-      console.error(`Artist not found with ID: ${artistId}`);
-      return { success: false, error: `Artist not found: ${artistId}` };
+      console.error(`Artist not found with Spotify ID: ${spotifyId}`);
+      return { success: false, error: `Artist not found: ${spotifyId}` };
     }
     
     // Fetch albums from Spotify in an isolated transaction
-    console.log(`Fetching albums from Spotify for artist ${artistName} (ID: ${artistId})`);
-    const albumsData = await spotifyClient.getArtistAlbums(artistId, offset);
+    console.log(`Fetching albums from Spotify for artist ${artistName} (Spotify ID: ${spotifyId})`);
+    const albumsData = await spotifyClient.getArtistAlbums(spotifyId, offset);
     console.log(`Found ${albumsData.items.length} albums for artist ${artistName} (total: ${albumsData.total})`);
     
     // Process inside a transaction
@@ -289,7 +289,7 @@ async function processAlbumMessage(
           
           // Create artist-album relationship
           await tx.from('artist_albums').insert({
-            artist_id: artistId,
+            artist_id: artist.id, // Use internal DB ID for relationship
             album_id: newAlbum.id,
             is_primary_artist: true
           });
@@ -298,11 +298,11 @@ async function processAlbumMessage(
           await queueHelper.enqueue(
             'track_discovery',
             {
-              albumId: newAlbum.id,
+              spotifyId: album.id,
               albumName: album.name,
-              artistId: artistId
+              artistSpotifyId: spotifyId
             },
-            `album:${newAlbum.id}`
+            `album:${album.id}`
           );
         } catch (albumError) {
           // Log error but continue with next album
@@ -319,11 +319,11 @@ async function processAlbumMessage(
       await queueHelper.enqueue(
         'album_discovery',
         { 
-          artistId, 
+          spotifyId, 
           artistName, 
           offset: newOffset 
         },
-        `artist:${artistId}:offset:${newOffset}`
+        `artist:${spotifyId}:offset:${newOffset}`
       );
     }
     
@@ -332,7 +332,7 @@ async function processAlbumMessage(
       'album_discovery',
       dedupKey,
       86400, // 24 hour TTL
-      { entityId: artistId }
+      { entityId: spotifyId }
     );
     
     return { success: true };

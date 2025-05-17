@@ -1,4 +1,3 @@
-
 /**
  * TrackDiscoveryWorker class
  * Extends EnhancedWorkerBase to provide standardized track discovery functionality
@@ -10,9 +9,9 @@ import { DeduplicationService } from "../deduplication.ts";
 import { SpotifyClient } from "../spotifyClient.ts";
 
 interface TrackDiscoveryMessage {
-  albumId: string;
+  spotifyId: string;
   albumName: string;
-  artistId: string;
+  artistSpotifyId: string;
   offset?: number;
 }
 
@@ -37,23 +36,23 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
    * Implementation of abstract handleMessage method from base class
    */
   async handleMessage(message: TrackDiscoveryMessage, logger: StructuredLogger): Promise<any> {
-    const { albumId, albumName, artistId, offset = 0 } = message;
+    const { spotifyId, albumName, artistSpotifyId, offset = 0 } = message;
     
-    logger.info(`Processing tracks for album ${albumName} (ID: ${albumId}) at offset ${offset}`);
+    logger.info(`Processing tracks for album ${albumName} (Spotify ID: ${spotifyId}) at offset ${offset}`);
     
     // Generate a deduplication key
-    const dedupKey = `album:${albumId}:offset:${offset}`;
+    const dedupKey = `album:${spotifyId}:offset:${offset}`;
     
     // Check if this album+offset was already processed
     const alreadyProcessed = await this.deduplicationService.isDuplicate(
       'track_discovery', 
       dedupKey,
       { logDetails: true },
-      { entityId: albumId }
+      { entityId: spotifyId }
     );
     
     if (alreadyProcessed) {
-      logger.info(`Tracks for album ${albumId} at offset ${offset} already processed, skipping`);
+      logger.info(`Tracks for album ${spotifyId} at offset ${offset} already processed, skipping`);
       return { 
         processed: 0, 
         skipped: true, 
@@ -65,11 +64,11 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
     const { data: album, error: albumError } = await this.supabase
       .from('albums')
       .select('id, spotify_id')
-      .eq('id', albumId)
+      .eq('spotify_id', spotifyId)
       .single();
 
     if (albumError || !album) {
-      const errMsg = `Album not found with ID: ${albumId}`;
+      const errMsg = `Album not found with Spotify ID: ${spotifyId}`;
       logger.error(errMsg);
       throw new Error(errMsg);
     }
@@ -79,28 +78,21 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
     // Get artist from database
     const { data: artist, error: artistError } = await this.supabase
       .from('artists')
-      .select('id, name')
-      .eq('id', artistId)
+      .select('id, name, spotify_id')
+      .eq('spotify_id', artistSpotifyId)
       .single();
 
     if (artistError || !artist) {
-      const errMsg = `Artist not found with ID: ${artistId}`;
+      const errMsg = `Artist not found with Spotify ID: ${artistSpotifyId}`;
       logger.error(errMsg);
       throw new Error(errMsg);
     }
     
     logger.info(`Found artist in database: ${artist.name} (ID: ${artist.id})`);
 
-    // Ensure spotify_id is a string
-    if (typeof album.spotify_id !== 'string') {
-      const errMsg = `Invalid Spotify ID for album ${albumId}: ${album.spotify_id}`;
-      logger.error(errMsg);
-      throw new Error(errMsg);
-    }
-    
     // Fetch tracks from Spotify
-    logger.info(`Fetching tracks from Spotify for album ${albumName} (ID: ${album.spotify_id})`);
-    const tracksData = await this.spotifyClient.getAlbumTracks(album.spotify_id, offset);
+    logger.info(`Fetching tracks from Spotify for album ${albumName} (ID: ${spotifyId})`);
+    const tracksData = await this.spotifyClient.getAlbumTracks(spotifyId, offset);
     logger.info(`Found ${tracksData.items.length} tracks in album ${albumName} (total: ${tracksData.total})`);
 
     if (!tracksData.items || tracksData.items.length === 0) {
@@ -111,14 +103,14 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
         'track_discovery', 
         dedupKey,
         86400, // 24 hour TTL
-        { entityId: albumId }
+        { entityId: spotifyId }
       );
       
       return { processed: 0 };
     }
 
     // Filter tracks that have the artist as primary
-    const tracksToProcess = this.filterTracksWithPrimaryArtist(tracksData.items, artist.id);
+    const tracksToProcess = this.filterTracksWithPrimaryArtist(tracksData.items, artistSpotifyId);
     
     logger.info(`${tracksToProcess.length} tracks have the artist as primary artist`);
 
@@ -131,7 +123,7 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
         'track_discovery', 
         dedupKey,
         86400, // 24 hour TTL
-        { entityId: albumId }
+        { entityId: spotifyId }
       );
       
       return { processed: 0, skipped: true, reason: "no_primary_tracks" };
@@ -179,8 +171,8 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
           'process_track_batch',
           {
             p_track_data: tracksForBatch,
-            p_album_id: albumId,
-            p_artist_id: artistId
+            p_album_id: album.id,
+            p_artist_id: artist.id
           }
         );
         
@@ -207,7 +199,7 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
                 processedTrackIds.push(track.track_id);
                 
                 // Enqueue producer identification
-                await this.enqueueProducerIdentification(track, albumId, artistId);
+                await this.enqueueProducerIdentification(track, album.id, artist.id);
               }
             }
           }
@@ -219,7 +211,7 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
     }
     
     // If there are more tracks, enqueue the next page
-    await this.enqueueNextPageIfNeeded(tracksData, albumId, albumName, artistId, offset);
+    await this.enqueueNextPageIfNeeded(tracksData, album.id, albumName, artist.id, offset);
     
     // Mark this batch as processed
     await this.deduplicationService.markAsProcessed(
@@ -227,7 +219,7 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
       dedupKey,
       86400, // 24 hour TTL
       { 
-        entityId: albumId,
+        entityId: spotifyId,
         processedCount,
         errorCount,
         tracksTotal: tracksData.total
@@ -245,13 +237,12 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
   /**
    * Filter tracks to only include those where the specified artist is primary
    */
-  private filterTracksWithPrimaryArtist(tracks: any[], artistId: string): any[] {
+  private filterTracksWithPrimaryArtist(tracks: any[], artistSpotifyId: string): any[] {
     return tracks.filter(track => {
       // Consider the artist primary if they're the first artist listed
       if (track.artists && track.artists.length > 0) {
-        // Some APIs return artist.id, others might return artist.spotify_id
-        const firstArtistId = track.artists[0].id || track.artists[0].spotify_id;
-        return firstArtistId === artistId;
+        const firstArtistId = track.artists[0].id;
+        return firstArtistId === artistSpotifyId;
       }
       return false;
     });
@@ -301,12 +292,24 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
     artistId: string,
     offset: number
   ): Promise<void> {
+    // Get album from database to get its Spotify ID
+    const { data: album } = await this.supabase
+      .from('albums')
+      .select('spotify_id')
+      .eq('id', albumId)
+      .single();
+
+    if (!album) {
+      this.logger.error(`Album not found with ID: ${albumId}`);
+      return;
+    }
+
     if (tracksData.items.length > 0 && offset + tracksData.items.length < tracksData.total) {
       const newOffset = offset + tracksData.items.length;
       this.logger.info(`Enqueueing next page of tracks for album ${albumName} with offset ${newOffset}`);
       
       // Use an idempotency key for the next page enqueue
-      const nextPageKey = `enqueued:nextpage:${albumId}:${newOffset}`;
+      const nextPageKey = `enqueued:nextpage:${album.spotify_id}:${newOffset}`;
       let nextPageEnqueued = false;
       
       try {
@@ -317,13 +320,25 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
       }
       
       if (!nextPageEnqueued) {
+        // Get artist from database to get its Spotify ID
+        const { data: artist } = await this.supabase
+          .from('artists')
+          .select('spotify_id')
+          .eq('id', artistId)
+          .single();
+
+        if (!artist) {
+          this.logger.error(`Artist not found with ID: ${artistId}`);
+          return;
+        }
+
         // Enqueue next batch with new offset
         await this.enqueueMessage('track_discovery', { 
-          albumId, 
+          spotifyId: album.spotify_id, // Use the album's Spotify ID
           albumName,
-          artistId, 
+          artistSpotifyId: artist.spotify_id, // Use the artist's Spotify ID
           offset: newOffset 
-        }, `album:${albumId}:offset:${newOffset}`);
+        }, `album:${album.spotify_id}:offset:${newOffset}`);
         
         // Mark as enqueued in Redis
         try {
