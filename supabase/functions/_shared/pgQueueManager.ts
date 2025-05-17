@@ -1,4 +1,3 @@
-
 /**
  * PgQueueManager - PostgreSQL-backed Queue Manager using PGMQ
  * 
@@ -103,7 +102,11 @@ export class PgQueueManager {
       // Parse the message data
       let messages: QueueMessage[] = [];
       try {
-        messages = Array.isArray(data) ? data : JSON.parse(data);
+        if (typeof data === 'string') {
+          messages = JSON.parse(data);
+        } else {
+          messages = data;
+        }
         messages = Array.isArray(messages) ? messages : [];
       } catch (parseError) {
         console.error(`Failed to parse queue messages:`, parseError);

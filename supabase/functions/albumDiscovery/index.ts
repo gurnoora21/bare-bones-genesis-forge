@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -65,7 +64,20 @@ serve(async (req) => {
     }
 
     // Parse messages
-    const messages = queueData ? JSON.parse(queueData) : [];
+    let messages;
+    if (typeof queueData === 'string') {
+      try {
+        messages = JSON.parse(queueData);
+      } catch (parseError) {
+        console.error("Error parsing queue data:", parseError);
+        return new Response(JSON.stringify({ error: "Invalid queue data format" }), { 
+          status: 500, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+    } else {
+      messages = queueData;
+    }
     
     if (!messages || messages.length === 0) {
       console.log("No messages to process in album_discovery queue");

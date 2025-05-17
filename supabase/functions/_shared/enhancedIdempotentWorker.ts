@@ -1,4 +1,3 @@
-
 /**
  * EnhancedIdempotentWorker - High-performance worker with PostgreSQL-backed queue
  * 
@@ -89,9 +88,11 @@ export class EnhancedIdempotentWorker<T = any> {
           // Parse the message body
           let body: any;
           try {
-            body = typeof queueMsg.message === 'string' 
-              ? JSON.parse(queueMsg.message) 
-              : queueMsg.message;
+            if (typeof queueMsg.message === 'string') {
+              body = JSON.parse(queueMsg.message);
+            } else {
+              body = queueMsg.message;
+            }
           } catch (parseError) {
             console.error(`[${batchId}] Failed to parse message body: ${parseError.message}`);
             
