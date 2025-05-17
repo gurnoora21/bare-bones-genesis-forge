@@ -246,70 +246,74 @@ async function processAlbumMessage(
     const albumsData = await spotifyClient.getArtistAlbums(spotifyId, offset);
     console.log(`Found ${albumsData.items.length} albums for artist ${artistName} (total: ${albumsData.total})`);
     
-    // Process inside a transaction
-    await supabase.transaction(async (tx: any) => {
-      // Process each album
-      for (const album of albumsData.items) {
-        try {
-          // Check if album already exists
-          const { data: existingAlbum } = await tx
-            .from('albums')
-            .select('id')
-            .eq('spotify_id', album.id)
-            .maybeSingle();
-          
-          if (existingAlbum) {
-            console.log(`Album ${album.name} (${album.id}) already exists, skipping`);
-            continue;
-          }
-          
-          // Insert album
-          const { data: newAlbum, error: insertError } = await tx
-            .from('albums')
-            .insert({
-              name: album.name,
-              spotify_id: album.id,
-              release_date: album.release_date,
-              album_type: album.album_type,
-              total_tracks: album.total_tracks,
-              metadata: {
-                images: album.images,
-                uri: album.uri,
-                markets: album.available_markets,
-                updated_at: new Date().toISOString()
-              }
-            })
-            .select('id')
-            .single();
-          
-          if (insertError) {
-            console.error(`Error inserting album ${album.name}:`, insertError);
-            continue;
-          }
-          
-          // Create artist-album relationship
-          await tx.from('artist_albums').insert({
+    // Process each album sequentially
+    for (const album of albumsData.items) {
+      try {
+        // Check if album already exists
+        const { data: existingAlbum } = await supabase
+          .from('albums')
+          .select('id')
+          .eq('spotify_id', album.id)
+          .maybeSingle();
+        
+        if (existingAlbum) {
+          console.log(`Album ${album.name} (${album.id}) already exists, skipping`);
+          continue;
+        }
+        
+        // Insert album
+        const { data: newAlbum, error: insertError } = await supabase
+          .from('albums')
+          .insert({
+            name: album.name,
+            spotify_id: album.id,
+            release_date: album.release_date,
+            album_type: album.album_type,
+            total_tracks: album.total_tracks,
+            metadata: {
+              images: album.images,
+              uri: album.uri,
+              markets: album.available_markets,
+              updated_at: new Date().toISOString()
+            }
+          })
+          .select('id')
+          .single();
+        
+        if (insertError) {
+          console.error(`Error inserting album ${album.name}:`, insertError);
+          continue;
+        }
+        
+        // Create artist-album relationship
+        const { error: relationError } = await supabase
+          .from('artist_albums')
+          .insert({
             artist_id: artist.id, // Use internal DB ID for relationship
             album_id: newAlbum.id,
             is_primary_artist: true
           });
-          
-          // Enqueue track discovery for this album
-          await queueHelper.enqueue(
-            'track_discovery',
-            {
-              spotifyId: album.id,
-              albumName: album.name,
-              artistSpotifyId: spotifyId
-            },
-            `album:${album.id}`
-          );
-        } catch (albumError) {
-          // Log error but continue with next album
-          console.error(`Error processing album ${album.name}:`, albumError);
+
+        if (relationError) {
+          console.error(`Error creating artist-album relationship for ${album.name}:`, relationError);
+          continue;
         }
+        
+        // Enqueue track discovery for this album
+        await queueHelper.enqueue(
+          'track_discovery',
+          {
+            spotifyId: album.id,
+            albumName: album.name,
+            artistSpotifyId: spotifyId
+          },
+          `album:${album.id}`
+        );
+      } catch (albumError) {
+        // Log error but continue with next album
+        console.error(`Error processing album ${album.name}:`, albumError);
       }
-    });
+    }
     
     // Handle pagination - enqueue next page if needed
     if (albumsData.items.length > 0 && offset + albumsData.items.length < albumsData.total) {
