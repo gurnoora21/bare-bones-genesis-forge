@@ -1,9 +1,10 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
 import { getGeniusClient } from "../_shared/geniusClient.ts";
+import { EnhancedWorkerBase } from "../_shared/enhancedWorkerBase.ts";
+import { StructuredLogger } from "../_shared/structuredLogger.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -23,16 +24,20 @@ const corsHeaders = {
 };
 
 // Define the producer worker implementation
-const EnhancedWorker = createEnhancedWorker('producer_identification', supabase, redis);
+class ProducerIdentificationWorker extends EnhancedWorkerBase {
+  constructor() {
+    super('producer_identification', supabase, 'ProducerIdentification');
+  }
 
-class ProducerIdentificationWorker extends EnhancedWorker {
   async processMessage(message: any): Promise<any> {
-    console.log("Processing producer identification message:", message);
+    const logger = new StructuredLogger({ service: 'producer_identification' });
+    logger.info("Processing producer identification message:", { message });
     
     // Extract track info
     const { trackId, trackName, artistId } = message;
     
     if (!trackId) {
+      logger.error("Message missing trackId");
       throw new Error("Message missing trackId");
     }
     
@@ -40,13 +45,14 @@ class ProducerIdentificationWorker extends EnhancedWorker {
     const dedupKey = `producer:track:${trackId}`;
     
     // Get track details from database
-    const { data: track, error: trackError } = await supabase
+    const { data: track, error: trackError } = await this.supabase
       .from('tracks')
       .select('id, name, spotify_id')
       .eq('id', trackId)
       .single();
     
     if (trackError || !track) {
+      logger.error(`Track not found with ID: ${trackId}`);
       throw new Error(`Track not found with ID: ${trackId}`);
     }
     
@@ -58,7 +64,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       const searchResults = await genius.search(trackName, track.name);
       
       if (!searchResults || !searchResults.hits || searchResults.hits.length === 0) {
-        console.log(`No genius results found for track "${trackName}"`);
+        logger.info(`No genius results found for track "${trackName}"`);
         return { status: 'completed', result: 'no_genius_results' };
       }
       
@@ -69,7 +75,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       const songDetails = await genius.getSong(songId);
       
       if (!songDetails) {
-        console.log(`No song details found for song ID ${songId}`);
+        logger.info(`No song details found for song ID ${songId}`);
         return { status: 'completed', result: 'no_song_details' };
       }
       
@@ -78,12 +84,12 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       
       // Save producers to database
       if (producers.length > 0) {
-        console.log(`Found ${producers.length} producers for track ${trackName}`);
+        logger.info(`Found ${producers.length} producers for track ${trackName}`);
         
         // Process each producer
         for (const producer of producers) {
           // Check if producer already exists
-          const { data: existingProducer } = await supabase
+          const { data: existingProducer } = await this.supabase
             .from('producers')
             .select('id')
             .eq('name', producer.name)
@@ -95,7 +101,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
             producerId = existingProducer.id;
           } else {
             // Insert new producer
-            const { data: newProducer, error: insertError } = await supabase
+            const { data: newProducer, error: insertError } = await this.supabase
               .from('producers')
               .insert({
                 name: producer.name,
@@ -110,7 +116,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
               .single();
               
             if (insertError) {
-              console.error(`Error inserting producer ${producer.name}:`, insertError);
+              logger.error(`Error inserting producer ${producer.name}:`, insertError);
               continue;
             }
             
@@ -118,7 +124,7 @@ class ProducerIdentificationWorker extends EnhancedWorker {
           }
           
           // Create track-producer relationship
-          const { error: relationError } = await supabase
+          const { error: relationError } = await this.supabase
             .from('track_producers')
             .insert({
               track_id: trackId,
@@ -130,17 +136,17 @@ class ProducerIdentificationWorker extends EnhancedWorker {
             .ignore();
             
           if (relationError) {
-            console.error(`Error creating track-producer relationship:`, relationError);
+            logger.error(`Error creating track-producer relationship:`, relationError);
           }
           
           // Enqueue social enrichment for this producer
           // Note: We'll use Redis to deduplicate across workers
           const enrichmentKey = `enqueued:enrichment:${producerId}`;
-          const alreadyEnqueued = await redis.get(enrichmentKey);
+          const alreadyEnqueued = await this.redis.get(enrichmentKey);
           
           if (!alreadyEnqueued) {
             // Enqueue social enrichment task
-            const queueResult = await supabase.functions.invoke('sendToQueue', {
+            const queueResult = await this.supabase.functions.invoke('sendToQueue', {
               body: {
                 queue_name: 'social_enrichment',
                 message: {
@@ -152,15 +158,15 @@ class ProducerIdentificationWorker extends EnhancedWorker {
             });
             
             if (queueResult.error) {
-              console.error(`Failed to enqueue social enrichment:`, queueResult.error);
+              logger.error(`Failed to enqueue social enrichment:`, queueResult.error);
             } else {
               // Mark as enqueued in Redis
-              await redis.set(enrichmentKey, 'true', { ex: 86400 }); // 24 hour TTL
+              await this.redis.set(enrichmentKey, 'true', { ex: 86400 }); // 24 hour TTL
             }
           }
         }
       } else {
-        console.log(`No producers found for track ${trackName}`);
+        logger.info(`No producers found for track ${trackName}`);
       }
       
       return {
@@ -170,9 +176,16 @@ class ProducerIdentificationWorker extends EnhancedWorker {
       };
       
     } catch (error) {
-      console.error(`Error processing track ${trackName}:`, error);
-      throw error; // Re-throw for retry logic
+      logger.error(`Error processing track ${trackName}:`, error);
+      throw error;
     }
+  }
+
+  /**
+   * Required implementation of handleMessage from EnhancedWorkerBase
+   */
+  async handleMessage(message: any, logger: StructuredLogger): Promise<any> {
+    return this.processMessage(message);
   }
 }
 

@@ -4,6 +4,7 @@ import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { getSpotifyClient } from "../_shared/spotifyClient.ts";
 import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
 import { StructuredLogger } from "../_shared/structuredLogger.ts";
+import { EnhancedWorkerBase } from "../_shared/enhancedWorkerBase.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -23,63 +24,17 @@ const corsHeaders = {
 };
 
 // Define the artist worker implementation
-const EnhancedWorker = createEnhancedWorker('artist_discovery', supabase, redis);
-
-class ArtistDiscoveryWorker extends EnhancedWorker {
-  /**
-   * Validate message before processing
-   * FIX: Improved message validation and debug logging
-   */
-  protected validateMessage(message: any, logger: StructuredLogger): boolean {
-    // Log received message structure to help with debugging
-    logger.debug("Validating artist discovery message", { 
-      messageType: typeof message, 
-      messageContent: typeof message === 'object' ? JSON.stringify(message).substring(0, 300) : 'not_object'
-    });
-    
-    if (!message) {
-      logger.error("Message is null or undefined");
-      return false;
-    }
-    
-    // Handle nested message structure from queue
-    let artistMessage = message;
-    
-    // If we have a wrapped message from the queue, extract it
-    if (message.message && typeof message.message === 'object') {
-      artistMessage = message.message;
-      logger.debug("Using nested artist message", { 
-        originalKeys: Object.keys(message),
-        extractedKeys: Object.keys(artistMessage)
-      });
-    } else if (typeof message.message === 'string') {
-      // Try to parse string message as JSON
-      try {
-        const parsed = JSON.parse(message.message);
-        artistMessage = parsed;
-        logger.debug("Parsed string message to JSON", {
-          parsedKeys: Object.keys(parsed)
-        });
-      } catch (e) {
-        logger.warn("Failed to parse message string as JSON", { error: e.message });
-        // Continue with the original message
-      }
-    }
-    
-    // Check for artistName field
-    if (!artistMessage.artistName) {
-      logger.error("Message missing artistName", { message: artistMessage });
-      return false;
-    }
-    
-    return true;
+class ArtistDiscoveryWorker extends EnhancedWorkerBase {
+  constructor() {
+    super('artist_discovery', supabase, 'ArtistDiscovery');
   }
 
   /**
    * Process an artist discovery message
-   * FIX: Improved handling of message structures
    */
-  async handleMessage(message: any, logger: StructuredLogger): Promise<any> {
+  async processMessage(message: any): Promise<any> {
+    const logger = new StructuredLogger({ service: 'artist_discovery' });
+    
     // Handle different message formats more robustly
     let artistMessage = message;
     
@@ -128,7 +83,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
       const artist = searchResponse.artists.items[0];
       
       // Check if artist already exists in database
-      const { data: existingArtist } = await supabase
+      const { data: existingArtist } = await this.supabase
         .from('artists')
         .select('id')
         .eq('spotify_id', artist.id)
@@ -141,7 +96,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
         artistId = existingArtist.id;
         
         // Update the artist
-        await supabase
+        await this.supabase
           .from('artists')
           .update({
             name: artist.name,
@@ -158,7 +113,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
         logger.info(`Creating new artist: ${artist.name}`);
         
         // Insert the artist
-        const { data: newArtist, error: insertError } = await supabase
+        const { data: newArtist, error: insertError } = await this.supabase
           .from('artists')
           .insert({
             name: artist.name,
@@ -185,7 +140,7 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
       // Enqueue album discovery for this artist
       logger.info(`Enqueueing album discovery for artist ${artist.name} (${artistId})`);
       
-      const queueResult = await supabase.functions.invoke('sendToQueue', {
+      const queueResult = await this.supabase.functions.invoke('sendToQueue', {
         body: {
           queue_name: 'album_discovery',
           message: {
@@ -198,20 +153,27 @@ class ArtistDiscoveryWorker extends EnhancedWorker {
       });
       
       if (queueResult.error) {
-        logger.error(`Failed to enqueue album discovery:`, queueResult.error);
-        // Continue anyway, at least the artist was stored
+        logger.error(`Error enqueueing album discovery:`, queueResult.error);
+        throw queueResult.error;
       }
       
-      return {
+      return { 
         status: 'completed',
+        result: 'success',
         artistId,
-        spotifyArtistId: artist.id,
-        name: artist.name
+        spotifyId: artist.id
       };
     } catch (error) {
       logger.error(`Error processing artist ${artistName}:`, error);
-      throw error; // Re-throw for retry logic
+      throw error;
     }
+  }
+
+  /**
+   * Required implementation of handleMessage from EnhancedWorkerBase
+   */
+  async handleMessage(message: any, logger: StructuredLogger): Promise<any> {
+    return this.processMessage(message);
   }
 }
 
