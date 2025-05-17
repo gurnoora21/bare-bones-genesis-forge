@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -68,7 +69,7 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
     const artistName = artistMessage.artistName;
     logger.info("Processing artist discovery message", { artistName });
     
-    // Generate deduplication key
+    // Generate deduplication key with consistent format: artist_discovery:artist:name:{normalized name}
     const dedupKey = `artist_discovery:artist:name:${artistName.toLowerCase()}`;
     
     try {
@@ -141,7 +142,7 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
         artistId = newArtist.id;
       }
       
-      // Enqueue album discovery for this artist
+      // Enqueue album discovery for this artist - use consistent dedup key format
       logger.info(`Enqueueing album discovery for artist ${artist.name} (${artist.id})`);
       
       await queueHelper.enqueue(
@@ -150,7 +151,7 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
           spotifyId: artist.id,
           artistName: artist.name
         },
-        `album_discovery:artist:${artist.id}`
+        `album_discovery:artist:${artist.id}:offset:0`  // Consistent format for deduplication key
       );
       
       return { 

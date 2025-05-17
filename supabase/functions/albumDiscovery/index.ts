@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -167,7 +168,7 @@ serve(async (req) => {
       console.log(`Completed background processing: ${successCount} successful, ${dedupedCount} deduplicated, ${errorCount} failed, ${sentToDlqCount} sent to DLQ`);
       
       try {
-        await supabase.from('queue_metrics').insert({
+        await supabase.from('monitoring.queue_metrics').insert({
           queue_name: "album_discovery",
           operation: "batch_processing",
           processed_count: messages.length,
@@ -213,8 +214,8 @@ async function processAlbumMessage(
   console.log(`Processing albums for artist ${artistName} (Spotify ID: ${spotifyId}) at offset ${offset}`);
   
   try {
-    // Generate deduplication key
-    const dedupKey = `artist:${spotifyId}:offset:${offset}`;
+    // Generate deduplication key - consistent format: album_discovery:artist:{spotifyId}:offset:{offset}
+    const dedupKey = `album_discovery:artist:${spotifyId}:offset:${offset}`;
     
     // Check for deduplication
     const isDuplicate = await deduplicationService.isDuplicate(
@@ -299,7 +300,7 @@ async function processAlbumMessage(
           continue;
         }
         
-        // Enqueue track discovery for this album
+        // Enqueue track discovery for this album - use consistent dedup key format
         await queueHelper.enqueue(
           'track_discovery',
           {
@@ -307,7 +308,7 @@ async function processAlbumMessage(
             albumName: album.name,
             artistSpotifyId: spotifyId
           },
-          `album:${album.id}`
+          `track_discovery:album:${album.id}`  // Consistent format for deduplication key
         );
       } catch (albumError) {
         // Log error but continue with next album
@@ -327,7 +328,7 @@ async function processAlbumMessage(
           artistName, 
           offset: newOffset 
         },
-        `artist:${spotifyId}:offset:${newOffset}`
+        `album_discovery:artist:${spotifyId}:offset:${newOffset}`  // Consistent format for deduplication key
       );
     }
     

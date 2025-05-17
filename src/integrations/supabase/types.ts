@@ -546,6 +546,14 @@ export type Database = {
             }
         Returns: boolean
       }
+      check_operation: {
+        Args: {
+          p_entity_id: string
+          p_entity_type: string
+          p_operation_id: string
+        }
+        Returns: boolean
+      }
       check_worker_crons: {
         Args: Record<PropertyKey, never>
         Returns: {
