@@ -109,7 +109,7 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
       return { processed: 0 };
     }
 
-    // Filter tracks that have the artist as primary
+    // Filter tracks to only include those where the specified artist is the primary artist (first listed)
     const tracksToProcess = this.filterTracksWithPrimaryArtist(tracksData.items, artistSpotifyId);
     
     logger.info(`${tracksToProcess.length} tracks have the artist as primary artist`);
@@ -235,16 +235,23 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
   }
   
   /**
-   * Filter tracks to only include those where the specified artist is primary
+   * Filter tracks to only include those where the specified artist is the primary artist (first listed)
    */
   private filterTracksWithPrimaryArtist(tracks: any[], artistSpotifyId: string): any[] {
     return tracks.filter(track => {
-      // Consider the artist primary if they're the first artist listed
-      if (track.artists && track.artists.length > 0) {
-        const firstArtistId = track.artists[0].id;
-        return firstArtistId === artistSpotifyId;
+      if (!track.artists || track.artists.length === 0) {
+        console.warn(`Track ${track.id} (${track.name}) has no artists listed`);
+        return false;
       }
-      return false;
+
+      const firstArtist = track.artists[0];
+      const isPrimaryArtist = firstArtist.id === artistSpotifyId;
+      
+      if (!isPrimaryArtist) {
+        console.debug(`Track ${track.id} (${track.name}) excluded – first artist is ${firstArtist.name} (${firstArtist.id}), expected ${artistSpotifyId}`);
+      }
+      
+      return isPrimaryArtist;
     });
   }
   

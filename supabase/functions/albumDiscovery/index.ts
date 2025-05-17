@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -292,6 +291,18 @@ async function processAlbumMessage(
     // Process each album sequentially
     for (const album of albumsData.items) {
       try {
+        // Check if the artist is the primary artist of the album
+        if (!album.artists || album.artists.length === 0) {
+          console.warn(`Album ${album.name} (${album.id}) has no artists listed, skipping`);
+          continue;
+        }
+
+        const firstArtist = album.artists[0];
+        if (firstArtist.id !== spotifyId) {
+          console.debug(`Album ${album.name} (${album.id}) excluded – first artist is ${firstArtist.name} (${firstArtist.id}), expected ${spotifyId}`);
+          continue;
+        }
+
         // Check if album already exists
         const { data: existingAlbum } = await supabase
           .from('albums')
