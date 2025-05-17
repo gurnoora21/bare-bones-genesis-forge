@@ -28,6 +28,33 @@ const corsHeaders = {
 // Maximum retries for a message before sending to DLQ
 const MAX_RETRIES = 3;
 
+/**
+ * Format a release date from Spotify to a valid Postgres date format
+ * Handles different formats like "2002", "2002-01", or "2002-01-01"
+ */
+function formatReleaseDate(releaseDate: string | null | undefined): string | null {
+  if (!releaseDate) return null;
+  
+  // If it's already a full date (YYYY-MM-DD), use as is
+  if (/^\d{4}-\d{2}-\d{2}$/.test(releaseDate)) {
+    return releaseDate;
+  }
+  
+  // If it's just a year (YYYY), append -01-01
+  if (/^\d{4}$/.test(releaseDate)) {
+    return `${releaseDate}-01-01`;
+  }
+  
+  // If it's a year and month (YYYY-MM), append -01
+  if (/^\d{4}-\d{2}$/.test(releaseDate)) {
+    return `${releaseDate}-01`;
+  }
+  
+  // If unknown format, return null instead of crashing
+  console.warn(`Unknown release date format: ${releaseDate}`);
+  return null;
+}
+
 serve(async (req) => {
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
@@ -277,21 +304,25 @@ async function processAlbumMessage(
           continue;
         }
         
-        // Insert album - FIXED: Removed album_type field which doesn't exist in our schema
+        // Format the release date properly
+        const formattedReleaseDate = formatReleaseDate(album.release_date);
+        
+        // Insert album - Store album_type and total_tracks in metadata
         const { data: newAlbum, error: insertError } = await supabase
           .from('albums')
           .insert({
             name: album.name,
             spotify_id: album.id,
-            release_date: album.release_date,
+            release_date: formattedReleaseDate,
             artist_id: artist.id,
             cover_url: album.images && album.images[0]?.url,
             metadata: {
               images: album.images,
               uri: album.uri,
               markets: album.available_markets,
-              album_type: album.album_type, // Store album_type in metadata instead
+              album_type: album.album_type, 
               total_tracks: album.total_tracks,
+              release_date_precision: album.release_date_precision,
               updated_at: new Date().toISOString()
             }
           })
