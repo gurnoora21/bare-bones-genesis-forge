@@ -262,19 +262,21 @@ async function processAlbumMessage(
           continue;
         }
         
-        // Insert album
+        // Insert album - FIXED: Removed album_type field which doesn't exist in our schema
         const { data: newAlbum, error: insertError } = await supabase
           .from('albums')
           .insert({
             name: album.name,
             spotify_id: album.id,
             release_date: album.release_date,
-            album_type: album.album_type,
-            total_tracks: album.total_tracks,
+            artist_id: artist.id,
+            cover_url: album.images && album.images[0]?.url,
             metadata: {
               images: album.images,
               uri: album.uri,
               markets: album.available_markets,
+              album_type: album.album_type, // Store album_type in metadata instead
+              total_tracks: album.total_tracks,
               updated_at: new Date().toISOString()
             }
           })
@@ -283,20 +285,6 @@ async function processAlbumMessage(
         
         if (insertError) {
           console.error(`Error inserting album ${album.name}:`, insertError);
-          continue;
-        }
-        
-        // Create artist-album relationship
-        const { error: relationError } = await supabase
-          .from('artist_albums')
-          .insert({
-            artist_id: artist.id, // Use internal DB ID for relationship
-            album_id: newAlbum.id,
-            is_primary_artist: true
-          });
-
-        if (relationError) {
-          console.error(`Error creating artist-album relationship for ${album.name}:`, relationError);
           continue;
         }
         
