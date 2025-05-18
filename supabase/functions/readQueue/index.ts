@@ -32,7 +32,28 @@ serve(async (req) => {
     
     console.log(`Reading up to ${batch_size} messages from queue ${queue_name} with visibility timeout ${visibility_timeout}s`);
     
-    // Call the database function to read messages
+    // Try the updated pgmq_read_safe function first
+    const { data: safeData, error: safeError } = await supabase.rpc('pgmq_read_safe', {
+      queue_name: queue_name,
+      max_messages: batch_size,
+      visibility_timeout: visibility_timeout
+    });
+    
+    if (!safeError && safeData) {
+      console.log(`Successfully read messages using pgmq_read_safe`);
+      const messages = typeof safeData === 'string' ? JSON.parse(safeData) : safeData;
+      
+      return new Response(
+        JSON.stringify(messages || []),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    if (safeError) {
+      console.warn(`pgmq_read_safe error: ${safeError.message}. Falling back to pg_dequeue.`);
+    }
+    
+    // Fall back to pg_dequeue if pgmq_read_safe fails
     const { data, error } = await supabase.rpc('pg_dequeue', {
       queue_name: queue_name,
       batch_size: batch_size,

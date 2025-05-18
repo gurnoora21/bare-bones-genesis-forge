@@ -84,12 +84,13 @@ export async function readQueueMessages(
         logDebug(MODULE_NAME, `Falling back to assumed table name: ${queueTable}`);
         
         // Build SQL that reads messages and sets visibility timeout
+        // Updated to use msg_id instead of id
         const sql = `
           WITH visible_msgs AS (
             SELECT *
             FROM ${queueTable}
             WHERE vt IS NULL
-            ORDER BY id
+            ORDER BY msg_id
             LIMIT ${batchSize}
             FOR UPDATE SKIP LOCKED
           ),
@@ -98,10 +99,10 @@ export async function readQueueMessages(
             SET vt = now() + interval '${visibilityTimeout} seconds',
                 read_ct = COALESCE(read_ct, 0) + 1
             FROM visible_msgs
-            WHERE t.id = visible_msgs.id
+            WHERE t.msg_id = visible_msgs.msg_id
             RETURNING t.*
           )
-          SELECT id, msg_id, message, created_at, vt, read_ct FROM updated`;
+          SELECT msg_id, message, enqueued_at as created_at, vt, read_ct FROM updated`;
         
         const { data: sqlResult, error: sqlError } = await supabase.rpc('raw_sql_query', {
           sql_query: sql
@@ -120,12 +121,13 @@ export async function readQueueMessages(
         logDebug(MODULE_NAME, `Determined queue table name: ${queueTable}`);
         
         // Build SQL that reads messages and sets visibility timeout
+        // Updated to use msg_id instead of id
         const sql = `
           WITH visible_msgs AS (
             SELECT *
             FROM ${queueTable}
             WHERE vt IS NULL
-            ORDER BY id
+            ORDER BY msg_id
             LIMIT ${batchSize}
             FOR UPDATE SKIP LOCKED
           ),
@@ -134,10 +136,10 @@ export async function readQueueMessages(
             SET vt = now() + interval '${visibilityTimeout} seconds',
                 read_ct = COALESCE(read_ct, 0) + 1
             FROM visible_msgs
-            WHERE t.id = visible_msgs.id
+            WHERE t.msg_id = visible_msgs.msg_id
             RETURNING t.*
           )
-          SELECT id, msg_id, message, created_at, vt, read_ct FROM updated`;
+          SELECT msg_id, message, enqueued_at as created_at, vt, read_ct FROM updated`;
         
         const { data: sqlResult, error: sqlError } = await supabase.rpc('raw_sql_query', {
           sql_query: sql
