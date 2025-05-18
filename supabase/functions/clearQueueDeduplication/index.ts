@@ -46,15 +46,26 @@ serve(async (req) => {
         cursor = nextCursor;
         
         if (keys && keys.length > 0) {
+          // Filter out any null or undefined keys
+          const validKeys = keys.filter(key => key != null);
+          
           // Delete in batches to avoid huge commands
-          for (let i = 0; i < keys.length; i += 50) {
-            const batch = keys.slice(i, i + 50);
+          for (let i = 0; i < validKeys.length; i += 50) {
+            const batch = validKeys.slice(i, i + 50);
             if (batch.length > 0) {
               try {
-                const deleteCount = await redis.del(...batch);
-                clearedKeys += deleteCount;
-              } catch (deleteError) {
-                console.warn(`Error deleting batch: ${deleteError.message}`);
+                // Use unlink instead of del for better performance
+                // and handle each key individually to avoid null args
+                for (const key of batch) {
+                  try {
+                    await redis.unlink(key);
+                    clearedKeys++;
+                  } catch (keyError) {
+                    console.warn(`Error deleting key ${key}: ${keyError.message}`);
+                  }
+                }
+              } catch (batchError) {
+                console.warn(`Error processing batch: ${batchError.message}`);
               }
             }
           }
