@@ -788,6 +788,14 @@ export type Database = {
         Args: { p_key: string }
         Returns: boolean
       }
+      pgmq_read_safe: {
+        Args: {
+          queue_name: string
+          max_messages?: number
+          visibility_timeout?: number
+        }
+        Returns: Json
+      }
       process_album_atomic: {
         Args: {
           p_album_data: Json

@@ -9,18 +9,13 @@ import { getDeduplicationMetrics } from "../_shared/metrics.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { validateMessage, AlbumDiscoveryMessageSchema, type AlbumDiscoveryMessage } from "../_shared/types/queueMessages.ts";
 import { readQueueMessages, deleteQueueMessage } from "../_shared/pgmqBridge.ts";
+import { logDebug, logError, logWarning } from "../_shared/debugHelper.ts";
 
 // Initialize Redis client
 const redis = new Redis({
   url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
   token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
 });
-
-interface AlbumDiscoveryMsg {
-  spotifyId: string;
-  artistName: string;
-  offset?: number;
-}
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -57,19 +52,151 @@ function formatReleaseDate(releaseDate: string | null | undefined): string | nul
   return null;
 }
 
-async function processMessage(message: AlbumDiscoveryMessage) {
+/**
+ * Process an album discovery message
+ */
+async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success: boolean, error?: string }> {
   try {
-    // Your existing message processing logic here
-    console.log("Processing album:", message.albumName);
+    const spotifyClient = new SpotifyClient();
+    const queueHelper = getQueueHelper(supabase, redis);
+    const deduplication = getDeduplicationService(redis);
     
-    // Example processing steps:
-    // 1. Fetch album details from Spotify
-    // 2. Store album in database
-    // 3. Enqueue for track discovery
+    // Ensure we have the required fields
+    if (!message.spotifyId || !message.artistName) {
+      throw new Error("Missing required fields: spotifyId and artistName must be provided");
+    }
     
-    return { success: true };
+    console.log(`Processing albums for artist ${message.artistName} (${message.spotifyId})`);
+    
+    // Fetch albums from Spotify
+    const offset = message.offset || 0;
+    const albums = await spotifyClient.getArtistAlbums(message.spotifyId, offset);
+    
+    if (!albums || !albums.items || albums.items.length === 0) {
+      console.log(`No albums found for artist ${message.artistName}`);
+      return { success: true, message: "No albums found" };
+    }
+    
+    console.log(`Found ${albums.items.length} albums for artist ${message.artistName}`);
+    
+    // Process each album
+    const artistId = message.artistId;
+    const results = [];
+    
+    for (const album of albums.items) {
+      // Generate a consistent deduplication key
+      const dedupKey = `album_discovery:album:${album.id}`;
+      
+      // Check if we've already processed this album
+      const isDuplicate = await deduplication.checkAndSet(dedupKey, { ttl: 86400 * 30 });
+      if (isDuplicate) {
+        console.log(`Album ${album.name} (${album.id}) already processed, skipping`);
+        continue;
+      }
+      
+      // Insert album into database
+      try {
+        const { data: existingAlbum } = await supabase
+          .from('albums')
+          .select('id')
+          .eq('spotify_id', album.id)
+          .maybeSingle();
+          
+        let albumId;
+        
+        if (existingAlbum) {
+          albumId = existingAlbum.id;
+          console.log(`Album ${album.name} already exists, updating`);
+          
+          await supabase
+            .from('albums')
+            .update({
+              name: album.name,
+              release_date: formatReleaseDate(album.release_date),
+              cover_url: album.images?.[0]?.url,
+              metadata: {
+                album_type: album.album_type,
+                total_tracks: album.total_tracks,
+                updated_at: new Date().toISOString()
+              }
+            })
+            .eq('id', albumId);
+        } else {
+          console.log(`Creating new album: ${album.name}`);
+          
+          const { data: newAlbum, error: insertError } = await supabase
+            .from('albums')
+            .insert({
+              artist_id: artistId,
+              name: album.name,
+              spotify_id: album.id,
+              release_date: formatReleaseDate(album.release_date),
+              cover_url: album.images?.[0]?.url,
+              metadata: {
+                album_type: album.album_type,
+                total_tracks: album.total_tracks,
+                created_at: new Date().toISOString()
+              }
+            })
+            .select('id')
+            .single();
+            
+          if (insertError) {
+            console.error(`Error inserting album ${album.name}:`, insertError);
+            continue;
+          }
+          
+          albumId = newAlbum.id;
+        }
+        
+        // Enqueue track discovery for this album
+        const trackDedupKey = `track_discovery:album:${album.id}:offset:0`;
+        const trackMessage = {
+          albumId,
+          albumName: album.name,
+          spotifyId: album.id,
+          artistId,
+          artistName: message.artistName,
+          offset: 0,
+          totalTracks: album.total_tracks || 50
+        };
+        
+        const trackEnqueueResult = await queueHelper.enqueue(
+          'track_discovery',
+          trackMessage,
+          trackDedupKey,
+          { ttl: 86400 * 7 }
+        );
+        
+        console.log(`Enqueued track discovery for album ${album.name}, message ID: ${trackEnqueueResult}`);
+        results.push({ albumId, albumName: album.name, tracksEnqueued: true });
+      } catch (error) {
+        console.error(`Error processing album ${album.name}:`, error);
+      }
+    }
+    
+    // If there are more albums, enqueue the next batch
+    if (albums.next) {
+      const nextOffset = offset + albums.limit;
+      const nextDedupKey = `album_discovery:artist:${message.spotifyId}:offset:${nextOffset}`;
+      
+      await queueHelper.enqueue(
+        QUEUE_NAME,
+        { ...message, offset: nextOffset },
+        nextDedupKey,
+        { ttl: 86400 * 7 }
+      );
+      
+      console.log(`Enqueued next batch of albums for ${message.artistName}, offset: ${nextOffset}`);
+    }
+    
+    return { 
+      success: true,
+      albums: results.length,
+      hasMore: !!albums.next
+    };
   } catch (error) {
-    console.error("Error processing message:", error);
+    console.error("Error processing album discovery message:", error);
     return { success: false, error: error.message };
   }
 }
@@ -80,7 +207,7 @@ serve(async (req) => {
   }
 
   try {
-    // Use our new bridge function to read messages from the queue
+    // Use our bridge function to read messages from the queue
     console.log(`Reading messages from ${QUEUE_NAME} queue using bridge function`);
     const messages = await readQueueMessages(
       supabase,
@@ -110,9 +237,14 @@ serve(async (req) => {
           ? JSON.parse(message.message) 
           : message.message;
         
+        if (!messageBody) {
+          throw new Error(`Invalid message format: message body is empty or null`);
+        }
+        
         const validatedMessage = validateMessage(AlbumDiscoveryMessageSchema, messageBody);
         
         // Process the validated message
+        console.log(`Processing album discovery for artist: ${validatedMessage.artistName}`);
         const result = await processMessage(validatedMessage);
         
         if (result.success) {
@@ -120,7 +252,7 @@ serve(async (req) => {
           console.log(`Processing successful, deleting message ID: ${message.id}`);
           await deleteQueueMessage(supabase, QUEUE_NAME, message.id);
           
-          results.push({ id: message.id, status: "success" });
+          results.push({ id: message.id, status: "success", ...result });
         } else {
           errors.push({ id: message.id, error: result.error });
         }
@@ -129,7 +261,7 @@ serve(async (req) => {
         errors.push({ id: message.id, error: error.message });
         
         // If it's a validation error, send to DLQ
-        if (error.message.includes("Invalid message format")) {
+        if (error.message.includes("Invalid message format") || error.message.includes("Required")) {
           console.log(`Validation error, sending message ${message.id} to DLQ`);
           try {
             await supabase.rpc("move_to_dead_letter_queue", {

@@ -1,12 +1,12 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { getSpotifyClient } from "../_shared/spotifyClient.ts";
-import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
-import { StructuredLogger } from "../_shared/structuredLogger.ts";
 import { EnhancedWorkerBase } from "../_shared/enhancedWorkerBase.ts";
+import { StructuredLogger } from "../_shared/structuredLogger.ts";
 import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
-import { safeStringify, logDebug } from "../_shared/debugHelper.ts";
+import { safeStringify, logDebug, logError, logWarning } from "../_shared/debugHelper.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { validateMessage, ArtistDiscoveryMessageSchema, type ArtistDiscoveryMessage } from "../_shared/types/queueMessages.ts";
 import { readQueueMessages, deleteQueueMessage } from "../_shared/pgmqBridge.ts";
@@ -300,6 +300,25 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
   }
 }
 
+// Function to process a message through the worker class
+async function processMessage(message: ArtistDiscoveryMessage): Promise<{ success: boolean, error?: string }> {
+  try {
+    const worker = new ArtistDiscoveryWorker();
+    const result = await worker.processMessage(message);
+    
+    return { 
+      success: true,
+      ...result 
+    };
+  } catch (error) {
+    logError("ArtistDiscovery", `Error processing artist message: ${error.message}`, error);
+    return { 
+      success: false, 
+      error: error.message 
+    };
+  }
+}
+
 // Process a batch of artist discovery messages
 async function processArtistDiscovery() {
   const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -349,7 +368,7 @@ serve(async (req) => {
   try {
     console.log("Artist Discovery worker starting");
     
-    // Use our new bridge function to read messages from the queue
+    // Use our bridge function to read messages from the queue
     console.log(`Reading messages from ${QUEUE_NAME} queue using bridge function`);
     const messages = await readQueueMessages(
       supabase,
@@ -379,6 +398,10 @@ serve(async (req) => {
           ? JSON.parse(message.message)
           : message.message;
           
+        if (!messageBody) {
+          throw new Error(`Invalid message format: message body is empty or null`);
+        }
+          
         const validatedMessage = validateMessage(ArtistDiscoveryMessageSchema, messageBody);
         
         // Process the validated message
@@ -390,7 +413,7 @@ serve(async (req) => {
           console.log(`Processing successful, deleting message ID: ${message.id}`);
           await deleteQueueMessage(supabase, QUEUE_NAME, message.id);
           
-          results.push({ id: message.id, status: "success" });
+          results.push({ id: message.id, status: "success", ...result });
         } else {
           errors.push({ id: message.id, error: result.error });
         }
@@ -399,7 +422,7 @@ serve(async (req) => {
         errors.push({ id: message.id, error: error.message });
         
         // If it's a validation error, send to DLQ
-        if (error.message.includes("Invalid message format")) {
+        if (error.message.includes("Invalid message format") || error.message.includes("Required")) {
           console.log(`Validation error, sending message ${message.id} to DLQ`);
           try {
             await supabase.rpc("move_to_dead_letter_queue", {

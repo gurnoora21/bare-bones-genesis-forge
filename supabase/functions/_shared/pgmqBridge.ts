@@ -7,9 +7,12 @@
  * public.pgmq_read function could not be found.
  */
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { logDebug, logError, logWarning } from "./debugHelper.ts";
+
+const MODULE_NAME = "PGMQBridge";
 
 /**
- * Read messages from a PGMQ queue using direct table access as a fallback
+ * Read messages from a PGMQ queue using multiple fallback methods
  * when pgmq_read RPC function isn't accessible
  */
 export async function readQueueMessages(
@@ -19,10 +22,33 @@ export async function readQueueMessages(
   visibilityTimeout: number = 30
 ): Promise<any[]> {
   try {
-    console.log(`Attempting to read from queue ${queueName} using reliable method`);
+    logDebug(MODULE_NAME, `Reading messages from queue ${queueName} with batch size ${batchSize}`);
 
-    // First try: Use the pg_dequeue function which is our custom wrapper
+    // First try: Use the pgmq_read_safe function which is our safe wrapper
     try {
+      logDebug(MODULE_NAME, "Attempting to use pgmq_read_safe function...");
+      const { data: safeData, error: safeError } = await supabase.rpc('pgmq_read_safe', {
+        queue_name: queueName,
+        max_messages: batchSize,
+        visibility_timeout: visibilityTimeout
+      });
+
+      if (!safeError && safeData) {
+        logDebug(MODULE_NAME, `Successfully read ${Array.isArray(safeData) ? safeData.length : 0} messages using pgmq_read_safe`);
+        return Array.isArray(safeData) ? safeData : 
+               (typeof safeData === 'string' ? JSON.parse(safeData) : []);
+      }
+      
+      if (safeError) {
+        logWarning(MODULE_NAME, `pgmq_read_safe error: ${safeError.message}. Trying alternate methods...`);
+      }
+    } catch (readSafeErr) {
+      logWarning(MODULE_NAME, `pgmq_read_safe exception: ${readSafeErr.message || readSafeErr}`);
+    }
+    
+    // Second try: Use pg_dequeue function
+    try {
+      logDebug(MODULE_NAME, "Attempting to use pg_dequeue function...");
       const { data: pgDequeueData, error: pgDequeueError } = await supabase.rpc('pg_dequeue', {
         queue_name: queueName,
         batch_size: batchSize,
@@ -30,21 +56,21 @@ export async function readQueueMessages(
       });
 
       if (!pgDequeueError && pgDequeueData) {
-        console.log(`Successfully read ${Array.isArray(pgDequeueData) ? pgDequeueData.length : 0} messages using pg_dequeue`);
+        logDebug(MODULE_NAME, `Successfully read ${Array.isArray(pgDequeueData) ? pgDequeueData.length : 0} messages using pg_dequeue`);
         return Array.isArray(pgDequeueData) ? pgDequeueData : 
                (typeof pgDequeueData === 'string' ? JSON.parse(pgDequeueData) : []);
       }
       
       if (pgDequeueError) {
-        console.warn(`pg_dequeue error: ${pgDequeueError.message}. Trying alternate methods...`);
+        logWarning(MODULE_NAME, `pg_dequeue error: ${pgDequeueError.message}. Trying alternate methods...`);
       }
     } catch (pgDequeueErr) {
-      console.warn(`pg_dequeue exception: ${pgDequeueErr.message || pgDequeueErr}`);
+      logWarning(MODULE_NAME, `pg_dequeue exception: ${pgDequeueErr.message || pgDequeueErr}`);
     }
 
-    // Second try: Use direct SQL via raw_sql_query function
+    // Third try: Use direct SQL via raw_sql_query function
     try {
-      console.log(`Attempting direct SQL query for queue ${queueName}`);
+      logDebug(MODULE_NAME, `Attempting direct SQL query for queue ${queueName}`);
       
       // Get the actual queue table name using a helper function
       const { data: queueTableResult, error: tableError } = await supabase.rpc('get_queue_table_name_safe', {
@@ -52,10 +78,10 @@ export async function readQueueMessages(
       });
       
       if (tableError || !queueTableResult) {
-        console.warn(`Could not determine queue table name: ${tableError?.message || 'No result'}`);
+        logWarning(MODULE_NAME, `Could not determine queue table name: ${tableError?.message || 'No result'}`);
         // Fallback to standard pattern
         const queueTable = `pgmq.q_${queueName}`;
-        console.log(`Falling back to assumed table name: ${queueTable}`);
+        logDebug(MODULE_NAME, `Falling back to assumed table name: ${queueTable}`);
         
         // Build SQL that reads messages and sets visibility timeout
         const sql = `
@@ -82,16 +108,16 @@ export async function readQueueMessages(
         });
         
         if (sqlError) {
-          console.error(`Direct SQL error: ${sqlError.message}`);
+          logError(MODULE_NAME, `Direct SQL error: ${sqlError.message}`);
           throw sqlError;
         }
         
-        console.log(`Successfully read ${Array.isArray(sqlResult) ? sqlResult.length : 0} messages using direct SQL`);
+        logDebug(MODULE_NAME, `Successfully read ${Array.isArray(sqlResult) ? sqlResult.length : 0} messages using direct SQL`);
         return sqlResult || [];
       } else {
         // We got the table name, now use it
         const queueTable = queueTableResult;
-        console.log(`Determined queue table name: ${queueTable}`);
+        logDebug(MODULE_NAME, `Determined queue table name: ${queueTable}`);
         
         // Build SQL that reads messages and sets visibility timeout
         const sql = `
@@ -118,20 +144,20 @@ export async function readQueueMessages(
         });
         
         if (sqlError) {
-          console.error(`Direct SQL error: ${sqlError.message}`);
+          logError(MODULE_NAME, `Direct SQL error: ${sqlError.message}`);
           throw sqlError;
         }
         
-        console.log(`Successfully read ${Array.isArray(sqlResult) ? sqlResult.length : 0} messages using direct SQL`);
+        logDebug(MODULE_NAME, `Successfully read ${Array.isArray(sqlResult) ? sqlResult.length : 0} messages using direct SQL`);
         return sqlResult || [];
       }
     } catch (directErr) {
-      console.error(`Direct SQL access error: ${directErr.message || directErr}`);
+      logError(MODULE_NAME, `Direct SQL access error: ${directErr.message || directErr}`);
     }
 
-    // Third try: Use the readQueue edge function if available
+    // Fourth try: Use the readQueue edge function if available
     try {
-      console.log(`Attempting to call readQueue edge function as fallback`);
+      logDebug(MODULE_NAME, `Attempting to call readQueue edge function as fallback`);
       const { data: functionData, error: functionError } = await supabase.functions.invoke('readQueue', {
         body: { 
           queue_name: queueName, 
@@ -141,22 +167,22 @@ export async function readQueueMessages(
       });
       
       if (functionError) {
-        console.error(`readQueue function error: ${functionError.message}`);
+        logError(MODULE_NAME, `readQueue function error: ${functionError.message}`);
         throw functionError;
       }
       
-      console.log(`Successfully read messages using readQueue function`);
+      logDebug(MODULE_NAME, `Successfully read messages using readQueue function`);
       return functionData || [];
     } catch (funcErr) {
-      console.error(`readQueue function error: ${funcErr.message || funcErr}`);
+      logError(MODULE_NAME, `readQueue function error: ${funcErr.message || funcErr}`);
     }
     
     // All methods failed
-    console.error(`All queue reading methods failed for ${queueName}`);
+    logError(MODULE_NAME, `All queue reading methods failed for ${queueName}`);
     return [];
     
   } catch (error) {
-    console.error(`Fatal error in readQueueMessages for ${queueName}: ${error.message}`);
+    logError(MODULE_NAME, `Fatal error in readQueueMessages for ${queueName}: ${error.message}`);
     return [];
   }
 }
@@ -170,7 +196,7 @@ export async function deleteQueueMessage(
   messageId: string
 ): Promise<boolean> {
   try {
-    console.log(`Attempting to delete message ${messageId} from queue ${queueName}`);
+    logDebug(MODULE_NAME, `Attempting to delete message ${messageId} from queue ${queueName}`);
 
     // First try: Use the ensure_message_deleted function which has multiple fallbacks built in
     try {
@@ -181,15 +207,15 @@ export async function deleteQueueMessage(
       });
       
       if (!ensureError && ensureData === true) {
-        console.log(`Successfully deleted message ${messageId} using ensure_message_deleted`);
+        logDebug(MODULE_NAME, `Successfully deleted message ${messageId} using ensure_message_deleted`);
         return true;
       }
       
       if (ensureError) {
-        console.warn(`ensure_message_deleted error: ${ensureError.message}. Trying alternate methods...`);
+        logWarning(MODULE_NAME, `ensure_message_deleted error: ${ensureError.message}. Trying alternate methods...`);
       }
     } catch (ensureErr) {
-      console.warn(`ensure_message_deleted exception: ${ensureErr.message || ensureErr}`);
+      logWarning(MODULE_NAME, `ensure_message_deleted exception: ${ensureErr.message || ensureErr}`);
     }
 
     // Second try: Use pg_delete_message function
@@ -200,15 +226,15 @@ export async function deleteQueueMessage(
       });
       
       if (!deleteError && deleteData === true) {
-        console.log(`Successfully deleted message ${messageId} using pg_delete_message`);
+        logDebug(MODULE_NAME, `Successfully deleted message ${messageId} using pg_delete_message`);
         return true;
       }
       
       if (deleteError) {
-        console.warn(`pg_delete_message error: ${deleteError.message}. Trying alternate methods...`);
+        logWarning(MODULE_NAME, `pg_delete_message error: ${deleteError.message}. Trying alternate methods...`);
       }
     } catch (deleteErr) {
-      console.warn(`pg_delete_message exception: ${deleteErr.message || deleteErr}`);
+      logWarning(MODULE_NAME, `pg_delete_message exception: ${deleteErr.message || deleteErr}`);
     }
 
     // Third try: Use direct_pgmq_delete function
@@ -219,23 +245,23 @@ export async function deleteQueueMessage(
       });
       
       if (!directError && directData === true) {
-        console.log(`Successfully deleted message ${messageId} using direct_pgmq_delete`);
+        logDebug(MODULE_NAME, `Successfully deleted message ${messageId} using direct_pgmq_delete`);
         return true;
       }
       
       if (directError) {
-        console.warn(`direct_pgmq_delete error: ${directError.message}. Trying final method...`);
+        logWarning(MODULE_NAME, `direct_pgmq_delete error: ${directError.message}. Trying final method...`);
       }
     } catch (directErr) {
-      console.warn(`direct_pgmq_delete exception: ${directErr.message || directErr}`);
+      logWarning(MODULE_NAME, `direct_pgmq_delete exception: ${directErr.message || directErr}`);
     }
 
     // All methods failed
-    console.error(`All queue deletion methods failed for message ${messageId} in queue ${queueName}`);
+    logError(MODULE_NAME, `All queue deletion methods failed for message ${messageId} in queue ${queueName}`);
     return false;
     
   } catch (error) {
-    console.error(`Fatal error in deleteQueueMessage for ${queueName}: ${error.message}`);
+    logError(MODULE_NAME, `Fatal error in deleteQueueMessage for ${queueName}: ${error.message}`);
     return false;
   }
 }

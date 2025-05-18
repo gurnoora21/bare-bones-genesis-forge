@@ -62,3 +62,19 @@ EXCEPTION WHEN OTHERS THEN
   RETURN '[]'::JSONB;
 END;
 $$;
+
+-- Create a synonym for pgmq_read that calls pgmq_read_safe
+-- This helps existing code that expects pgmq_read to work
+CREATE OR REPLACE FUNCTION public.pgmq_read(
+  max_messages INTEGER, 
+  queue_name TEXT,
+  visibility_timeout INTEGER DEFAULT 30
+)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  RETURN public.pgmq_read_safe(queue_name, max_messages, visibility_timeout);
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'pgmq_read wrapper error: %', SQLERRM;
+  RETURN '[]'::JSONB;
+END;
+$$;
