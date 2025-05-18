@@ -1,7 +1,8 @@
+
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { logDebug, formatError } from "../_shared/debugHelper.ts";
-import { ProcessingResult } from "../_shared/types.ts";
+import { logDebug, formatError } from "../debugHelper.ts";
+import { ProcessingResult } from "../types.ts";
 import * as queueHelper from '../queueHelper.ts';
 
 interface BatchProcessingOptions {
