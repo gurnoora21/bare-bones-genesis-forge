@@ -18,12 +18,13 @@ BEGIN
   SELECT public.get_queue_table_name_safe(queue_name) INTO queue_table;
   
   -- Build a dynamic SQL statement to read from the queue
+  -- Fixed the query to use msg_id instead of id
   dynamic_sql := format(
     'WITH visible_msgs AS (
       SELECT *
       FROM %s
       WHERE vt IS NULL
-      ORDER BY id
+      ORDER BY msg_id
       LIMIT %s
       FOR UPDATE SKIP LOCKED
     ),
@@ -32,15 +33,15 @@ BEGIN
       SET vt = now() + interval ''%s seconds'',
           read_ct = COALESCE(read_ct, 0) + 1
       FROM visible_msgs
-      WHERE t.id = visible_msgs.id
+      WHERE t.msg_id = visible_msgs.msg_id
       RETURNING t.*
     )
     SELECT jsonb_agg(
       jsonb_build_object(
-        ''id'', id::TEXT,
+        ''id'', msg_id::TEXT,
         ''msg_id'', msg_id::TEXT,
         ''message'', message,
-        ''created_at'', created_at,
+        ''created_at'', enqueued_at,
         ''vt'', vt,
         ''read_ct'', read_ct
       )
