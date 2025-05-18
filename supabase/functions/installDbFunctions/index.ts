@@ -158,23 +158,67 @@ serve(async (req) => {
     COMMENT ON FUNCTION pg_delete_message IS 'Reliably deletes a message by ID from a queue with fallback strategies';
     `;
     
-    // Execute the SQL to install the function
-    const { error: pgDeleteMessageError } = await supabase.rpc('execute_sql', { sql: pgDeleteMessageSql });
+    // Execute the SQL to install the function directly using a POST request
+    const response = await fetch(`${supabaseUrl}/rest/v1/rpc/pg_delete_message_install`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${supabaseKey}`,
+        'apikey': supabaseKey
+      },
+      body: JSON.stringify({})
+    });
     
-    if (pgDeleteMessageError) {
-      console.error("Error installing pg_delete_message function:", pgDeleteMessageError);
-      return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: pgDeleteMessageError.message,
-          details: "Failed to install pg_delete_message function"
-        }),
-        { 
-          status: 500, 
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
-      );
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Error installing pg_delete_message function:", errorText);
+      
+      // Create the function using a direct SQL query
+      console.log("Attempting to create function using direct SQL...");
+      
+      // First create the installation function if it doesn't exist
+      await fetch(`${supabaseUrl}/rest/v1/`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${supabaseKey}`,
+          'apikey': supabaseKey,
+          'Prefer': 'params=single-object'
+        },
+        body: JSON.stringify({
+          query: `
+          CREATE OR REPLACE FUNCTION public.pg_delete_message_install()
+          RETURNS BOOLEAN AS $$
+          BEGIN
+            ${pgDeleteMessageSql}
+            RETURN TRUE;
+          EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Error installing function: %', SQLERRM;
+            RETURN FALSE;
+          END;
+          $$ LANGUAGE plpgsql SECURITY DEFINER;
+          `
+        })
+      });
+      
+      // Then call the installation function
+      const installResponse = await fetch(`${supabaseUrl}/rest/v1/rpc/pg_delete_message_install`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${supabaseKey}`,
+          'apikey': supabaseKey
+        },
+        body: JSON.stringify({})
+      });
+      
+      if (!installResponse.ok) {
+        const installErrorText = await installResponse.text();
+        console.error("Error calling installation function:", installErrorText);
+        throw new Error(`Failed to install pg_delete_message function: ${installErrorText}`);
+      }
     }
+    
     
     console.log("Successfully installed pg_delete_message function");
     
