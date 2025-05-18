@@ -133,44 +133,56 @@ RETURNS TABLE(
   record_count BIGINT
 ) AS $$
 DECLARE
+  r RECORD;
   query_text TEXT;
 BEGIN
   IF p_queue_name IS NOT NULL THEN
-    -- For pgmq schema with q_ prefix
-    query_text := format(
-      'SELECT %L::TEXT, %L::TEXT, %L::TEXT, 
-       (SELECT COUNT(*)::BIGINT FROM pgmq.q_%I WHERE TRUE)',
-      'pgmq', 
-      'q_' || p_queue_name, 
-      'pgmq.q_' || p_queue_name,
-      p_queue_name
-    );
+    -- Check if the pgmq.q_* version exists and return its info
+    BEGIN
+      query_text := format(
+        $fmt$
+        SELECT 
+          %L::TEXT as schema_name, 
+          %L::TEXT as table_name, 
+          %L::TEXT as full_name, 
+          COUNT(*)::BIGINT as record_count 
+        FROM pgmq.q_%I
+        $fmt$,
+        'pgmq', 
+        'q_' || p_queue_name, 
+        'pgmq.q_' || p_queue_name,
+        p_queue_name
+      );
+      
+      RETURN QUERY EXECUTE query_text;
+    EXCEPTION WHEN OTHERS THEN
+      -- If query above fails, the table might not exist or might be in public schema
+      -- Just continue to the next check
+      RAISE NOTICE 'Error checking pgmq.q_%: %', p_queue_name, SQLERRM;
+    END;
     
-    query_text := query_text || format(
-      ' WHERE EXISTS (SELECT 1 FROM information_schema.tables t 
-       WHERE t.table_schema = %L AND t.table_name = %L)',
-      'pgmq', 'q_' || p_queue_name
-    );
-    
-    RETURN QUERY EXECUTE query_text;
-    
-    -- For public schema with pgmq_ prefix
-    query_text := format(
-      'SELECT %L::TEXT, %L::TEXT, %L::TEXT, 
-       (SELECT COUNT(*)::BIGINT FROM public.pgmq_%I WHERE TRUE)',
-      'public', 
-      'pgmq_' || p_queue_name, 
-      'public.pgmq_' || p_queue_name,
-      p_queue_name
-    );
-    
-    query_text := query_text || format(
-      ' WHERE EXISTS (SELECT 1 FROM information_schema.tables t 
-       WHERE t.table_schema = %L AND t.table_name = %L)',
-      'public', 'pgmq_' || p_queue_name
-    );
-    
-    RETURN QUERY EXECUTE query_text;
+    -- Check if the public.pgmq_* version exists and return its info
+    BEGIN
+      query_text := format(
+        $fmt$
+        SELECT 
+          %L::TEXT as schema_name, 
+          %L::TEXT as table_name, 
+          %L::TEXT as full_name, 
+          COUNT(*)::BIGINT as record_count 
+        FROM public.pgmq_%I
+        $fmt$,
+        'public', 
+        'pgmq_' || p_queue_name, 
+        'public.pgmq_' || p_queue_name,
+        p_queue_name
+      );
+      
+      RETURN QUERY EXECUTE query_text;
+    EXCEPTION WHEN OTHERS THEN
+      -- If this fails too, the queue might not exist at all
+      RAISE NOTICE 'Error checking public.pgmq_%: %', p_queue_name, SQLERRM;
+    END;
   ELSE
     -- List all queue tables in both schemas
     RETURN QUERY
