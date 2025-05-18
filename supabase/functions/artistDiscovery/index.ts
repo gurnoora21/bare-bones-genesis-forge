@@ -1,5 +1,5 @@
-import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { getSpotifyClient } from "../_shared/spotifyClient.ts";
 import { createEnhancedWorker } from "../_shared/enhancedQueueWorker.ts";
@@ -7,6 +7,8 @@ import { StructuredLogger } from "../_shared/structuredLogger.ts";
 import { EnhancedWorkerBase } from "../_shared/enhancedWorkerBase.ts";
 import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
 import { safeStringify, logDebug } from "../_shared/debugHelper.ts";
+import { corsHeaders } from "../_shared/cors.ts";
+import { validateMessage, ArtistDiscoveryMessageSchema, type ArtistDiscoveryMessage } from "../_shared/types/queueMessages.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -15,18 +17,16 @@ const redis = new Redis({
 });
 
 // Initialize Supabase client
-const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 // Initialize QueueHelper
 const queueHelper = getQueueHelper(supabase, redis);
 
-// Common CORS headers
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+const QUEUE_NAME = "artist_discovery";
+const BATCH_SIZE = 10;
+const VISIBILITY_TIMEOUT = 30; // seconds
 
 // Define the artist worker implementation
 class ArtistDiscoveryWorker extends EnhancedWorkerBase {
@@ -37,7 +37,7 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
   /**
    * Process an artist discovery message
    */
-  async processMessage(message: any): Promise<any> {
+  async processMessage(message: ArtistDiscoveryMessage): Promise<any> {
     const logger = new StructuredLogger({ service: 'artist_discovery' });
     
     // Handle different message formats more robustly
@@ -294,7 +294,7 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
   /**
    * Required implementation of handleMessage from EnhancedWorkerBase
    */
-  async handleMessage(message: any, logger: StructuredLogger): Promise<any> {
+  async handleMessage(message: ArtistDiscoveryMessage, logger: StructuredLogger): Promise<any> {
     return this.processMessage(message);
   }
 }
@@ -342,51 +342,84 @@ async function processArtistDiscovery() {
 // Handle HTTP requests
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
+    return new Response("ok", { headers: corsHeaders });
   }
   
   try {
-    // Process the batch in the background using EdgeRuntime.waitUntil
-    const resultPromise = processArtistDiscovery();
-    
-    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
-      EdgeRuntime.waitUntil(resultPromise);
-      
-      // Return immediately with acknowledgment
+    // Read messages from the queue
+    const { data: messages, error: readError } = await supabase
+      .rpc("pgmq_read", {
+        queue_name: QUEUE_NAME,
+        max_messages: BATCH_SIZE,
+        visibility_timeout: VISIBILITY_TIMEOUT,
+      });
+
+    if (readError) {
+      throw readError;
+    }
+
+    if (!messages || messages.length === 0) {
       return new Response(
-        JSON.stringify({ message: "Artist discovery batch processing started" }),
-        { 
-          headers: { 
-            ...corsHeaders, 
-            'Content-Type': 'application/json' 
-          } 
-        }
-      );
-    } else {
-      // If EdgeRuntime.waitUntil is not available, wait for completion
-      const result = await resultPromise;
-      
-      return new Response(
-        JSON.stringify(result),
-        { 
-          headers: { 
-            ...corsHeaders, 
-            'Content-Type': 'application/json' 
-          } 
-        }
+        JSON.stringify({ message: "No messages to process" }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
-  } catch (error) {
-    console.error("Error in artist discovery handler:", error);
-    
+
+    const results = [];
+    const errors = [];
+
+    for (const message of messages) {
+      try {
+        // Validate the message format
+        const validatedMessage = validateMessage(ArtistDiscoveryMessageSchema, message);
+        
+        // Process the validated message
+        const result = await processMessage(validatedMessage);
+        
+        if (result.success) {
+          // Delete the message from the queue after successful processing
+          await supabase.rpc("pgmq_delete", {
+            queue_name: QUEUE_NAME,
+            message_id: message.id,
+          });
+          results.push({ id: message.id, status: "success" });
+        } else {
+          errors.push({ id: message.id, error: result.error });
+        }
+      } catch (error) {
+        console.error("Error processing message:", error);
+        errors.push({ id: message.id, error: error.message });
+        
+        // If it's a validation error, send to DLQ
+        if (error.message.includes("Invalid message format")) {
+          await supabase.rpc("pgmq_send", {
+            queue_name: `${QUEUE_NAME}_dlq`,
+            message: {
+              originalMessage: message,
+              error: error.message,
+              timestamp: new Date().toISOString(),
+            },
+          });
+        }
+      }
+    }
+
     return new Response(
-      JSON.stringify({ error: error.message, success: false }),
+      JSON.stringify({
+        processed: results.length,
+        errors: errors.length,
+        results,
+        errors,
+      }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  } catch (error) {
+    console.error("Error:", error);
+    return new Response(
+      JSON.stringify({ error: error.message }),
       { 
         status: 500,
-        headers: { 
-          ...corsHeaders, 
-          'Content-Type': 'application/json' 
-        } 
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
       }
     );
   }

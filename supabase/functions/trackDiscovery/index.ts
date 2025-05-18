@@ -1,85 +1,114 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
-import { TrackDiscoveryWorker } from "../_shared/workers/TrackDiscoveryWorker.ts";
-import { logDebug } from "../_shared/debugHelper.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
+import { corsHeaders } from "../_shared/cors.ts";
+import { validateMessage, TrackDiscoveryMessageSchema, type TrackDiscoveryMessage } from "../_shared/types/queueMessages.ts";
 
-// Initialize Redis client for distributed locking and idempotency
-const redis = new Redis({
-  url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
-  token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
-});
+const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-// CORS headers for API responses
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+const QUEUE_NAME = "track_discovery";
+const BATCH_SIZE = 10;
+const VISIBILITY_TIMEOUT = 30; // seconds
+
+async function processMessage(message: TrackDiscoveryMessage) {
+  try {
+    // Your existing message processing logic here
+    console.log("Processing track:", message.trackName);
+    
+    // Example processing steps:
+    // 1. Fetch track details from Spotify
+    // 2. Store track in database
+    // 3. Enqueue for producer identification
+    
+    return { success: true };
+  } catch (error) {
+    console.error("Error processing message:", error);
+    return { success: false, error: error.message };
+  }
+}
 
 serve(async (req) => {
-  // Handle CORS preflight requests
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
   }
 
-  const executionId = `track_disc_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-  
-  // Initialize Supabase client
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-  );
-  
   try {
-    logDebug("TrackDiscovery", `Starting track discovery process`, { executionId });
-    
-    // Initialize the TrackDiscoveryWorker
-    const worker = new TrackDiscoveryWorker(supabase, redis);
-    
-    // Process messages in background to avoid CPU timeout
-    const response = new Response(
-      JSON.stringify({ processing: true, message: "Starting batch process" }), 
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-    
-    // Process queue in background to avoid edge function timeout
-    EdgeRuntime.waitUntil((async () => {
+    // Read messages from the queue
+    const { data: messages, error: readError } = await supabase
+      .rpc("pgmq_read", {
+        queue_name: QUEUE_NAME,
+        max_messages: BATCH_SIZE,
+        visibility_timeout: VISIBILITY_TIMEOUT,
+      });
+
+    if (readError) {
+      throw readError;
+    }
+
+    if (!messages || messages.length === 0) {
+      return new Response(
+        JSON.stringify({ message: "No messages to process" }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    const results = [];
+    const errors = [];
+
+    for (const message of messages) {
       try {
-        // Process up to 5 batches of 3 messages each
-        const result = await worker.processBatch({
-          batchSize: 3,
-          processorName: 'track_discovery',
-          maxBatches: 5,
-          timeoutSeconds: 60,
-          visibilityTimeoutSeconds: 900, // 15 minutes
-          sendToDlqOnMaxRetries: true,
-          maxRetries: 3,
-          logDetailedMetrics: true,
-          deadLetterQueue: 'track_discovery_dlq'
-        });
+        // Validate the message format
+        const validatedMessage = validateMessage(TrackDiscoveryMessageSchema, message);
         
-        logDebug("TrackDiscovery", `Completed background processing: ${result.processed} processed, ${result.errors} errors`, { executionId });
+        // Process the validated message
+        const result = await processMessage(validatedMessage);
+        
+        if (result.success) {
+          // Delete the message from the queue after successful processing
+          await supabase.rpc("pgmq_delete", {
+            queue_name: QUEUE_NAME,
+            message_id: message.id,
+          });
+          results.push({ id: message.id, status: "success" });
+        } else {
+          errors.push({ id: message.id, error: result.error });
+        }
       } catch (error) {
-        logDebug("TrackDiscovery", `Error in background queue processing:`, { 
-          executionId, 
-          error: error.message,
-          stack: error.stack 
-        });
+        console.error("Error processing message:", error);
+        errors.push({ id: message.id, error: error.message });
+        
+        // If it's a validation error, send to DLQ
+        if (error.message.includes("Invalid message format")) {
+          await supabase.rpc("pgmq_send", {
+            queue_name: `${QUEUE_NAME}_dlq`,
+            message: {
+              originalMessage: message,
+              error: error.message,
+              timestamp: new Date().toISOString(),
+            },
+          });
+        }
       }
-    })());
-    
-    return response;
-  } catch (error) {
-    logDebug("TrackDiscovery", `Unexpected error in track discovery worker:`, {
-      executionId,
-      error: error.message,
-      stack: error.stack
-    });
-    
+    }
+
     return new Response(
-      JSON.stringify({ error: error.message }), 
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      JSON.stringify({
+        processed: results.length,
+        errors: errors.length,
+        results,
+        errors,
+      }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  } catch (error) {
+    console.error("Error:", error);
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { 
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      }
     );
   }
 });
