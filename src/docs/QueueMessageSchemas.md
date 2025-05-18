@@ -1,3 +1,4 @@
+
 # Queue Message Schemas
 
 This document outlines the standardized message formats for all queues in the system.
@@ -23,7 +24,7 @@ All queue messages extend from this base schema:
 **Schema:**
 ```typescript
 {
-  spotifyId: string;      // 22-character Spotify ID
+  spotifyId?: string;     // Optional 22-character Spotify ID
   artistName: string;     // Artist name
   genres?: string[];      // Optional array of genres
   popularity?: number;    // Optional popularity score (0-100)

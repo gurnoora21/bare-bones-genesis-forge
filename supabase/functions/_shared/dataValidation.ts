@@ -1,4 +1,3 @@
-
 /**
  * Data validation system for music producer pipeline
  * Provides schema validation, data contracts, and quality checks
@@ -877,7 +876,8 @@ export const GENIUS_SONG_SCHEMA: SchemaDefinition = {
 export const ARTIST_DISCOVERY_MESSAGE_SCHEMA: SchemaDefinition = {
   artistId: { type: ValidationType.SPOTIFY_ID, required: false },
   artistName: { type: ValidationType.STRING, required: false },
-  _idempotencyKey: { type: ValidationType.STRING, required: false }
+  _idempotencyKey: { type: ValidationType.STRING, required: false },
+  spotifyId: { type: ValidationType.SPOTIFY_ID, required: false } // Updated to be optional
 };
 
 export const ALBUM_DISCOVERY_MESSAGE_SCHEMA: SchemaDefinition = {

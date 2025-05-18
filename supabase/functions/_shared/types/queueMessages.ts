@@ -1,3 +1,4 @@
+
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Base message schema that all queue messages must follow
@@ -9,7 +10,7 @@ export const BaseMessageSchema = z.object({
 
 // Artist Discovery Queue
 export const ArtistDiscoveryMessageSchema = BaseMessageSchema.extend({
-  spotifyId: z.string().length(22),
+  spotifyId: z.string().length(22).optional(), // Changed from required to optional
   artistName: z.string(),
   genres: z.array(z.string()).optional(),
   popularity: z.number().min(0).max(100).optional(),
