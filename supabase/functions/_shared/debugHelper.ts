@@ -25,6 +25,19 @@ export function logDebug(context: string, message: string, data?: any): void {
 }
 
 /**
+ * Format error object for logging
+ */
+export function formatError(error: any): Record<string, any> {
+  return {
+    message: error?.message || 'Unknown error',
+    name: error?.name || 'Error',
+    stack: error?.stack || '',
+    code: error?.code,
+    details: error?.details || error?.info || undefined
+  };
+}
+
+/**
  * Check if environment variables are set
  */
 export function validateEnvironment(requiredVars: string[]): boolean {

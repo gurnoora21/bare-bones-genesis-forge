@@ -135,28 +135,18 @@ RETURNS TABLE(
   full_name TEXT,
   record_count BIGINT
 ) AS $$
-DECLARE
-  specific_queue TEXT;
-  count_query TEXT;
 BEGIN
   IF p_queue_name IS NOT NULL THEN
-    specific_queue := p_queue_name;
-    
     -- First check pgmq.q_queue_name pattern
     RETURN QUERY
     SELECT 
       'pgmq'::TEXT AS schema_name,
-      'q_' || specific_queue AS table_name,
-      'pgmq.q_' || specific_queue AS full_name,
-      (
-        SELECT COUNT(*)::BIGINT 
-        FROM pgmq.q_album_discovery
-        WHERE specific_queue = 'album_discovery'
-      ) AS record_count 
+      'q_' || p_queue_name AS table_name,
+      'pgmq.q_' || p_queue_name AS full_name,
+      (SELECT COUNT(*)::BIGINT FROM pgmq.q_artist_discovery WHERE p_queue_name = 'artist_discovery') AS record_count 
     WHERE EXISTS (
-      SELECT 1 
-      FROM information_schema.tables 
-      WHERE table_schema = 'pgmq' AND table_name = 'q_' || specific_queue
+      SELECT 1 FROM information_schema.tables 
+      WHERE table_schema = 'pgmq' AND table_name = 'q_' || p_queue_name
     )
     
     UNION
@@ -164,18 +154,12 @@ BEGIN
     -- Then check public.pgmq_queue_name pattern
     SELECT 
       'public'::TEXT AS schema_name,
-      'pgmq_' || specific_queue AS table_name,
-      'public.pgmq_' || specific_queue AS full_name,
-      (
-        SELECT COUNT(*)::BIGINT 
-        FROM public.pgmq_album_discovery
-        WHERE specific_queue = 'album_discovery'
-        LIMIT 1
-      ) AS record_count
+      'pgmq_' || p_queue_name AS table_name,
+      'public.pgmq_' || p_queue_name AS full_name,
+      0::BIGINT AS record_count
     WHERE EXISTS (
-      SELECT 1 
-      FROM information_schema.tables 
-      WHERE table_schema = 'public' AND table_name = 'pgmq_' || specific_queue
+      SELECT 1 FROM information_schema.tables 
+      WHERE table_schema = 'public' AND table_name = 'pgmq_' || p_queue_name
     );
   ELSE
     -- Return all PGMQ tables in both schemas
@@ -184,7 +168,7 @@ BEGIN
       table_schema::TEXT AS schema_name,
       table_name::TEXT,
       (table_schema || '.' || table_name)::TEXT AS full_name,
-      0::BIGINT AS record_count -- Just a placeholder
+      0::BIGINT AS record_count
     FROM 
       information_schema.tables
     WHERE 
@@ -207,6 +191,21 @@ BEGIN
     RAISE NOTICE 'Error with pgmq.create for album_discovery: %', SQLERRM;
   END;
   
+  -- Do the same for track_discovery and producer_identification queues
+  BEGIN
+    PERFORM pgmq.create('track_discovery');
+    RAISE NOTICE 'Created or confirmed track_discovery queue';
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error with pgmq.create for track_discovery: %', SQLERRM;
+  END;
+  
+  BEGIN
+    PERFORM pgmq.create('producer_identification');
+    RAISE NOTICE 'Created or confirmed producer_identification queue';
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error with pgmq.create for producer_identification: %', SQLERRM;
+  END;
+  
   -- Diagnose all queue tables
   RAISE NOTICE 'Queue table diagnosis:';
   FOR r IN SELECT * FROM public.diagnose_queue_tables() LOOP
@@ -216,6 +215,18 @@ BEGIN
   -- Check album_discovery queue specifically
   RAISE NOTICE 'Album discovery queue tables:';
   FOR r IN SELECT * FROM public.diagnose_queue_tables('album_discovery') LOOP
+    RAISE NOTICE 'Found: %.% (count: %)', r.schema_name, r.table_name, r.record_count;
+  END LOOP;
+  
+  -- Check track_discovery queue specifically
+  RAISE NOTICE 'Track discovery queue tables:';
+  FOR r IN SELECT * FROM public.diagnose_queue_tables('track_discovery') LOOP
+    RAISE NOTICE 'Found: %.% (count: %)', r.schema_name, r.table_name, r.record_count;
+  END LOOP;
+  
+  -- Check producer_identification queue specifically
+  RAISE NOTICE 'Producer identification queue tables:';
+  FOR r IN SELECT * FROM public.diagnose_queue_tables('producer_identification') LOOP
     RAISE NOTICE 'Found: %.% (count: %)', r.schema_name, r.table_name, r.record_count;
   END LOOP;
 END $$;

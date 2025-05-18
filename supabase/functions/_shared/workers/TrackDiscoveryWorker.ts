@@ -1,3 +1,4 @@
+
 /**
  * TrackDiscoveryWorker class
  * Extends EnhancedWorkerBase to provide standardized track discovery functionality
@@ -7,6 +8,7 @@ import { EnhancedWorkerBase } from "../enhancedWorkerBase.ts";
 import { StructuredLogger } from "../structuredLogger.ts";
 import { DeduplicationService } from "../deduplication.ts";
 import { SpotifyClient } from "../spotifyClient.ts";
+import { getQueueHelper } from "../queueHelper.ts";
 
 interface TrackDiscoveryMessage {
   spotifyId: string;
@@ -22,6 +24,7 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
   private spotifyClient: SpotifyClient;
   private deduplicationService: DeduplicationService;
   private redis: any;
+  private queueHelper: any;
   
   constructor(supabase: any, redis: any) {
     super('track_discovery', supabase, 'TrackDiscovery');
@@ -30,6 +33,7 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
     this.spotifyClient = new SpotifyClient();
     this.deduplicationService = new DeduplicationService(redis);
     this.redis = redis;
+    this.queueHelper = getQueueHelper(supabase, redis);
   }
   
   /**
@@ -277,14 +281,22 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
     }
     
     if (!alreadyEnqueued) {
-      // Enqueue producer identification task
-      await this.enqueueMessage('producer_identification', producerMsg, `track:${track.track_id}`);
-      
-      // Mark as enqueued in Redis
       try {
-        await this.redis.set(producerKey, 'true', { ex: 86400 }); // 24 hour TTL
-      } catch (redisError) {
-        console.warn(`Failed to mark producer identification as enqueued:`, redisError);
+        // Use queueHelper instead of directly calling enqueueMessage
+        await this.queueHelper.enqueue(
+          'producer_identification', 
+          producerMsg, 
+          `track:${track.track_id}`
+        );
+        
+        // Mark as enqueued in Redis
+        try {
+          await this.redis.set(producerKey, 'true', { ex: 86400 }); // 24 hour TTL
+        } catch (redisError) {
+          console.warn(`Failed to mark producer identification as enqueued:`, redisError);
+        }
+      } catch (enqueueError) {
+        this.logger.error(`Failed to enqueue producer identification for track ${track.track_id}:`, enqueueError);
       }
     }
   }
@@ -339,19 +351,27 @@ export class TrackDiscoveryWorker extends EnhancedWorkerBase<TrackDiscoveryMessa
           return;
         }
 
-        // Enqueue next batch with new offset
-        await this.enqueueMessage('track_discovery', { 
-          spotifyId: album.spotify_id, // Use the album's Spotify ID
-          albumName,
-          artistSpotifyId: artist.spotify_id, // Use the artist's Spotify ID
-          offset: newOffset 
-        }, `album:${album.spotify_id}:offset:${newOffset}`);
-        
-        // Mark as enqueued in Redis
         try {
-          await this.redis.set(nextPageKey, 'true', { ex: 86400 }); // 24 hour TTL
-        } catch (redisError) {
-          console.warn(`Failed to mark next page as enqueued:`, redisError);
+          // Use queueHelper instead of directly calling enqueueMessage
+          await this.queueHelper.enqueue(
+            'track_discovery',
+            { 
+              spotifyId: album.spotify_id, // Use the album's Spotify ID
+              albumName,
+              artistSpotifyId: artist.spotify_id, // Use the artist's Spotify ID
+              offset: newOffset 
+            }, 
+            `album:${album.spotify_id}:offset:${newOffset}`
+          );
+          
+          // Mark as enqueued in Redis
+          try {
+            await this.redis.set(nextPageKey, 'true', { ex: 86400 }); // 24 hour TTL
+          } catch (redisError) {
+            console.warn(`Failed to mark next page as enqueued:`, redisError);
+          }
+        } catch (enqueueError) {
+          this.logger.error(`Failed to enqueue next page for album ${albumName}:`, enqueueError);
         }
       }
     }

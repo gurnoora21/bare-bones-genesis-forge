@@ -3,6 +3,7 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { TrackDiscoveryWorker } from "../_shared/workers/TrackDiscoveryWorker.ts";
+import { logDebug } from "../_shared/debugHelper.ts";
 
 // Initialize Redis client for distributed locking and idempotency
 const redis = new Redis({
@@ -22,6 +23,8 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  const executionId = `track_disc_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  
   // Initialize Supabase client
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
@@ -29,7 +32,7 @@ serve(async (req) => {
   );
   
   try {
-    console.log("Starting track discovery process");
+    logDebug("TrackDiscovery", `Starting track discovery process`, { executionId });
     
     // Initialize the TrackDiscoveryWorker
     const worker = new TrackDiscoveryWorker(supabase, redis);
@@ -56,15 +59,23 @@ serve(async (req) => {
           deadLetterQueue: 'track_discovery_dlq'
         });
         
-        console.log(`Completed background processing: ${result.processed} processed, ${result.errors} errors`);
+        logDebug("TrackDiscovery", `Completed background processing: ${result.processed} processed, ${result.errors} errors`, { executionId });
       } catch (error) {
-        console.error("Error in background queue processing:", error);
+        logDebug("TrackDiscovery", `Error in background queue processing:`, { 
+          executionId, 
+          error: error.message,
+          stack: error.stack 
+        });
       }
     })());
     
     return response;
   } catch (error) {
-    console.error("Unexpected error in track discovery worker:", error);
+    logDebug("TrackDiscovery", `Unexpected error in track discovery worker:`, {
+      executionId,
+      error: error.message,
+      stack: error.stack
+    });
     
     return new Response(
       JSON.stringify({ error: error.message }), 

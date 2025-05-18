@@ -147,9 +147,44 @@ serve(async (req) => {
           executionId,
           error: safeStringify(rawError)
         });
+        
+        // Try one more approach - direct SQL 
+        const { data: directData, error: directError } = await supabase.rpc('raw_sql_query', {
+          sql_query: `
+            INSERT INTO pgmq.q_${normalizedDLQName} (message, read_ct) 
+            VALUES ($1::jsonb, 0) 
+            RETURNING id`,
+          params: JSON.stringify([JSON.stringify(dlqMessage)])
+        });
+        
+        if (directError) {
+          logDebug("SendToDLQ", `Direct SQL insert failed:`, {
+            executionId, 
+            error: safeStringify(directError)
+          });
+          
+          return new Response(
+            JSON.stringify({ error: 'Failed to send to DLQ after all attempts', details: directError }),
+            { status: 500, headers: corsHeaders }
+          );
+        }
+        
+        logDebug("SendToDLQ", `Message sent to DLQ via direct SQL insert`, { executionId });
+        
+        // Try to delete the original message
+        await supabase.rpc('ensure_message_deleted', {
+          queue_name: normalizedQueueName,
+          message_id: message_id,
+          max_attempts: 3
+        });
+        
         return new Response(
-          JSON.stringify({ error: 'Failed to send to DLQ', details: rawError }),
-          { status: 500, headers: corsHeaders }
+          JSON.stringify({ 
+            success: true, 
+            message_id: directData?.result || 'unknown',
+            dlq_name: normalizedDLQName
+          }),
+          { status: 200, headers: corsHeaders }
         );
       }
       
