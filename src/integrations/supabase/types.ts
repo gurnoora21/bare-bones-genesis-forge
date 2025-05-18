@@ -595,6 +595,10 @@ export type Database = {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
       }
+      direct_pgmq_delete: {
+        Args: { p_queue_name: string; p_message_id: string }
+        Returns: boolean
+      }
       emergency_reset_message: {
         Args: {
           p_queue_name: string

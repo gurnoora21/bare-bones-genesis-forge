@@ -3,6 +3,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService } from "./deduplication.ts";
 import { getDeduplicationMetrics } from "./metrics.ts";
+import { safeStringify, logDebug } from "./debugHelper.ts";
 
 // Interface for response from deleteFromQueue function
 export interface DeleteMessageResponse {
@@ -63,15 +64,15 @@ class SupabaseQueueHelper implements QueueHelper {
     options: { ttl?: number, priority?: number } = {}
   ): Promise<string | null> {
     const executionId = `enqueue_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-    console.log(`[${executionId}] Starting enqueue operation for queue: ${queueName}`);
+    logDebug("QueueHelper", `Starting enqueue operation for queue: ${queueName}`, { executionId });
     
     // Normalize the queue name
     const normalizedQueueName = normalizeQueueName(queueName);
-    console.log(`[${executionId}] Normalized queue name: ${normalizedQueueName}`);
+    logDebug("QueueHelper", `Normalized queue name: ${normalizedQueueName}`, { executionId });
     
     // Check deduplication first if a key is provided
     if (dedupKey) {
-      console.log(`[${executionId}] Checking deduplication for key: ${dedupKey}`);
+      logDebug("QueueHelper", `Checking deduplication for key: ${dedupKey}`, { executionId });
       const isDuplicate = await this.deduplication.isDuplicate(
         normalizedQueueName, 
         dedupKey,
@@ -82,7 +83,7 @@ class SupabaseQueueHelper implements QueueHelper {
       );
       
       if (isDuplicate) {
-        console.log(`[${executionId}] Skipping duplicate message with key ${dedupKey} for queue ${normalizedQueueName}`);
+        logDebug("QueueHelper", `Skipping duplicate message with key ${dedupKey} for queue ${normalizedQueueName}`, { executionId });
         
         try {
           // Record the deduplication
@@ -93,11 +94,11 @@ class SupabaseQueueHelper implements QueueHelper {
         
         return null;
       }
-      console.log(`[${executionId}] No duplicate found, proceeding with enqueue`);
+      logDebug("QueueHelper", `No duplicate found, proceeding with enqueue`, { executionId });
     }
 
     try {
-      console.log(`[${executionId}] Calling sendToQueue function...`);
+      logDebug("QueueHelper", `Calling sendToQueue function...`, { executionId });
       
       // Ensure message is properly formatted
       const messageToSend = typeof message === 'string' ? message : JSON.stringify(message);
@@ -113,12 +114,12 @@ class SupabaseQueueHelper implements QueueHelper {
         });
 
         if (!error) {
-          const messageId = data.message_id;
-          console.log(`[${executionId}] Message enqueued successfully with ID: ${messageId}`);
+          const messageId = data?.message_id || data;
+          logDebug("QueueHelper", `Message enqueued successfully with ID: ${messageId}`, { executionId });
 
           // If deduplication key was provided, mark as processed to prevent duplicates
           if (dedupKey) {
-            console.log(`[${executionId}] Marking message as processed for deduplication`);
+            logDebug("QueueHelper", `Marking message as processed for deduplication`, { executionId });
             await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
           }
           
@@ -139,37 +140,105 @@ class SupabaseQueueHelper implements QueueHelper {
         
         // Log the detailed error for debugging
         console.error(`[${executionId}] Error enqueueing message to ${normalizedQueueName}:`, error);
-        console.error(`[${executionId}] Error details:`, {
-          message: error.message,
-          status: error.status,
-          statusText: error.statusText,
-          response: error.response
+        logDebug("QueueHelper", `Error enqueueing message`, { 
+          executionId,
+          queueName: normalizedQueueName,
+          error: safeStringify(error)
         });
         
-        // Fallback approach if the first attempt fails with a specific error
-        if (error.message?.includes('non-2xx status code')) {
-          console.log(`[${executionId}] Trying fallback approach with direct database function...`);
+        // Fallback approach 1: Try using pg_enqueue database function
+        try {
+          logDebug("QueueHelper", `Trying fallback 1 - pg_enqueue database function...`, { executionId });
           
-          // Try using the direct database function
-          const { data: directData, error: directError } = await this.supabase.rpc('start_artist_discovery', {
-            artist_name: typeof message === 'object' && message.artistName ? message.artistName : 'unknown'
+          // Convert message to JSONB
+          const jsonMessage = typeof message === 'string' ? JSON.parse(message) : message;
+          
+          const { data: pgData, error: pgError } = await this.supabase.rpc('pg_enqueue', {
+            queue_name: normalizedQueueName,
+            message_body: jsonMessage
           });
           
-          if (!directError && directData) {
-            console.log(`[${executionId}] Message enqueued successfully via direct DB function: ${directData}`);
+          if (!pgError && pgData) {
+            const messageId = String(pgData);
+            logDebug("QueueHelper", `Message enqueued successfully via pg_enqueue: ${messageId}`, { executionId });
             
-            // If deduplication key was provided, mark as processed
             if (dedupKey) {
               await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
             }
             
-            return directData.toString();
+            return messageId;
           }
           
-          console.error(`[${executionId}] Fallback also failed:`, directError);
+          logDebug("QueueHelper", `pg_enqueue fallback failed`, { 
+            executionId,
+            error: safeStringify(pgError)
+          });
+          
+          // Fallback approach 2: Try using raw SQL
+          logDebug("QueueHelper", `Trying fallback 2 - direct SQL query...`, { executionId });
+          
+          // For artist discovery, try the specific function
+          if (normalizedQueueName === 'artist_discovery' && typeof message === 'object' && message.artistName) {
+            const { data: directData, error: directError } = await this.supabase.rpc('start_artist_discovery', {
+              artist_name: message.artistName
+            });
+            
+            if (!directError && directData) {
+              const messageId = String(directData);
+              logDebug("QueueHelper", `Message enqueued successfully via start_artist_discovery: ${messageId}`, { 
+                executionId,
+                artistName: message.artistName
+              });
+              
+              if (dedupKey) {
+                await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
+              }
+              
+              return messageId;
+            }
+            
+            logDebug("QueueHelper", `start_artist_discovery fallback failed`, { 
+              executionId,
+              error: safeStringify(directError)
+            });
+          }
+          
+          // Fallback approach 3: Try using raw_sql_query with pgmq.send
+          logDebug("QueueHelper", `Trying fallback 3 - raw SQL pgmq.send...`, { executionId });
+          
+          const messageSql = typeof message === 'string' ? message : JSON.stringify(message);
+          const { data: rawData, error: rawError } = await this.supabase.rpc('raw_sql_query', {
+            sql_query: `SELECT * FROM pgmq.send($1, $2::jsonb) AS msg_id`,
+            params: JSON.stringify([normalizedQueueName, messageSql])
+          });
+          
+          if (!rawError && rawData) {
+            const messageId = String(rawData);
+            logDebug("QueueHelper", `Message enqueued successfully via raw SQL: ${messageId}`, { executionId });
+            
+            if (dedupKey) {
+              await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
+            }
+            
+            return messageId;
+          }
+          
+          logDebug("QueueHelper", `All fallback approaches failed`, { 
+            executionId,
+            rawError: safeStringify(rawError)
+          });
+        } catch (fallbackError) {
+          logDebug("QueueHelper", `Exception in fallback approaches`, { 
+            executionId,
+            error: safeStringify(fallbackError)
+          });
         }
       } catch (invokeError) {
         console.error(`[${executionId}] Exception invoking sendToQueue:`, invokeError);
+        logDebug("QueueHelper", `Exception invoking sendToQueue`, { 
+          executionId,
+          error: safeStringify(invokeError)
+        });
       }
       
       // Record the failure
@@ -187,9 +256,10 @@ class SupabaseQueueHelper implements QueueHelper {
       return null;
     } catch (err) {
       console.error(`[${executionId}] Unexpected error enqueueing message to ${normalizedQueueName}:`, err);
-      console.error(`[${executionId}] Error details:`, {
-        message: err.message,
-        stack: err.stack
+      logDebug("QueueHelper", `Unexpected error in enqueue operation`, { 
+        executionId,
+        queueName: normalizedQueueName,
+        error: safeStringify(err)
       });
       
       // Record the failure

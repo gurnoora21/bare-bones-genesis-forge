@@ -1,6 +1,7 @@
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { safeStringify, logDebug } from "../_shared/debugHelper.ts";
 
 // Initialize Supabase client
 const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
@@ -13,7 +14,7 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Add this function at the top of the file, after imports
+// Normalize queue name to ensure consistent naming across all queue operations
 function normalizeQueueName(queueName: string): string {
   // Remove any existing prefixes
   const baseName = queueName.replace(/^(pgmq\.|q_)/, '');
@@ -28,7 +29,7 @@ serve(async (req) => {
   }
   
   const executionId = `dlq_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-  console.log(`[${executionId}] DLQ request received`);
+  logDebug("SendToDLQ", `DLQ request received`, { executionId });
   
   try {
     const { queue_name, dlq_name, message_id, message, failure_reason, metadata } = await req.json();
@@ -43,9 +44,13 @@ serve(async (req) => {
     // Normalize the queue names
     const normalizedQueueName = normalizeQueueName(queue_name);
     const normalizedDLQName = normalizeQueueName(dlq_name);
-    console.log(`[${executionId}] Normalized queue names - source: ${normalizedQueueName}, DLQ: ${normalizedDLQName}`);
+    logDebug("SendToDLQ", `Normalized queue names`, { 
+      executionId,
+      source: normalizedQueueName, 
+      DLQ: normalizedDLQName
+    });
 
-    // Ensure DLQ exists
+    // Ensure DLQ exists using multiple approaches
     try {
       // Try to create the queue directly with proper pgmq schema
       const { error: createError } = await supabase.rpc('raw_sql_query', {
@@ -54,15 +59,21 @@ serve(async (req) => {
       });
       
       if (createError) {
-        console.error(`[${executionId}] Error creating DLQ with raw SQL:`, createError);
+        logDebug("SendToDLQ", `Error creating DLQ with pgmq.create:`, {
+          executionId,
+          error: safeStringify(createError)
+        });
         // Continue anyway - might exist already
       }
     } catch (createErr) {
-      console.error(`[${executionId}] Exception creating DLQ:`, createErr);
+      logDebug("SendToDLQ", `Exception creating DLQ:`, {
+        executionId,
+        error: safeStringify(createErr)
+      });
       // Continue anyway - might exist already
     }
     
-    console.log(`[${executionId}] DLQ created or already exists`);
+    logDebug("SendToDLQ", `DLQ created or already exists`, { executionId });
 
     // Prepare the DLQ message
     const dlqMessage = {
@@ -74,56 +85,97 @@ serve(async (req) => {
       ...metadata
     };
 
-    // Send message to DLQ
+    // Send message to DLQ using multiple approaches
     try {
-      // Try using pg_send_text directly with the proper schema
-      const { data, error } = await supabase.rpc('pg_send_text', {
-        queue_name: normalizedDLQName,
-        msg_text: JSON.stringify(dlqMessage)
+      // Approach 1: Try using the move_to_dead_letter_queue function
+      const { data: moveData, error: moveError } = await supabase.rpc('move_to_dead_letter_queue', {
+        source_queue: normalizedQueueName,
+        dlq_name: normalizedDLQName,
+        message_id: message_id,
+        failure_reason: failure_reason || 'Unknown failure',
+        metadata: metadata || {}
       });
-
-      if (error) {
-        console.error(`[${executionId}] Error with pg_send_text:`, error);
-        
-        // Fall back to raw SQL to call pgmq.send directly
-        const { data: rawData, error: rawError } = await supabase.rpc('raw_sql_query', {
-          sql_query: `SELECT send FROM pgmq.send($1, $2::jsonb) AS send`,
-          params: JSON.stringify([
-            normalizedDLQName, 
-            JSON.stringify(dlqMessage)
-          ])
-        });
-        
-        if (rawError) {
-          console.error(`[${executionId}] Error sending message with raw SQL:`, rawError);
-          return new Response(
-            JSON.stringify({ error: 'Failed to send to DLQ', details: rawError }),
-            { status: 500, headers: corsHeaders }
-          );
-        }
-        
-        console.log(`[${executionId}] Message sent to DLQ successfully via raw SQL`);
+      
+      if (!moveError && moveData === true) {
+        logDebug("SendToDLQ", `Message sent to DLQ successfully via move_to_dead_letter_queue`, { executionId });
         return new Response(
           JSON.stringify({ 
-            success: true, 
-            message_id: rawData?.result,
+            success: true,
             dlq_name: normalizedDLQName
           }),
           { status: 200, headers: corsHeaders }
         );
       }
-
-      console.log(`[${executionId}] Message sent to DLQ successfully, ID: ${data}`);
+      
+      // Approach 2: Try using pg_enqueue
+      const { data: enqueueData, error: enqueueError } = await supabase.rpc('pg_enqueue', {
+        queue_name: normalizedDLQName,
+        message_body: dlqMessage
+      });
+      
+      if (!enqueueError && enqueueData) {
+        logDebug("SendToDLQ", `Message sent to DLQ successfully via pg_enqueue, ID: ${enqueueData}`, { executionId });
+        
+        // Now try to delete the original message
+        await supabase.rpc('ensure_message_deleted', {
+          queue_name: normalizedQueueName,
+          message_id: message_id,
+          max_attempts: 3
+        });
+        
+        return new Response(
+          JSON.stringify({ 
+            success: true, 
+            message_id: enqueueData,
+            dlq_name: normalizedDLQName
+          }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+      
+      // Approach 3: Try using raw SQL to call pgmq.send directly
+      const { data: rawData, error: rawError } = await supabase.rpc('raw_sql_query', {
+        sql_query: `SELECT send FROM pgmq.send($1, $2::jsonb) AS send`,
+        params: JSON.stringify([
+          normalizedDLQName, 
+          JSON.stringify(dlqMessage)
+        ])
+      });
+      
+      if (rawError) {
+        logDebug("SendToDLQ", `Error sending message with raw SQL:`, {
+          executionId,
+          error: safeStringify(rawError)
+        });
+        return new Response(
+          JSON.stringify({ error: 'Failed to send to DLQ', details: rawError }),
+          { status: 500, headers: corsHeaders }
+        );
+      }
+      
+      logDebug("SendToDLQ", `Message sent to DLQ successfully via raw SQL`, { executionId });
+      
+      // Try to delete the original message
+      await supabase.rpc('ensure_message_deleted', {
+        queue_name: normalizedQueueName,
+        message_id: message_id,
+        max_attempts: 3
+      });
+      
       return new Response(
         JSON.stringify({ 
           success: true, 
-          message_id: data,
+          message_id: rawData?.result,
           dlq_name: normalizedDLQName
         }),
         { status: 200, headers: corsHeaders }
       );
     } catch (sendError) {
-      console.error(`[${executionId}] Exception sending message to DLQ:`, sendError);
+      logDebug("SendToDLQ", `Exception sending message to DLQ:`, {
+        executionId,
+        error: safeStringify(sendError)
+      });
+      
       return new Response(
         JSON.stringify({ 
           error: 'Failed to send to DLQ',
@@ -133,7 +185,11 @@ serve(async (req) => {
       );
     }
   } catch (error) {
-    console.error(`[${executionId}] Unexpected error:`, error);
+    logDebug("SendToDLQ", `Unexpected error:`, {
+      executionId,
+      error: safeStringify(error)
+    });
+    
     return new Response(
       JSON.stringify({ 
         error: 'Internal server error',
