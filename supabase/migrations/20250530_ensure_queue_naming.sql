@@ -182,6 +182,8 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Ensure PGMQ is working properly
 DO $$
+DECLARE
+  r RECORD;
 BEGIN
   -- Try to create the album_discovery queue specifically
   BEGIN
