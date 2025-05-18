@@ -163,19 +163,20 @@ BEGIN
     );
   ELSE
     -- Return all PGMQ tables in both schemas
+    -- Fix the column reference ambiguity by using table alias
     RETURN QUERY
     SELECT 
-      table_schema::TEXT AS schema_name,
-      table_name::TEXT,
-      (table_schema || '.' || table_name)::TEXT AS full_name,
+      t.table_schema::TEXT AS schema_name,
+      t.table_name::TEXT,
+      (t.table_schema || '.' || t.table_name)::TEXT AS full_name,
       0::BIGINT AS record_count
     FROM 
-      information_schema.tables
+      information_schema.tables t
     WHERE 
-      (table_schema = 'pgmq' AND table_name LIKE 'q_%') OR
-      (table_schema = 'public' AND table_name LIKE 'pgmq_%')
+      (t.table_schema = 'pgmq' AND t.table_name LIKE 'q_%') OR
+      (t.table_schema = 'public' AND t.table_name LIKE 'pgmq_%')
     ORDER BY
-      table_schema, table_name;
+      t.table_schema, t.table_name;
   END IF;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
