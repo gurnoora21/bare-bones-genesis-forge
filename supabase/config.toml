@@ -1,4 +1,3 @@
-
 project_id = "wshetxovyxtfqohhbvpg"
 
 [api]
@@ -63,9 +62,6 @@ port = 54327
     verify_jwt = false
     
   [functions.socialEnrichment]
-    verify_jwt = false
-    
-  [functions.cronQueueProcessor]
     verify_jwt = false
     
   [functions.pipelineMonitor]
