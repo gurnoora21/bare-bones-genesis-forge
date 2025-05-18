@@ -34,6 +34,8 @@ serve(async (req) => {
     try {
       let cursor = '0';
       do {
+        console.log(`Starting scan with cursor: ${cursor}`);
+        
         // Scan for all deduplication keys
         const [nextCursor, keys] = await redis.scan(
           cursor,
@@ -43,29 +45,55 @@ serve(async (req) => {
           100
         );
         
+        console.log(`Scan returned ${keys?.length || 0} keys. Next cursor: ${nextCursor}`);
+        
         cursor = nextCursor;
         
         if (keys && keys.length > 0) {
-          // Filter out any null or undefined keys
-          const validKeys = keys.filter(key => key != null);
+          // Filter out any null or undefined keys and log them
+          const validKeys = keys.filter(key => {
+            if (key == null) {
+              console.warn('Found null/undefined key in scan results');
+              return false;
+            }
+            return true;
+          });
+          
+          console.log(`After filtering, processing ${validKeys.length} valid keys`);
           
           // Delete in batches to avoid huge commands
           for (let i = 0; i < validKeys.length; i += 50) {
             const batch = validKeys.slice(i, i + 50);
+            console.log(`Processing batch of ${batch.length} keys`);
+            
             if (batch.length > 0) {
               try {
                 // Use unlink instead of del for better performance
                 // and handle each key individually to avoid null args
                 for (const key of batch) {
                   try {
+                    if (!key) {
+                      console.warn('Skipping null/undefined key in batch');
+                      continue;
+                    }
+                    console.log(`Attempting to unlink key: ${key}`);
                     await redis.unlink(key);
                     clearedKeys++;
+                    console.log(`Successfully unlinked key: ${key}`);
                   } catch (keyError) {
-                    console.warn(`Error deleting key ${key}: ${keyError.message}`);
+                    console.error(`Error deleting key ${key}:`, {
+                      error: keyError.message,
+                      stack: keyError.stack,
+                      key: key
+                    });
                   }
                 }
               } catch (batchError) {
-                console.warn(`Error processing batch: ${batchError.message}`);
+                console.error('Error processing batch:', {
+                  error: batchError.message,
+                  stack: batchError.stack,
+                  batchSize: batch.length
+                });
               }
             }
           }
@@ -83,19 +111,31 @@ serve(async (req) => {
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     } catch (redisError) {
-      console.error(`Redis operation failed: ${redisError.message}`);
+      console.error('Redis operation failed:', {
+        error: redisError.message,
+        stack: redisError.stack,
+        name: redisError.name
+      });
       return new Response(
         JSON.stringify({ 
           error: 'Failed to clear deduplication keys',
-          details: redisError.message
+          details: redisError.message,
+          stack: redisError.stack
         }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
   } catch (error) {
-    console.error("Error clearing deduplication keys:", error);
+    console.error("Error clearing deduplication keys:", {
+      error: error.message,
+      stack: error.stack,
+      name: error.name
+    });
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        stack: error.stack
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
