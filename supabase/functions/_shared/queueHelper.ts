@@ -1,4 +1,3 @@
-
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService } from "./deduplication.ts";
@@ -430,4 +429,28 @@ class SupabaseQueueHelper implements QueueHelper {
 export function getQueueHelper(supabase: any, redis: Redis): QueueHelper {
   const deduplicationService = new DeduplicationService(redis);
   return new SupabaseQueueHelper(supabase, redis, deduplicationService);
+}
+
+/**
+ * Enqueue a message to a specified queue
+ */
+export async function enqueue(supabase: SupabaseClient, queueName: string, message: any): Promise<string | null> {
+  try {
+    const { data, error } = await supabase.functions.invoke('sendToQueue', {
+      body: { 
+        queue_name: queueName, 
+        message 
+      }
+    });
+    
+    if (error) {
+      console.error(`Error enqueueing message to ${queueName}:`, error);
+      return null;
+    }
+    
+    return data?.message_id || null;
+  } catch (error) {
+    console.error(`Exception enqueueing message to ${queueName}:`, error);
+    return null;
+  }
 }

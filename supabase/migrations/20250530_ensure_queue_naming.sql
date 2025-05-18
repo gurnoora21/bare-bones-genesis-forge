@@ -70,9 +70,6 @@ BEGIN
 END;
 $$;
 
--- Ensure all queues exist
-SELECT * FROM ensure_all_queues_exist();
-
 -- Ensure required tables and schema exist
 CREATE SCHEMA IF NOT EXISTS pgmq;
 
@@ -135,35 +132,47 @@ RETURNS TABLE(
   full_name TEXT,
   record_count BIGINT
 ) AS $$
+DECLARE
+  query_text TEXT;
 BEGIN
   IF p_queue_name IS NOT NULL THEN
-    -- First check pgmq.q_queue_name pattern
-    RETURN QUERY
-    SELECT 
-      'pgmq'::TEXT AS schema_name,
-      'q_' || p_queue_name AS table_name,
-      'pgmq.q_' || p_queue_name AS full_name,
-      (SELECT COUNT(*)::BIGINT FROM pgmq.q_artist_discovery WHERE p_queue_name = 'artist_discovery') AS record_count 
-    WHERE EXISTS (
-      SELECT 1 FROM information_schema.tables 
-      WHERE table_schema = 'pgmq' AND table_name = 'q_' || p_queue_name
-    )
-    
-    UNION
-    
-    -- Then check public.pgmq_queue_name pattern
-    SELECT 
-      'public'::TEXT AS schema_name,
-      'pgmq_' || p_queue_name AS table_name,
-      'public.pgmq_' || p_queue_name AS full_name,
-      0::BIGINT AS record_count
-    WHERE EXISTS (
-      SELECT 1 FROM information_schema.tables 
-      WHERE table_schema = 'public' AND table_name = 'pgmq_' || p_queue_name
+    -- For pgmq schema with q_ prefix
+    query_text := format(
+      'SELECT %L::TEXT, %L::TEXT, %L::TEXT, 
+       (SELECT COUNT(*)::BIGINT FROM pgmq.q_%I WHERE TRUE)',
+      'pgmq', 
+      'q_' || p_queue_name, 
+      'pgmq.q_' || p_queue_name,
+      p_queue_name
     );
+    
+    query_text := query_text || format(
+      ' WHERE EXISTS (SELECT 1 FROM information_schema.tables t 
+       WHERE t.table_schema = %L AND t.table_name = %L)',
+      'pgmq', 'q_' || p_queue_name
+    );
+    
+    RETURN QUERY EXECUTE query_text;
+    
+    -- For public schema with pgmq_ prefix
+    query_text := format(
+      'SELECT %L::TEXT, %L::TEXT, %L::TEXT, 
+       (SELECT COUNT(*)::BIGINT FROM public.pgmq_%I WHERE TRUE)',
+      'public', 
+      'pgmq_' || p_queue_name, 
+      'public.pgmq_' || p_queue_name,
+      p_queue_name
+    );
+    
+    query_text := query_text || format(
+      ' WHERE EXISTS (SELECT 1 FROM information_schema.tables t 
+       WHERE t.table_schema = %L AND t.table_name = %L)',
+      'public', 'pgmq_' || p_queue_name
+    );
+    
+    RETURN QUERY EXECUTE query_text;
   ELSE
-    -- Return all PGMQ tables in both schemas
-    -- Fix the column reference ambiguity by using table alias
+    -- List all queue tables in both schemas
     RETURN QUERY
     SELECT 
       t.table_schema::TEXT AS schema_name,
