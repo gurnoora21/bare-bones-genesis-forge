@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -37,7 +38,7 @@ serve(async (req) => {
         console.log(`Starting scan with cursor: ${cursor}`);
         
         // Scan for all deduplication keys
-        const [nextCursor, keys] = await redis.scan(
+        const scanResult = await redis.scan(
           cursor,
           "MATCH",
           "dedup:*",
@@ -45,12 +46,21 @@ serve(async (req) => {
           100
         );
         
+        // Ensure scanResult is an array with two elements
+        if (!Array.isArray(scanResult) || scanResult.length !== 2) {
+          console.warn(`Unexpected scan result format: ${JSON.stringify(scanResult)}`);
+          break;
+        }
+        
+        const nextCursor = scanResult[0];
+        const keys = scanResult[1];
+        
         console.log(`Scan returned ${keys?.length || 0} keys. Next cursor: ${nextCursor}`);
         
         cursor = nextCursor;
         
-        if (keys && keys.length > 0) {
-          // Filter out any null or undefined keys and log them
+        if (keys && Array.isArray(keys) && keys.length > 0) {
+          // Filter out any null or undefined keys
           const validKeys = keys.filter(key => {
             if (key == null) {
               console.warn('Found null/undefined key in scan results');
@@ -68,18 +78,18 @@ serve(async (req) => {
             
             if (batch.length > 0) {
               try {
-                // Use unlink instead of del for better performance
-                // and handle each key individually to avoid null args
+                // Process each key individually to avoid null arguments
                 for (const key of batch) {
                   try {
-                    if (!key) {
-                      console.warn('Skipping null/undefined key in batch');
+                    if (typeof key !== 'string' || !key) {
+                      console.warn(`Skipping invalid key: ${key}`);
                       continue;
                     }
-                    console.log(`Attempting to unlink key: ${key}`);
-                    await redis.unlink(key);
+                    
+                    console.log(`Attempting to delete key: ${key}`);
+                    await redis.del(key);
                     clearedKeys++;
-                    console.log(`Successfully unlinked key: ${key}`);
+                    console.log(`Successfully deleted key: ${key}`);
                   } catch (keyError) {
                     console.error(`Error deleting key ${key}:`, {
                       error: keyError.message,

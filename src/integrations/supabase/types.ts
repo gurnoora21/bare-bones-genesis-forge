@@ -595,6 +595,15 @@ export type Database = {
         Args: { queue_name: string; message_id: string }
         Returns: boolean
       }
+      diagnose_queue_tables: {
+        Args: { p_queue_name?: string }
+        Returns: {
+          schema_name: string
+          table_name: string
+          full_name: string
+          record_count: number
+        }[]
+      }
       direct_pgmq_delete: {
         Args: { p_queue_name: string; p_message_id: string }
         Returns: boolean
@@ -615,8 +624,16 @@ export type Database = {
         }
         Returns: boolean
       }
+      ensure_all_queues_exist: {
+        Args: Record<PropertyKey, never>
+        Returns: string[]
+      }
       ensure_message_deleted: {
         Args: { queue_name: string; message_id: string; max_attempts?: number }
+        Returns: boolean
+      }
+      ensure_queue_exists: {
+        Args: { p_queue_name: string }
         Returns: boolean
       }
       execute_in_transaction: {
