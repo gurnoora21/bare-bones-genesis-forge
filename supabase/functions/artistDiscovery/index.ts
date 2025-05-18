@@ -9,6 +9,7 @@ import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
 import { safeStringify, logDebug } from "../_shared/debugHelper.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { validateMessage, ArtistDiscoveryMessageSchema, type ArtistDiscoveryMessage } from "../_shared/types/queueMessages.ts";
+import { readQueueMessages, deleteQueueMessage } from "../_shared/pgmqBridge.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -346,24 +347,26 @@ serve(async (req) => {
   }
   
   try {
-    // Read messages from the queue
-    const { data: messages, error: readError } = await supabase
-      .rpc("pgmq_read", {
-        queue_name: QUEUE_NAME,
-        max_messages: BATCH_SIZE,
-        visibility_timeout: VISIBILITY_TIMEOUT,
-      });
-
-    if (readError) {
-      throw readError;
-    }
+    console.log("Artist Discovery worker starting");
+    
+    // Use our new bridge function to read messages from the queue
+    console.log(`Reading messages from ${QUEUE_NAME} queue using bridge function`);
+    const messages = await readQueueMessages(
+      supabase,
+      QUEUE_NAME,
+      BATCH_SIZE,
+      VISIBILITY_TIMEOUT
+    );
 
     if (!messages || messages.length === 0) {
+      console.log("No messages to process");
       return new Response(
         JSON.stringify({ message: "No messages to process" }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
+
+    console.log(`Retrieved ${messages.length} messages to process`);
 
     const results = [];
     const errors = [];
@@ -371,35 +374,43 @@ serve(async (req) => {
     for (const message of messages) {
       try {
         // Validate the message format
-        const validatedMessage = validateMessage(ArtistDiscoveryMessageSchema, message);
+        console.log(`Validating message format for message ID: ${message.id}`);
+        const messageBody = typeof message.message === 'string'
+          ? JSON.parse(message.message)
+          : message.message;
+          
+        const validatedMessage = validateMessage(ArtistDiscoveryMessageSchema, messageBody);
         
         // Process the validated message
+        console.log(`Processing artist: ${validatedMessage.artistName}`);
         const result = await processMessage(validatedMessage);
         
         if (result.success) {
-          // Delete the message from the queue after successful processing
-          await supabase.rpc("pgmq_delete", {
-            queue_name: QUEUE_NAME,
-            message_id: message.id,
-          });
+          // Delete the message from the queue after successful processing using our bridge function
+          console.log(`Processing successful, deleting message ID: ${message.id}`);
+          await deleteQueueMessage(supabase, QUEUE_NAME, message.id);
+          
           results.push({ id: message.id, status: "success" });
         } else {
           errors.push({ id: message.id, error: result.error });
         }
       } catch (error) {
-        console.error("Error processing message:", error);
+        console.error(`Error processing message ${message.id}:`, error);
         errors.push({ id: message.id, error: error.message });
         
         // If it's a validation error, send to DLQ
         if (error.message.includes("Invalid message format")) {
-          await supabase.rpc("pgmq_send", {
-            queue_name: `${QUEUE_NAME}_dlq`,
-            message: {
-              originalMessage: message,
-              error: error.message,
-              timestamp: new Date().toISOString(),
-            },
-          });
+          console.log(`Validation error, sending message ${message.id} to DLQ`);
+          try {
+            await supabase.rpc("move_to_dead_letter_queue", {
+              source_queue: QUEUE_NAME, 
+              dlq_name: `${QUEUE_NAME}_dlq`,
+              message_id: message.id,
+              failure_reason: error.message
+            });
+          } catch (dlqError) {
+            console.error(`Failed to send to DLQ: ${dlqError.message}`);
+          }
         }
       }
     }
@@ -414,7 +425,7 @@ serve(async (req) => {
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
-    console.error("Error:", error);
+    console.error("Fatal Error:", error);
     return new Response(
       JSON.stringify({ error: error.message }),
       { 
