@@ -241,6 +241,15 @@ serve(async (req) => {
           throw new Error(`Invalid message format: message body is empty or null`);
         }
         
+        // Add missing required fields if they don't exist
+        if (!messageBody.artistSpotifyId && messageBody.spotifyId) {
+          messageBody.artistSpotifyId = messageBody.spotifyId;
+        }
+        
+        if (!messageBody.albumName && messageBody.artistName) {
+          messageBody.albumName = `Albums by ${messageBody.artistName}`;
+        }
+        
         const validatedMessage = validateMessage(AlbumDiscoveryMessageSchema, messageBody);
         
         // Process the validated message

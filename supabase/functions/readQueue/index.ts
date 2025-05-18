@@ -1,6 +1,6 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { logDebug, logError } from "../_shared/debugHelper.ts";
 
 // Initialize Supabase client
 const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
@@ -30,30 +30,9 @@ serve(async (req) => {
       );
     }
     
-    console.log(`Reading up to ${batch_size} messages from queue ${queue_name} with visibility timeout ${visibility_timeout}s`);
+    logDebug("ReadQueue", `Reading up to ${batch_size} messages from queue ${queue_name} with visibility timeout ${visibility_timeout}s`);
     
-    // Try the updated pgmq_read_safe function first
-    const { data: safeData, error: safeError } = await supabase.rpc('pgmq_read_safe', {
-      queue_name: queue_name,
-      max_messages: batch_size,
-      visibility_timeout: visibility_timeout
-    });
-    
-    if (!safeError && safeData) {
-      console.log(`Successfully read messages using pgmq_read_safe`);
-      const messages = typeof safeData === 'string' ? JSON.parse(safeData) : safeData;
-      
-      return new Response(
-        JSON.stringify(messages || []),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    if (safeError) {
-      console.warn(`pgmq_read_safe error: ${safeError.message}. Falling back to pg_dequeue.`);
-    }
-    
-    // Fall back to pg_dequeue if pgmq_read_safe fails
+    // Use pg_dequeue directly - the standard way to read messages
     const { data, error } = await supabase.rpc('pg_dequeue', {
       queue_name: queue_name,
       batch_size: batch_size,
@@ -61,7 +40,7 @@ serve(async (req) => {
     });
     
     if (error) {
-      console.error(`Error reading from queue:`, error);
+      logError("ReadQueue", `Error reading from queue: ${error.message}`);
       return new Response(
         JSON.stringify({ error: error.message }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -70,6 +49,7 @@ serve(async (req) => {
     
     // Parse the JSON result if it's a string
     const messages = typeof data === 'string' ? JSON.parse(data) : data;
+    logDebug("ReadQueue", `Successfully read ${messages?.length || 0} messages from queue ${queue_name}`);
     
     return new Response(
       JSON.stringify(messages || []),
@@ -77,7 +57,7 @@ serve(async (req) => {
     );
     
   } catch (error) {
-    console.error("Error in readQueue handler:", error);
+    logError("ReadQueue", `Unexpected error: ${error.message}`);
     
     return new Response(
       JSON.stringify({ error: error.message }),
