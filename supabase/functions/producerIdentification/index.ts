@@ -7,6 +7,8 @@ import { EnhancedWorkerBase } from "../_shared/enhancedWorkerBase.ts";
 import { StructuredLogger } from "../_shared/structuredLogger.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { validateMessage, ProducerIdentificationMessageSchema, type ProducerIdentificationMessage } from "../_shared/types/queueMessages.ts";
+import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
+import { readQueueMessages, deleteQueueMessage } from "../_shared/pgmqBridge.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -139,31 +141,34 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
             logger.error(`Error creating track-producer relationship:`, relationError);
           }
           
-          // Enqueue social enrichment for this producer
-          // Note: We'll use Redis to deduplicate across workers
-          const enrichmentKey = `enqueued:enrichment:${producerId}`;
-          const alreadyEnqueued = await this.redis.get(enrichmentKey);
-          
-          if (!alreadyEnqueued) {
-            // Enqueue social enrichment task
-            const queueResult = await this.supabase.functions.invoke('sendToQueue', {
-              body: {
-                queue_name: 'social_enrichment',
-                message: {
-                  producerId: producerId,
-                  producerName: producer.name
-                },
-                idempotency_key: `producer:${producerId}`
-              }
-            });
-            
-            if (queueResult.error) {
-              logger.error(`Failed to enqueue social enrichment:`, queueResult.error);
-            } else {
-              // Mark as enqueued in Redis
-              await this.redis.set(enrichmentKey, 'true', { ex: 86400 }); // 24 hour TTL
-            }
-          }
+      // Enqueue social enrichment for this producer
+      // Note: We'll use Redis to deduplicate across workers
+      const enrichmentKey = `enqueued:enrichment:${producerId}`;
+      const alreadyEnqueued = await this.redis.get(enrichmentKey);
+      
+      if (!alreadyEnqueued) {
+        // Get queue helper
+        const queueHelper = getQueueHelper(this.supabase, this.redis);
+        
+        // Enqueue social enrichment task directly
+        const messageId = await queueHelper.enqueue(
+          'social_enrichment',
+          {
+            producerId: producerId,
+            producerName: producer.name
+          },
+          `producer:${producerId}`,
+          { ttl: 86400 } // 24 hour TTL
+        );
+        
+        if (messageId) {
+          // Mark as enqueued in Redis
+          await this.redis.set(enrichmentKey, 'true', { ex: 86400 }); // 24 hour TTL
+          logger.info(`Enqueued social enrichment for producer ${producer.name}`);
+        } else {
+          logger.error(`Failed to enqueue social enrichment for producer ${producer.name}`);
+        }
+      }
         }
       } else {
         logger.info(`No producers found for track ${trackName}`);
@@ -213,24 +218,24 @@ serve(async (req) => {
   }
 
   try {
-    // Read messages from the queue
-    const { data: messages, error: readError } = await supabase
-      .rpc("pgmq_read", {
-        queue_name: QUEUE_NAME,
-        max_messages: BATCH_SIZE,
-        visibility_timeout: VISIBILITY_TIMEOUT,
-      });
-
-    if (readError) {
-      throw readError;
-    }
+    // Use our bridge function to read messages from the queue
+    console.log(`Reading messages from ${QUEUE_NAME} queue using bridge function`);
+    const messages = await readQueueMessages(
+      supabase,
+      QUEUE_NAME,
+      BATCH_SIZE,
+      VISIBILITY_TIMEOUT
+    );
 
     if (!messages || messages.length === 0) {
+      console.log("No messages to process");
       return new Response(
         JSON.stringify({ message: "No messages to process" }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
+
+    console.log(`Retrieved ${messages.length} messages to process`);
 
     const results = [];
     const errors = [];
@@ -238,35 +243,50 @@ serve(async (req) => {
     for (const message of messages) {
       try {
         // Validate the message format
-        const validatedMessage = validateMessage(ProducerIdentificationMessageSchema, message);
+        console.log(`Validating message format for message ID: ${message.id}`);
+        const messageBody = typeof message.message === 'string' 
+          ? JSON.parse(message.message) 
+          : message.message;
+        
+        if (!messageBody) {
+          throw new Error(`Invalid message format: message body is empty or null`);
+        }
+        
+        const validatedMessage = validateMessage(ProducerIdentificationMessageSchema, messageBody);
         
         // Process the validated message
+        console.log(`Processing producer identification for track: ${validatedMessage.trackName}`);
         const result = await processMessage(validatedMessage);
         
         if (result.success) {
-          // Delete the message from the queue after successful processing
-          await supabase.rpc("pgmq_delete", {
-            queue_name: QUEUE_NAME,
-            message_id: message.id,
-          });
+          // Delete the message from the queue after successful processing using our bridge function
+          console.log(`Processing successful, deleting message ID: ${message.id}`);
+          await deleteQueueMessage(supabase, QUEUE_NAME, message.id);
+          
           results.push({ id: message.id, status: "success" });
         } else {
           errors.push({ id: message.id, error: result.error });
         }
       } catch (error) {
-        console.error("Error processing message:", error);
+        console.error(`Error processing message ${message.id}:`, error);
         errors.push({ id: message.id, error: error.message });
         
         // If it's a validation error, send to DLQ
-        if (error.message.includes("Invalid message format")) {
-          await supabase.rpc("pgmq_send", {
-            queue_name: `${QUEUE_NAME}_dlq`,
-            message: {
-              originalMessage: message,
-              error: error.message,
-              timestamp: new Date().toISOString(),
-            },
-          });
+        if (error.message.includes("Invalid message format") || error.message.includes("Required")) {
+          console.log(`Validation error, sending message ${message.id} to DLQ`);
+          try {
+            // Use QueueHelper to send to DLQ
+            const queueHelper = getQueueHelper(supabase, redis);
+            await queueHelper.sendToDLQ(
+              QUEUE_NAME,
+              message.id,
+              message,
+              error.message,
+              { timestamp: new Date().toISOString() }
+            );
+          } catch (dlqError) {
+            console.error(`Failed to send to DLQ: ${dlqError.message}`);
+          }
         }
       }
     }

@@ -1,11 +1,24 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
+import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { corsHeaders } from "../_shared/cors.ts";
 import { validateMessage, TrackDiscoveryMessageSchema, type TrackDiscoveryMessage } from "../_shared/types/queueMessages.ts";
+import { readQueueMessages, deleteQueueMessage } from "../_shared/pgmqBridge.ts";
+import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
+import { logDebug, logError } from "../_shared/debugHelper.ts";
+
+// Initialize Redis client
+const redis = new Redis({
+  url: Deno.env.get("UPSTASH_REDIS_REST_URL") || "",
+  token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN") || "",
+});
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+// Initialize QueueHelper
+const queueHelper = getQueueHelper(supabase, redis);
 
 const QUEUE_NAME = "track_discovery";
 const BATCH_SIZE = 10;
@@ -34,24 +47,24 @@ serve(async (req) => {
   }
 
   try {
-    // Read messages from the queue
-    const { data: messages, error: readError } = await supabase
-      .rpc("pgmq_read", {
-        queue_name: QUEUE_NAME,
-        max_messages: BATCH_SIZE,
-        visibility_timeout: VISIBILITY_TIMEOUT,
-      });
-
-    if (readError) {
-      throw readError;
-    }
+    // Use our bridge function to read messages from the queue
+    console.log(`Reading messages from ${QUEUE_NAME} queue using bridge function`);
+    const messages = await readQueueMessages(
+      supabase,
+      QUEUE_NAME,
+      BATCH_SIZE,
+      VISIBILITY_TIMEOUT
+    );
 
     if (!messages || messages.length === 0) {
+      console.log("No messages to process");
       return new Response(
         JSON.stringify({ message: "No messages to process" }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
+
+    console.log(`Retrieved ${messages.length} messages to process`);
 
     const results = [];
     const errors = [];
@@ -59,35 +72,49 @@ serve(async (req) => {
     for (const message of messages) {
       try {
         // Validate the message format
-        const validatedMessage = validateMessage(TrackDiscoveryMessageSchema, message);
+        console.log(`Validating message format for message ID: ${message.id}`);
+        const messageBody = typeof message.message === 'string' 
+          ? JSON.parse(message.message) 
+          : message.message;
+        
+        if (!messageBody) {
+          throw new Error(`Invalid message format: message body is empty or null`);
+        }
+        
+        const validatedMessage = validateMessage(TrackDiscoveryMessageSchema, messageBody);
         
         // Process the validated message
+        console.log(`Processing track: ${validatedMessage.trackName}`);
         const result = await processMessage(validatedMessage);
         
         if (result.success) {
-          // Delete the message from the queue after successful processing
-          await supabase.rpc("pgmq_delete", {
-            queue_name: QUEUE_NAME,
-            message_id: message.id,
-          });
+          // Delete the message from the queue after successful processing using our bridge function
+          console.log(`Processing successful, deleting message ID: ${message.id}`);
+          await deleteQueueMessage(supabase, QUEUE_NAME, message.id);
+          
           results.push({ id: message.id, status: "success" });
         } else {
           errors.push({ id: message.id, error: result.error });
         }
       } catch (error) {
-        console.error("Error processing message:", error);
+        console.error(`Error processing message ${message.id}:`, error);
         errors.push({ id: message.id, error: error.message });
         
         // If it's a validation error, send to DLQ
-        if (error.message.includes("Invalid message format")) {
-          await supabase.rpc("pgmq_send", {
-            queue_name: `${QUEUE_NAME}_dlq`,
-            message: {
-              originalMessage: message,
-              error: error.message,
-              timestamp: new Date().toISOString(),
-            },
-          });
+        if (error.message.includes("Invalid message format") || error.message.includes("Required")) {
+          console.log(`Validation error, sending message ${message.id} to DLQ`);
+          try {
+            // Use QueueHelper to send to DLQ
+            await queueHelper.sendToDLQ(
+              QUEUE_NAME,
+              message.id,
+              message,
+              error.message,
+              { timestamp: new Date().toISOString() }
+            );
+          } catch (dlqError) {
+            console.error(`Failed to send to DLQ: ${dlqError.message}`);
+          }
         }
       }
     }
@@ -102,7 +129,7 @@ serve(async (req) => {
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
-    console.error("Error:", error);
+    console.error("Fatal Error:", error);
     return new Response(
       JSON.stringify({ error: error.message }),
       { 

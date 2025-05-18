@@ -143,135 +143,36 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
         artistId = newArtist.id;
       }
       
-      // Enqueue album discovery for this artist using multiple approaches
-      // with robust error handling to ensure it gets enqueued
+      // Enqueue album discovery for this artist
       
       // Create a consistent deduplication key for album discovery
       const albumDedupKey = `album_discovery:artist:${artist.id}:offset:0`;
       logger.info(`Enqueueing album discovery for artist ${artist.name} (${artist.id})`);
       
-      // Log the exact dedup key being used
-      logDebug("AlbumDiscovery", "Using deduplication key", albumDedupKey);
-      
-      // Prepare message with more details for better debugging
+      // Prepare message with necessary details
       const albumMessage = {
         spotifyId: artist.id,
         artistName: artist.name,
         artistId: artistId,
-        enqueueTime: new Date().toISOString(),
-        requestId: `album-discovery-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
+        enqueueTime: new Date().toISOString()
       };
       
-      let enqueueSuccess = false;
+      // Use QueueHelper to enqueue with deduplication
+      const enqueueResult = await queueHelper.enqueue(
+        'album_discovery',
+        albumMessage,
+        albumDedupKey,
+        { ttl: 86400 * 7 } // 7 day TTL to avoid duplicate processing
+      );
       
-      // Approach 1: Try using the QueueHelper
-      try {
-        const enqueueResult = await queueHelper.enqueue(
-          'album_discovery',
-          albumMessage,
-          albumDedupKey,
-          { ttl: 86400 * 7 } // 7 day TTL to avoid duplicate processing
-        );
-        
-        if (enqueueResult) {
-          logger.info(`Album discovery enqueued successfully`, { 
-            artistName: artist.name,
-            artistId: artist.id,
-            messageId: enqueueResult
-          });
-          
-          enqueueSuccess = true;
-        }
-      } catch (enqueueError) {
-        logger.error(`Failed to enqueue album discovery via queueHelper:`, {
-          error: enqueueError.message,
+      if (enqueueResult) {
+        logger.info(`Album discovery enqueued successfully`, { 
           artistName: artist.name,
           artistId: artist.id,
-          stack: enqueueError.stack
+          messageId: enqueueResult
         });
-        // Continue to next approach
-      }
-      
-      // Approach 2: If QueueHelper failed, try direct database function
-      if (!enqueueSuccess) {
-        logger.warn(`Trying direct database method for album discovery enqueue`, {
-          artistName: artist.name,
-          artistId: artist.id
-        });
-        
-        try {
-          // Try direct pg_enqueue function
-          const { data: pgData, error: pgError } = await this.supabase.rpc('pg_enqueue', {
-            queue_name: 'album_discovery',
-            message_body: albumMessage
-          });
-          
-          if (pgError) {
-            logger.error(`pg_enqueue failed:`, {
-              error: pgError.message,
-              artistName: artist.name,
-              artistId: artist.id
-            });
-          } else {
-            logger.info(`Album discovery enqueued via pg_enqueue`, {
-              artistName: artist.name,
-              artistId: artist.id,
-              messageId: pgData
-            });
-            
-            enqueueSuccess = true;
-          }
-        } catch (pgError) {
-          logger.error(`Exception in pg_enqueue:`, {
-            error: pgError.message,
-            artistName: artist.name,
-            artistId: artist.id
-          });
-          // Continue to next approach
-        }
-      }
-      
-      // Approach 3: Last resort - use raw SQL
-      if (!enqueueSuccess) {
-        logger.warn(`Trying raw SQL for album discovery enqueue`, {
-          artistName: artist.name,
-          artistId: artist.id
-        });
-        
-        try {
-          // Use raw SQL as the final fallback
-          const { data: sqlData, error: sqlError } = await this.supabase.rpc('raw_sql_query', {
-            sql_query: `SELECT pgmq.send($1, $2::jsonb) AS msg_id`,
-            params: JSON.stringify(['album_discovery', JSON.stringify(albumMessage)])
-          });
-          
-          if (sqlError) {
-            logger.error(`Raw SQL enqueue failed:`, {
-              error: sqlError.message,
-              artistName: artist.name,
-              artistId: artist.id
-            });
-          } else {
-            logger.info(`Album discovery enqueued via raw SQL`, {
-              artistName: artist.name,
-              artistId: artist.id,
-              result: sqlData
-            });
-            
-            enqueueSuccess = true;
-          }
-        } catch (sqlError) {
-          logger.error(`Exception in raw SQL enqueue:`, {
-            error: sqlError.message,
-            artistName: artist.name,
-            artistId: artist.id
-          });
-        }
-      }
-      
-      // Log final enqueue status
-      if (!enqueueSuccess) {
-        logger.error(`Failed to enqueue album discovery after all attempts`, {
+      } else {
+        logger.error(`Failed to enqueue album discovery`, {
           artistName: artist.name,
           artistId: artist.id
         });
@@ -284,7 +185,7 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
         result: 'success',
         artistId,
         spotifyId: artist.id,
-        albumEnqueued: enqueueSuccess
+        albumEnqueued: !!enqueueResult
       };
     } catch (error) {
       logger.error(`Error processing artist ${artistName}:`, error);

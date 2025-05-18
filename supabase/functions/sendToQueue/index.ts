@@ -1,7 +1,6 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
-import { safeStringify, logDebug } from "../_shared/debugHelper.ts";
+import { logDebug, logError } from "../_shared/debugHelper.ts";
 
 // Initialize Supabase client
 const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
@@ -56,24 +55,17 @@ serve(async (req) => {
     logDebug("SendToQueue", `Creating queue if not exists...`, { executionId });
     
     try {
-      // First try with pgmq.create directly
       const { error: createError } = await supabase.rpc('raw_sql_query', {
         sql_query: `SELECT pgmq.create($1)`,
         params: JSON.stringify([normalizedQueueName])
       });
       
       if (createError) {
-        logDebug("SendToQueue", `Error creating queue with pgmq.create:`, { 
-          executionId,
-          error: safeStringify(createError)
-        });
+        logDebug("SendToQueue", `Error creating queue with pgmq.create: ${createError.message}`);
         // Continue anyway - queue might exist already
       }
     } catch (createErr) {
-      logDebug("SendToQueue", `Exception creating queue:`, { 
-        executionId, 
-        error: safeStringify(createErr)
-      });
+      logDebug("SendToQueue", `Exception creating queue: ${createErr.message}`);
       // Continue anyway - might exist already
     }
     
@@ -82,125 +74,51 @@ serve(async (req) => {
     // Format message to ensure it's properly handled
     const messageToSend = typeof message === 'string' ? message : JSON.stringify(message);
     
-    // Send message to queue - try multiple approaches
+    // Send message to queue using pg_enqueue - the standard way to enqueue messages
     logDebug("SendToQueue", `Sending message to queue...`, { executionId });
     
-    // Approach 1: Use pg_send_text function
     try {
-      const { data, error } = await supabase.rpc('pg_send_text', {
-        queue_name: normalizedQueueName,
-        msg_text: messageToSend
-      });
-
-      if (error) {
-        logDebug("SendToQueue", `Error with pg_send_text:`, { 
-          executionId,
-          error: safeStringify(error)
-        });
-      } else {
-        logDebug("SendToQueue", `Message sent successfully using pg_send_text, ID: ${data}`, { executionId });
-        return new Response(
-          JSON.stringify({ 
-            success: true, 
-            message_id: data,
-            queue_name: normalizedQueueName
-          }),
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    } catch (error) {
-      logDebug("SendToQueue", `Exception using pg_send_text:`, { 
-        executionId,
-        error: safeStringify(error)
-      });
-    }
-    
-    // Approach 2: Use pg_enqueue function
-    try {
+      // Parse the message to JSON if it's a string
+      const messageBody = typeof message === 'string' ? JSON.parse(message) : message;
+      
       const { data, error } = await supabase.rpc('pg_enqueue', {
         queue_name: normalizedQueueName,
-        message_body: JSON.parse(messageToSend)
+        message_body: messageBody
       });
       
       if (error) {
-        logDebug("SendToQueue", `Error with pg_enqueue:`, { 
-          executionId,
-          error: safeStringify(error)
-        });
-      } else {
-        logDebug("SendToQueue", `Message sent successfully using pg_enqueue, ID: ${data}`, { executionId });
+        logError("SendToQueue", `Error enqueueing message: ${error.message}`);
         return new Response(
           JSON.stringify({ 
-            success: true, 
-            message_id: data,
-            queue_name: normalizedQueueName
-          }),
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    } catch (error) {
-      logDebug("SendToQueue", `Exception using pg_enqueue:`, { 
-        executionId,
-        error: safeStringify(error)
-      });
-    }
-    
-    // Approach 3: Fall back to raw SQL to call pgmq.send directly
-    try {
-      const { data: rawData, error: rawError } = await supabase.rpc('raw_sql_query', {
-        sql_query: `SELECT send FROM pgmq.send($1, $2::jsonb) AS send`,
-        params: JSON.stringify([
-          normalizedQueueName, 
-          messageToSend
-        ])
-      });
-      
-      if (rawError) {
-        logDebug("SendToQueue", `Error sending message with raw SQL:`, { 
-          executionId,
-          error: safeStringify(rawError)
-        });
-        return new Response(
-          JSON.stringify({ 
-            error: 'Failed to send message after multiple attempts',
-            details: rawError.message
+            error: 'Failed to send message',
+            details: error.message
           }),
           { status: 500, headers: corsHeaders }
         );
       }
       
-      logDebug("SendToQueue", `Message sent successfully via raw SQL, ID:`, { 
-        executionId,
-        result: safeStringify(rawData)
-      });
-      
+      logDebug("SendToQueue", `Message sent successfully, ID: ${data}`, { executionId });
       return new Response(
         JSON.stringify({ 
           success: true, 
-          message_id: rawData?.result,
+          message_id: data,
           queue_name: normalizedQueueName
         }),
-        { status: 200, headers: corsHeaders }
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
-    } catch (sendError) {
-      logDebug("SendToQueue", `Exception sending message with raw SQL:`, { 
-        executionId,
-        error: safeStringify(sendError)
-      });
+    } catch (error) {
+      logError("SendToQueue", `Exception sending message: ${error.message}`);
       
       return new Response(
         JSON.stringify({ 
           error: 'Failed to send message',
-          details: sendError.message
+          details: error.message
         }),
         { status: 500, headers: corsHeaders }
       );
     }
   } catch (error) {
-    logDebug("SendToQueue", `Unexpected error:`, { 
-      executionId,
-      error: safeStringify(error)
-    });
+    logError("SendToQueue", `Unexpected error: ${error.message}`);
     
     return new Response(
       JSON.stringify({ 
