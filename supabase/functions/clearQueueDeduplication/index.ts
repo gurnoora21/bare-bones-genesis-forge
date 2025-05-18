@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -33,31 +32,25 @@ serve(async (req) => {
     
     // Get all keys with the dedup prefix
     try {
-      let cursor = '0';
+      let cursor = 0;
       do {
         console.log(`Starting scan with cursor: ${cursor}`);
         
-        // Scan for all deduplication keys
-        const scanResult = await redis.scan(
-          cursor,
-          "MATCH",
-          "dedup:*",
-          "COUNT",
-          100
-        );
+        // Use scan with proper parameters for Upstash
+        const scanResult = await redis.scan(cursor, {
+          match: "dedup:*",
+          count: 100
+        });
         
-        // Ensure scanResult is an array with two elements
-        if (!Array.isArray(scanResult) || scanResult.length !== 2) {
+        if (!scanResult || !Array.isArray(scanResult) || scanResult.length !== 2) {
           console.warn(`Unexpected scan result format: ${JSON.stringify(scanResult)}`);
           break;
         }
         
-        const nextCursor = scanResult[0];
-        const keys = scanResult[1];
-        
+        const [nextCursor, keys] = scanResult;
         console.log(`Scan returned ${keys?.length || 0} keys. Next cursor: ${nextCursor}`);
         
-        cursor = nextCursor;
+        cursor = parseInt(nextCursor);
         
         if (keys && Array.isArray(keys) && keys.length > 0) {
           // Filter out any null or undefined keys
@@ -108,7 +101,7 @@ serve(async (req) => {
             }
           }
         }
-      } while (cursor !== '0');
+      } while (cursor !== 0);
       
       console.log(`Successfully cleared ${clearedKeys} deduplication keys`);
       
