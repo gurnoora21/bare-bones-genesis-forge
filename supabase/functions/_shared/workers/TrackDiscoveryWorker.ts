@@ -1,4 +1,3 @@
-
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { logDebug, formatError } from "../debugHelper.ts";
@@ -170,12 +169,36 @@ export class TrackDiscoveryWorker {
    * Process a single message
    */
   private async processMessage(message: any): Promise<void> {
-    const { trackId, trackName, artistId } = message.message;
+    let messageContent = message.message;
     
-    logDebug("TrackDiscovery", `Processing track ${trackName} (${trackId}) by artist ${artistId}`);
+    // Handle string-encoded JSON messages
+    if (typeof messageContent === 'string') {
+      try {
+        messageContent = JSON.parse(messageContent);
+      } catch (e) {
+        // If parsing fails, keep the original message
+      }
+    }
+    
+    // Extract track details with proper fallbacks
+    const trackId = messageContent?.trackId || messageContent?.id;
+    const trackName = messageContent?.trackName || messageContent?.name || 'unknown';
+    const artistId = messageContent?.artistId;
+    const albumId = messageContent?.albumId;
+    
+    // Log with full details for debugging
+    logDebug(
+      "TrackDiscovery", 
+      `Processing track ${trackName} (${trackId}) by artist ${artistId || 'unknown'}`
+    );
+    
+    // Check if we have the minimum required information
+    if (!trackId && !trackName) {
+      throw new Error("Invalid track message: missing trackId and trackName");
+    }
     
     // Enqueue producer identification
-    await this.enqueueProducerIdentification(trackId, trackName, artistId);
+    await this.enqueueProducerIdentification(trackId, trackName, artistId, albumId);
   }
   
   /**
@@ -260,16 +283,29 @@ export class TrackDiscoveryWorker {
   
   /**
    * Enqueue a producer identification message for a track
+   * Updated to include optional albumId and ensure all fields are passed
    */
-  async enqueueProducerIdentification(trackId: string, trackName: string, artistId: string): Promise<string | null> {
+  async enqueueProducerIdentification(
+    trackId: string | undefined, 
+    trackName: string, 
+    artistId: string | undefined,
+    albumId?: string | undefined
+  ): Promise<string | null> {
     try {
       const message = {
         trackId,
         trackName,
         artistId,
+        albumId,
         _timestamp: Date.now(),
-        _operation: `producer_identification_${trackId}`
+        _operation: `producer_identification_${trackId || trackName}`
       };
+      
+      // Log what we're sending to verify data
+      logDebug(
+        "TrackDiscovery", 
+        `Enqueueing producer identification for track: ${trackName}, artist: ${artistId || 'unknown'}`
+      );
       
       // Use the imported queueHelper.enqueue directly rather than this.enqueueMessage
       return await queueHelper.enqueue(this.supabase, 'producer_identification', message);
