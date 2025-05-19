@@ -636,6 +636,10 @@ export type Database = {
         }
         Returns: Json
       }
+      execute_sql: {
+        Args: { sql: string; params?: Json }
+        Returns: Json
+      }
       find_inconsistent_states: {
         Args: { p_entity_type?: string; p_older_than_minutes?: number }
         Returns: {
@@ -741,6 +745,10 @@ export type Database = {
       }
       pg_delete_message: {
         Args: { queue_name: string; message_id: string }
+        Returns: boolean
+      }
+      pg_delete_message_alt: {
+        Args: { p_queue_name: string; p_message_id: string }
         Returns: boolean
       }
       pg_dequeue: {

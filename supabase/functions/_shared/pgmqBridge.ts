@@ -1,4 +1,3 @@
-
 /**
  * PGMQ Bridge Functions
  * 
@@ -154,7 +153,8 @@ export async function deleteQueueMessage(
   try {
     logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName} using pg_delete_message`);
     
-    // Use the pg_delete_message function which now uses our robust implementation
+    // Use ONLY the pg_delete_message function which has SECURITY DEFINER
+    // This ensures proper permission elevation and schema access
     const { data, error } = await supabase.rpc('pg_delete_message', {
       queue_name: queueName,
       message_id: messageIdStr
@@ -162,22 +162,6 @@ export async function deleteQueueMessage(
     
     if (error) {
       logError(MODULE_NAME, `Error deleting message ${messageIdStr} from queue ${queueName}: ${error.message}`);
-      
-      // Fallback to direct SQL if the function call fails
-      logDebug(MODULE_NAME, `Falling back to direct SQL deletion for message ${messageIdStr}`);
-      
-      const sql = `
-        SELECT pgmq.delete_message_robust($1, $2) as deleted
-      `;
-      
-      const result = await executeQueueSql(supabase, sql, [queueName, messageIdStr]);
-      
-      if (result && result.length > 0 && result[0].deleted) {
-        logDebug(MODULE_NAME, `Successfully deleted message ${messageIdStr} using fallback method`);
-        return true;
-      }
-      
-      logError(MODULE_NAME, `Failed to delete message ${messageIdStr} from queue ${queueName} using fallback method`);
       return false;
     }
     
@@ -188,6 +172,7 @@ export async function deleteQueueMessage(
     }
     
     // If we get here, the message wasn't deleted but no error was returned
+    // This could mean the message doesn't exist or was already deleted
     logDebug(MODULE_NAME, `Message ${messageIdStr} not found in queue ${queueName}, considering as deleted`);
     return true;
   } catch (error) {
