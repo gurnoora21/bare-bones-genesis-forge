@@ -61,12 +61,24 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
     const queueHelper = getQueueHelper(supabase, redis);
     const deduplication = getDeduplicationService(redis);
     
-    // Ensure we have the required fields
-    if (!message.spotifyId || !message.artistName) {
-      throw new Error("Missing required fields: spotifyId and artistName must be provided");
+    // Ensure we have the required fields with fallbacks
+    const spotifyId = message.spotifyId || message.artistSpotifyId || message.artist_spotify_id;
+    const artistName = message.artistName || message.artist_name || "Unknown Artist";
+    
+    if (!spotifyId) {
+      throw new Error("Missing required field: spotifyId must be provided");
     }
     
-    console.log(`Processing albums for artist ${message.artistName} (${message.spotifyId})`);
+    // Create a normalized message with all required fields
+    const normalizedMessage = {
+      ...message,
+      spotifyId,
+      artistName,
+      artistId: message.artistId || message.artist_id,
+      offset: message.offset || 0
+    };
+    
+    console.log(`Processing albums for artist ${normalizedMessage.artistName} (${normalizedMessage.spotifyId})`);
     
     // Fetch albums from Spotify
     const offset = message.offset || 0;
