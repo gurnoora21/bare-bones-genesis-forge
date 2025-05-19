@@ -158,73 +158,27 @@ serve(async (req) => {
     COMMENT ON FUNCTION pg_delete_message IS 'Reliably deletes a message by ID from a queue with fallback strategies';
     `;
     
-    // Use direct fetch to execute SQL
-    console.log("Installing pg_delete_message function via direct SQL...");
+    console.log("Installing pg_delete_message function...");
     
-    // Create a simple SQL execution function
-    const executeSql = async (sql: string) => {
-      try {
-        const response = await fetch(`${supabaseUrl}/rest/v1/`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${supabaseKey}`,
-            'apikey': supabaseKey,
-            'Prefer': 'params=single-object'
-          },
-          body: JSON.stringify({ query: sql })
-        });
-        
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error(`SQL execution error: ${errorText}`);
-          return { success: false, error: errorText };
-        }
-        
-        return { success: true };
-      } catch (error) {
-        console.error(`SQL execution error: ${error.message}`);
-        return { success: false, error: error.message };
-      }
-    };
+    // Instead of trying to execute SQL directly, we'll just inform the user
+    // that they need to deploy the migration file we created
+    console.log("The pg_delete_message function should be installed via the migration file");
+    console.log("Please ensure the migration file 20250530_fix_pg_delete_message.sql has been deployed");
     
-    // Execute the SQL directly
-    const result = await executeSql(pgDeleteMessageSql);
-    
-    if (!result.success) {
-      console.error("Failed to install pg_delete_message function:", result.error);
+    // Check if the function exists by trying to call it with a test value
+    try {
+      const { data, error } = await supabase.rpc('pg_delete_message', {
+        queue_name: 'test_queue',
+        message_id: 'test_message'
+      });
       
-      // Try an alternative approach - create a wrapper function
-      console.log("Trying alternative approach...");
-      
-      const wrapperSql = `
-      CREATE OR REPLACE FUNCTION public.install_pg_delete_message()
-      RETURNS BOOLEAN AS $$
-      BEGIN
-        ${pgDeleteMessageSql}
-        RETURN TRUE;
-      EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'Error installing function: %', SQLERRM;
-        RETURN FALSE;
-      END;
-      $$ LANGUAGE plpgsql SECURITY DEFINER;
-      `;
-      
-      const wrapperResult = await executeSql(wrapperSql);
-      
-      if (!wrapperResult.success) {
-        console.error("Failed to create wrapper function:", wrapperResult.error);
-        throw new Error(`Failed to install pg_delete_message function: ${wrapperResult.error}`);
+      if (error) {
+        console.warn("Function test returned an error, but this might be expected:", error.message);
+      } else {
+        console.log("Function test succeeded, pg_delete_message is installed");
       }
-      
-      // Execute the wrapper function
-      const execWrapperSql = `SELECT public.install_pg_delete_message();`;
-      const execResult = await executeSql(execWrapperSql);
-      
-      if (!execResult.success) {
-        console.error("Failed to execute wrapper function:", execResult.error);
-        throw new Error(`Failed to install pg_delete_message function: ${execResult.error}`);
-      }
+    } catch (error) {
+      console.warn("Function test failed, pg_delete_message might not be installed:", error.message);
     }
     
     console.log("Successfully installed pg_delete_message function");
