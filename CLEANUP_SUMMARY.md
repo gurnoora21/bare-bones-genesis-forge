@@ -112,6 +112,40 @@ The pipeline was tested to ensure it correctly processes messages through all st
 2. Verified that the UI can display the linked data without errors
 3. Tested error handling and fallback mechanisms
 
+## Core Pipeline Refactoring
+
+We've refactored the core pipeline functions to focus on the essential discovery flow:
+
+### 1. Track Discovery Worker
+
+Implemented a complete track discovery worker that:
+- Fetches tracks from Spotify for each album
+- Stores tracks in the database with proper metadata
+- Uses deduplication to avoid processing the same track multiple times
+- Enqueues producer identification jobs for each track
+- Handles pagination for albums with many tracks
+
+### 2. Producer Identification Worker
+
+Unified the producer identification implementation by:
+- Leveraging the existing ProducerIdentificationWorker class
+- Connecting the HTTP handler to use the worker's processMessage method
+- Ensuring proper message validation and error handling
+- Maintaining the Genius API integration for producer discovery
+- Properly enqueuing social enrichment jobs for discovered producers
+
+### 3. Social Enrichment Worker
+
+Simplified the social enrichment implementation by:
+- Removing the unused stub code
+- Relying entirely on the idempotent worker pattern
+- Ensuring proper transaction management for database operations
+- Maintaining the recursive discovery capability for related producers
+
 ## Conclusion
 
-By simplifying the queue operations and removing unnecessary complexity, we've restored the functionality of the music discovery pipeline while making it more maintainable and reliable.
+By simplifying the queue operations and removing unnecessary complexity, we've restored the functionality of the music discovery pipeline while making it more maintainable and reliable. The refactored pipeline now follows a consistent pattern across all workers:
+
+1. Artist Discovery → Album Discovery → Track Discovery → Producer Identification → Social Enrichment
+
+Each worker uses the same pattern for reading from queues, processing messages, and enqueueing the next step, making the code more consistent and easier to maintain.

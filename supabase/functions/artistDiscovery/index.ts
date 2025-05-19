@@ -29,18 +29,12 @@ const QUEUE_NAME = "artist_discovery";
 const BATCH_SIZE = 10;
 const VISIBILITY_TIMEOUT = 30; // seconds
 
-// Define the artist worker implementation
-class ArtistDiscoveryWorker extends EnhancedWorkerBase {
-  constructor() {
-    super('artist_discovery', supabase, 'ArtistDiscovery');
-  }
-
-  /**
-   * Process an artist discovery message
-   */
-  async processMessage(message: ArtistDiscoveryMessage): Promise<any> {
-    const logger = new StructuredLogger({ service: 'artist_discovery' });
-    
+/**
+ * Process an artist discovery message
+ * Looks up the artist on Spotify, inserts it into the database, and enqueues an album discovery job
+ */
+async function processMessage(message: ArtistDiscoveryMessage): Promise<{ success: boolean, error?: string }> {
+  try {
     // Handle different message formats more robustly
     let artistMessage = message;
     
@@ -52,210 +46,140 @@ class ArtistDiscoveryWorker extends EnhancedWorkerBase {
         try {
           artistMessage = JSON.parse(message.message);
         } catch (e) {
-          logger.warn("Failed to parse message string as JSON", { error: e.message });
+          logWarning("ArtistDiscovery", "Failed to parse message string as JSON", e);
           // Keep original message
         }
       }
     }
     
-    // Log the extracted message for debugging
-    logger.debug("Processing with extracted message", { extractedMessage: artistMessage });
-    
     // Ensure we have the artistName
     if (!artistMessage?.artistName) {
-      logger.error("Missing artistName in message", { message: artistMessage });
+      logError("ArtistDiscovery", "Missing artistName in message", { message: artistMessage });
       throw new Error("Missing artistName in message");
     }
     
     const artistName = artistMessage.artistName;
-    logger.info("Processing artist discovery message", { artistName });
+    logDebug("ArtistDiscovery", "Processing artist discovery message", { artistName });
     
-    // Generate deduplication key with consistent format: artist_discovery:artist:name:{normalized name}
-    const dedupKey = `artist_discovery:artist:name:${artistName.toLowerCase()}`;
+    // Get Spotify client
+    const spotifyClient = getSpotifyClient();
     
-    try {
-      // Get Spotify client
-      const spotifyClient = getSpotifyClient();
-      
-      // Lookup artist on Spotify
-      const searchResponse = await spotifyClient.getArtistByName(artistName);
-      
-      if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items || searchResponse.artists.items.length === 0) {
-        logger.info(`No results found for artist "${artistName}"`);
-        return { status: 'completed', result: 'no_results' };
-      }
-      
-      // Get the first result
-      const artist = searchResponse.artists.items[0];
-      
-      // Check if artist already exists in database
-      const { data: existingArtist } = await this.supabase
-        .from('artists')
-        .select('id')
-        .eq('spotify_id', artist.id)
-        .maybeSingle();
-      
-      let artistId;
-      
-      if (existingArtist) {
-        logger.info(`Artist ${artist.name} already exists, updating`);
-        artistId = existingArtist.id;
-        
-        // Update the artist
-        await this.supabase
-          .from('artists')
-          .update({
-            name: artist.name,
-            followers: artist.followers?.total || 0,
-            popularity: artist.popularity || 0,
-            image_url: artist.images?.[0]?.url,
-            metadata: {
-              genres: artist.genres,
-              updated_at: new Date().toISOString()
-            }
-          })
-          .eq('id', artistId);
-      } else {
-        logger.info(`Creating new artist: ${artist.name}`);
-        
-        // Insert the artist
-        const { data: newArtist, error: insertError } = await this.supabase
-          .from('artists')
-          .insert({
-            name: artist.name,
-            spotify_id: artist.id,
-            followers: artist.followers?.total || 0,
-            popularity: artist.popularity || 0,
-            image_url: artist.images?.[0]?.url,
-            metadata: {
-              genres: artist.genres,
-              created_at: new Date().toISOString()
-            }
-          })
-          .select('id')
-          .single();
-          
-        if (insertError) {
-          logger.error(`Error inserting artist ${artist.name}:`, insertError);
-          throw insertError;
-        }
-        
-        artistId = newArtist.id;
-      }
-      
-      // Enqueue album discovery for this artist
-      
-      // Create a consistent deduplication key for album discovery
-      const albumDedupKey = `album_discovery:artist:${artist.id}:offset:0`;
-      logger.info(`Enqueueing album discovery for artist ${artist.name} (${artist.id})`);
-      
-      // Prepare message with necessary details
-      const albumMessage = {
-        spotifyId: artist.id,
-        artistName: artist.name,
-        artistId: artistId,
-        enqueueTime: new Date().toISOString()
-      };
-      
-      // Use QueueHelper to enqueue with deduplication
-      const enqueueResult = await queueHelper.enqueue(
-        'album_discovery',
-        albumMessage,
-        albumDedupKey,
-        { ttl: 86400 * 7 } // 7 day TTL to avoid duplicate processing
-      );
-      
-      if (enqueueResult) {
-        logger.info(`Album discovery enqueued successfully`, { 
-          artistName: artist.name,
-          artistId: artist.id,
-          messageId: enqueueResult
-        });
-      } else {
-        logger.error(`Failed to enqueue album discovery`, {
-          artistName: artist.name,
-          artistId: artist.id
-        });
-      }
-      
-      // Return successful completion even if album enqueue failed
-      // We don't want to redo artist discovery just because album discovery couldn't be enqueued
-      return { 
-        status: 'completed',
-        result: 'success',
-        artistId,
-        spotifyId: artist.id,
-        albumEnqueued: !!enqueueResult
-      };
-    } catch (error) {
-      logger.error(`Error processing artist ${artistName}:`, error);
-      throw error;
+    // Lookup artist on Spotify
+    const searchResponse = await spotifyClient.getArtistByName(artistName);
+    
+    if (!searchResponse || !searchResponse.artists || !searchResponse.artists.items || searchResponse.artists.items.length === 0) {
+      logDebug("ArtistDiscovery", `No results found for artist "${artistName}"`);
+      return { success: true, result: 'no_results' };
     }
-  }
-
-  /**
-   * Required implementation of handleMessage from EnhancedWorkerBase
-   */
-  async handleMessage(message: ArtistDiscoveryMessage, logger: StructuredLogger): Promise<any> {
-    return this.processMessage(message);
-  }
-}
-
-// Function to process a message through the worker class
-async function processMessage(message: ArtistDiscoveryMessage): Promise<{ success: boolean, error?: string }> {
-  try {
-    const worker = new ArtistDiscoveryWorker();
-    const result = await worker.processMessage(message);
     
+    // Get the first result
+    const artist = searchResponse.artists.items[0];
+    
+    // Check if artist already exists in database
+    const { data: existingArtist } = await supabase
+      .from('artists')
+      .select('id')
+      .eq('spotify_id', artist.id)
+      .maybeSingle();
+    
+    let artistId;
+    
+    if (existingArtist) {
+      logDebug("ArtistDiscovery", `Artist ${artist.name} already exists, updating`);
+      artistId = existingArtist.id;
+      
+      // Update the artist
+      await supabase
+        .from('artists')
+        .update({
+          name: artist.name,
+          followers: artist.followers?.total || 0,
+          popularity: artist.popularity || 0,
+          image_url: artist.images?.[0]?.url,
+          metadata: {
+            genres: artist.genres,
+            updated_at: new Date().toISOString()
+          }
+        })
+        .eq('id', artistId);
+    } else {
+      logDebug("ArtistDiscovery", `Creating new artist: ${artist.name}`);
+      
+      // Insert the artist
+      const { data: newArtist, error: insertError } = await supabase
+        .from('artists')
+        .insert({
+          name: artist.name,
+          spotify_id: artist.id,
+          followers: artist.followers?.total || 0,
+          popularity: artist.popularity || 0,
+          image_url: artist.images?.[0]?.url,
+          metadata: {
+            genres: artist.genres,
+            created_at: new Date().toISOString()
+          }
+        })
+        .select('id')
+        .single();
+        
+      if (insertError) {
+        logError("ArtistDiscovery", `Error inserting artist ${artist.name}:`, insertError);
+        throw insertError;
+      }
+      
+      artistId = newArtist.id;
+    }
+    
+    // Enqueue album discovery for this artist
+    
+    // Create a consistent deduplication key for album discovery
+    const albumDedupKey = `album_discovery:artist:${artist.id}:offset:0`;
+    logDebug("ArtistDiscovery", `Enqueueing album discovery for artist ${artist.name} (${artist.id})`);
+    
+    // Prepare message with necessary details
+    const albumMessage = {
+      spotifyId: artist.id,
+      artistName: artist.name,
+      artistId: artistId,
+      enqueueTime: new Date().toISOString()
+    };
+    
+    // Use QueueHelper to enqueue with deduplication
+    const enqueueResult = await queueHelper.enqueue(
+      'album_discovery',
+      albumMessage,
+      albumDedupKey,
+      { ttl: 86400 * 7 } // 7 day TTL to avoid duplicate processing
+    );
+    
+    if (enqueueResult) {
+      logDebug("ArtistDiscovery", `Album discovery enqueued successfully`, { 
+        artistName: artist.name,
+        artistId: artist.id,
+        messageId: enqueueResult
+      });
+    } else {
+      logError("ArtistDiscovery", `Failed to enqueue album discovery`, {
+        artistName: artist.name,
+        artistId: artist.id
+      });
+    }
+    
+    // Return successful completion even if album enqueue failed
+    // We don't want to redo artist discovery just because album discovery couldn't be enqueued
     return { 
       success: true,
-      ...result 
+      status: 'completed',
+      result: 'success',
+      artistId,
+      spotifyId: artist.id,
+      albumEnqueued: !!enqueueResult
     };
   } catch (error) {
     logError("ArtistDiscovery", `Error processing artist message: ${error.message}`, error);
     return { 
       success: false, 
       error: error.message 
-    };
-  }
-}
-
-// Process a batch of artist discovery messages
-async function processArtistDiscovery() {
-  const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-  console.log(`[${executionId}] Starting artist discovery batch processing`);
-  
-  try {
-    const worker = new ArtistDiscoveryWorker();
-    
-    // Process multiple batches within the time limit
-    const result = await worker.processBatch({
-      maxBatches: 1,
-      batchSize: 5,
-      processorName: 'artist-discovery',
-      timeoutSeconds: 50,
-      visibilityTimeoutSeconds: 900, // 15 minutes
-      logDetailedMetrics: true,
-      sendToDlqOnMaxRetries: true,
-      maxRetries: 3,
-      deadLetterQueue: 'artist_discovery_dlq'
-    });
-    
-    console.log(`[${executionId}] Total messages processed: ${result.processed}, errors: ${result.errors}, duplicates: ${result.duplicates || 0}, skipped: ${result.skipped || 0}`);
-    
-    return {
-      processed: result.processed,
-      errors: result.errors,
-      duplicates: result.duplicates || 0,
-      skipped: result.skipped || 0,
-      processingTimeMs: result.processingTimeMs || 0,
-      success: result.errors === 0
-    };
-  } catch (batchError) {
-    console.error(`[${executionId}] Fatal error in artist discovery batch:`, batchError);
-    return { 
-      error: batchError.message,
-      success: false
     };
   }
 }

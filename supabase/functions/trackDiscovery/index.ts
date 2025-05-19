@@ -6,6 +6,8 @@ import { validateMessage, TrackDiscoveryMessageSchema, type TrackDiscoveryMessag
 import { readQueueMessages, deleteQueueMessage } from "../_shared/pgmqBridge.ts";
 import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
 import { logDebug, logError } from "../_shared/debugHelper.ts";
+import { SpotifyClient } from "../_shared/spotifyClient.ts";
+import { DeduplicationService, getDeduplicationService } from "../_shared/deduplication.ts";
 
 // Initialize Redis client
 const redis = new Redis({
@@ -19,24 +21,172 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 // Initialize QueueHelper
 const queueHelper = getQueueHelper(supabase, redis);
+// Initialize Deduplication Service
+const deduplication = getDeduplicationService(redis);
 
 const QUEUE_NAME = "track_discovery";
 const BATCH_SIZE = 10;
 const VISIBILITY_TIMEOUT = 30; // seconds
 
-async function processMessage(message: TrackDiscoveryMessage) {
+/**
+ * Process a track discovery message
+ * For each album, fetch its tracks from Spotify and store them in the database
+ * Then enqueue producer identification jobs for each track
+ */
+async function processMessage(message: TrackDiscoveryMessage): Promise<{ success: boolean, error?: string }> {
   try {
-    // Your existing message processing logic here
-    console.log("Processing track:", message.trackName);
+    const spotifyClient = new SpotifyClient();
     
-    // Example processing steps:
-    // 1. Fetch track details from Spotify
-    // 2. Store track in database
-    // 3. Enqueue for producer identification
+    // Extract required fields with fallbacks
+    const albumId = message.albumId;
+    const albumSpotifyId = message.spotifyId || message.albumSpotifyId;
+    const artistId = message.artistId;
+    const albumName = message.albumName || "Unknown Album";
+    const offset = message.offset || 0;
+    const limit = 50; // Spotify's default limit for tracks
     
-    return { success: true };
+    if (!albumSpotifyId) {
+      throw new Error("Missing required field: albumSpotifyId must be provided");
+    }
+    
+    if (!albumId) {
+      throw new Error("Missing required field: albumId must be provided");
+    }
+    
+    console.log(`Processing tracks for album ${albumName} (${albumSpotifyId}), offset: ${offset}`);
+    
+    // Fetch tracks from Spotify
+    const tracks = await spotifyClient.getAlbumTracks(albumSpotifyId, offset);
+    
+    if (!tracks || !tracks.items || tracks.items.length === 0) {
+      console.log(`No tracks found for album ${albumName}`);
+      return { success: true, message: "No tracks found" };
+    }
+    
+    console.log(`Found ${tracks.items.length} tracks for album ${albumName}`);
+    
+    // Process each track
+    const results = [];
+    
+    for (const track of tracks.items) {
+      // Generate a consistent deduplication key
+      const dedupKey = `track_discovery:track:${track.id}`;
+      
+      // Check if we've already processed this track
+      const isDuplicate = await deduplication.isDuplicate(QUEUE_NAME, dedupKey);
+      if (isDuplicate) {
+        console.log(`Track ${track.name} (${track.id}) already processed, skipping`);
+        continue;
+      }
+      
+      // Mark as processed to prevent duplicates
+      await deduplication.markAsProcessed(QUEUE_NAME, dedupKey, 86400 * 30); // 30 days TTL
+      
+      // Insert track into database
+      try {
+        // Check if track already exists
+        const { data: existingTrack } = await supabase
+          .from('tracks')
+          .select('id')
+          .eq('spotify_id', track.id)
+          .maybeSingle();
+          
+        let trackId;
+        
+        if (existingTrack) {
+          trackId = existingTrack.id;
+          console.log(`Track ${track.name} already exists, updating`);
+          
+          // Update track details
+          await supabase
+            .from('tracks')
+            .update({
+              name: track.name,
+              album_id: albumId,
+              duration_ms: track.duration_ms,
+              track_number: track.track_number,
+              metadata: {
+                preview_url: track.preview_url,
+                explicit: track.explicit,
+                updated_at: new Date().toISOString()
+              }
+            })
+            .eq('id', trackId);
+        } else {
+          console.log(`Creating new track: ${track.name}`);
+          
+          // Insert new track
+          const { data: newTrack, error: insertError } = await supabase
+            .from('tracks')
+            .insert({
+              album_id: albumId,
+              name: track.name,
+              spotify_id: track.id,
+              duration_ms: track.duration_ms,
+              track_number: track.track_number,
+              metadata: {
+                preview_url: track.preview_url,
+                explicit: track.explicit,
+                created_at: new Date().toISOString()
+              }
+            })
+            .select('id')
+            .single();
+            
+          if (insertError) {
+            console.error(`Error inserting track ${track.name}:`, insertError);
+            continue;
+          }
+          
+          trackId = newTrack.id;
+        }
+        
+        // Enqueue producer identification for this track
+        const producerDedupKey = `producer_identification:track:${track.id}`;
+        const producerMessage = {
+          trackId,
+          trackName: track.name,
+          trackSpotifyId: track.id,
+          artistId,
+          albumId
+        };
+        
+        const producerEnqueueResult = await queueHelper.enqueue(
+          'producer_identification',
+          producerMessage,
+          producerDedupKey,
+          { ttl: 86400 * 7 } // 7 day TTL
+        );
+        
+        console.log(`Enqueued producer identification for track ${track.name}, message ID: ${producerEnqueueResult}`);
+        results.push({ trackId, trackName: track.name, producerEnqueued: true });
+      } catch (error) {
+        console.error(`Error processing track ${track.name}:`, error);
+      }
+    }
+    
+    // If there are more tracks, enqueue the next batch
+    if (tracks.next) {
+      const nextOffset = offset + tracks.limit;
+      const nextDedupKey = `track_discovery:album:${albumSpotifyId}:offset:${nextOffset}`;
+      
+      await queueHelper.enqueue(
+        QUEUE_NAME,
+        { ...message, offset: nextOffset },
+        nextDedupKey,
+        { ttl: 86400 * 7 } // 7 day TTL
+      );
+      
+      console.log(`Enqueued next batch of tracks for ${albumName}, offset: ${nextOffset}`);
+    }
+    
+    return { 
+      success: true,
+      tracks: results.length,
+      hasMore: !!tracks.next
+    };
   } catch (error) {
-    console.error("Error processing message:", error);
+    console.error("Error processing track discovery message:", error);
     return { success: false, error: error.message };
   }
 }
@@ -84,7 +234,7 @@ serve(async (req) => {
         const validatedMessage = validateMessage(TrackDiscoveryMessageSchema, messageBody);
         
         // Process the validated message
-        console.log(`Processing track: ${validatedMessage.trackName}`);
+        console.log(`Processing tracks for album: ${validatedMessage.albumName || validatedMessage.spotifyId}`);
         const result = await processMessage(validatedMessage);
         
         if (result.success) {
@@ -104,7 +254,7 @@ serve(async (req) => {
           console.log(`Processing successful, deleting message ID: ${messageId}`);
           await deleteQueueMessage(supabase, QUEUE_NAME, messageId);
           
-          results.push({ id: messageId, status: "success" });
+          results.push({ id: messageId, status: "success", ...result });
         } else {
           errors.push({ id: message.id || message.msgId || message.msg_id || "unknown", error: result.error });
         }

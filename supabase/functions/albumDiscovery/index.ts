@@ -48,7 +48,7 @@ function formatReleaseDate(releaseDate: string | null | undefined): string | nul
   }
   
   // If unknown format, return null instead of crashing
-  console.warn(`Unknown release date format: ${releaseDate}`);
+  logWarning("AlbumDiscovery", `Unknown release date format: ${releaseDate}`);
   return null;
 }
 
@@ -109,60 +109,39 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
       // Mark as processed to prevent duplicates
       await deduplication.markAsProcessed(QUEUE_NAME, dedupKey, 86400 * 30);
       
-      // Insert album into database
+      // Insert or update album in database using upsert
       try {
-        const { data: existingAlbum } = await supabase
-          .from('albums')
-          .select('id')
-          .eq('spotify_id', album.id)
-          .maybeSingle();
-          
-        let albumId;
-        
-        if (existingAlbum) {
-          albumId = existingAlbum.id;
-          console.log(`Album ${album.name} already exists, updating`);
-          
-          await supabase
-            .from('albums')
-            .update({
-              name: album.name,
-              release_date: formatReleaseDate(album.release_date),
-              cover_url: album.images?.[0]?.url,
-              metadata: {
-                album_type: album.album_type,
-                total_tracks: album.total_tracks,
-                updated_at: new Date().toISOString()
-              }
-            })
-            .eq('id', albumId);
-        } else {
-          console.log(`Creating new album: ${album.name}`);
-          
-          const { data: newAlbum, error: insertError } = await supabase
-            .from('albums')
-            .insert({
-              artist_id: artistId,
-              name: album.name,
-              spotify_id: album.id,
-              release_date: formatReleaseDate(album.release_date),
-              cover_url: album.images?.[0]?.url,
-              metadata: {
-                album_type: album.album_type,
-                total_tracks: album.total_tracks,
-                created_at: new Date().toISOString()
-              }
-            })
-            .select('id')
-            .single();
-            
-          if (insertError) {
-            console.error(`Error inserting album ${album.name}:`, insertError);
-            continue;
+        // Prepare album data
+        const albumData = {
+          artist_id: artistId,
+          name: album.name,
+          spotify_id: album.id,
+          release_date: formatReleaseDate(album.release_date),
+          cover_url: album.images?.[0]?.url,
+          metadata: {
+            album_type: album.album_type,
+            total_tracks: album.total_tracks,
+            updated_at: new Date().toISOString()
           }
+        };
+        
+        // Use upsert operation
+        const { data: upsertedAlbum, error: upsertError } = await supabase
+          .from('albums')
+          .upsert(albumData, { 
+            onConflict: 'spotify_id',
+            returning: 'id'
+          })
+          .select('id')
+          .single();
           
-          albumId = newAlbum.id;
+        if (upsertError) {
+          logError("AlbumDiscovery", `Error upserting album ${album.name}:`, upsertError);
+          continue;
         }
+        
+        const albumId = upsertedAlbum.id;
+        logDebug("AlbumDiscovery", `Album ${album.name} upserted with ID ${albumId}`);
         
         // Enqueue track discovery for this album
         const trackDedupKey = `track_discovery:album:${album.id}:offset:0`;

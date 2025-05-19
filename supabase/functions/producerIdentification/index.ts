@@ -194,17 +194,25 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
   }
 }
 
+/**
+ * Process a producer identification message using the ProducerIdentificationWorker
+ * This function serves as a bridge between the HTTP handler and the worker class
+ */
 async function processMessage(message: ProducerIdentificationMessage) {
   try {
-    // Your existing message processing logic here
-    console.log("Processing producer:", message.producerName);
+    // Create an instance of the worker
+    const worker = new ProducerIdentificationWorker();
     
-    // Example processing steps:
-    // 1. Identify producer from track metadata
-    // 2. Store producer information
-    // 3. Enqueue for social enrichment if needed
+    // Use the worker's processMessage method to handle the message
+    const result = await worker.processMessage(message);
     
-    return { success: true };
+    // Map the worker result to the expected format
+    return { 
+      success: true,
+      trackId: result.trackId,
+      producersCount: result.producersCount || 0,
+      status: result.status
+    };
   } catch (error) {
     console.error("Error processing message:", error);
     return { success: false, error: error.message };

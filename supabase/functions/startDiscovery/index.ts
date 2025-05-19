@@ -62,117 +62,38 @@ serve(async (req) => {
     const idempotencyKey = `artist:name:${artistName.toLowerCase()}`;
     console.log(`[${executionId}] Generated idempotency key: ${idempotencyKey}`);
 
-    // DIRECT DATABASE APPROACH - Use the database function directly for reliable enqueuing
+    // Use the database function directly for reliable enqueuing
     console.log(`[${executionId}] Using direct database function start_artist_discovery...`);
-    const { data: directDbResult, error: directDbError } = await supabase.rpc('start_artist_discovery', {
+    const { data: messageId, error: dbError } = await supabase.rpc('start_artist_discovery', {
       artist_name: artistName
     });
     
-    if (directDbError) {
-      console.error(`[${executionId}] Failed to start artist discovery via direct DB call:`, directDbError);
-      
-      // Try the fallback approach with pg_enqueue
-      console.log(`[${executionId}] Attempting fallback with pg_enqueue RPC...`);
-      const { data: messageId, error: enqueueError } = await supabase.rpc('pg_enqueue', {
-        queue_name: 'artist_discovery',
-        message_body: { artistName, _idempotencyKey: idempotencyKey }
-      });
-      
-      if (enqueueError) {
-        console.error(`[${executionId}] Fallback also failed:`, enqueueError);
-        
-        // Last resort - try raw SQL command
-        console.log(`[${executionId}] Last resort: attempting raw SQL insertion...`);
-        try {
-          const { data: rawSqlResult, error: rawSqlError } = await supabase.rpc('raw_sql_query', {
-            sql_query: `SELECT pgmq.send('artist_discovery', $1::jsonb) as message_id`,
-            params: [JSON.stringify({ artistName, _idempotencyKey: idempotencyKey })]
-          });
-          
-          if (rawSqlError) {
-            console.error(`[${executionId}] Raw SQL method also failed:`, rawSqlError);
-            throw new Error(`All enqueue methods failed. Last error: ${rawSqlError.message}`);
-          }
-          
-          console.log(`[${executionId}] Raw SQL insertion result:`, rawSqlResult);
-          
-          if (rawSqlResult && rawSqlResult.message_id) {
-            console.log(`[${executionId}] Successfully enqueued via raw SQL, message ID:`, rawSqlResult.message_id);
-            
-            // Immediately trigger worker without verification (since verification seems problematic)
-            console.log(`[${executionId}] Immediately triggering worker without verification...`);
-            await supabase.functions.invoke('artistDiscovery', {
-              body: { triggeredManually: true, messageId: rawSqlResult.message_id, executionId: executionId }
-            });
-            
-            return new Response(
-              JSON.stringify({ 
-                success: true, 
-                message: `Discovery process started for artist: ${artistName} (via raw SQL)`,
-                messageId: rawSqlResult.message_id,
-                executionId: executionId
-              }),
-              { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-        } catch (finalError) {
-          console.error(`[${executionId}] Final attempt failed:`, finalError);
-          throw new Error(`All enqueue methods failed. Unable to start discovery.`);
-        }
-      }
-      
-      if (messageId) {
-        console.log(`[${executionId}] Successfully enqueued via pg_enqueue fallback, message ID: ${messageId}`);
-        
-        // Immediately trigger worker to ensure processing (skip verification)
-        console.log(`[${executionId}] Triggering worker immediately...`);
-        await supabase.functions.invoke('artistDiscovery', {
-          body: { triggeredManually: true, messageId: messageId, executionId: executionId }
-        });
-        
-        return new Response(
-          JSON.stringify({ 
-            success: true, 
-            message: `Discovery process started for artist: ${artistName} (via fallback)`,
-            messageId: messageId,
-            executionId: executionId
-          }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      } else {
-        throw new Error(`Failed to enqueue artist discovery after all attempts`);
-      }
+    if (dbError) {
+      console.error(`[${executionId}] Failed to start artist discovery:`, dbError);
+      throw new Error(`Failed to start artist discovery: ${dbError.message}`);
     }
     
-    // If we get here, the direct DB call succeeded
-    console.log(`[${executionId}] Successfully started discovery via direct DB call, ID: ${directDbResult}`);
+    console.log(`[${executionId}] Successfully started discovery, message ID: ${messageId}`);
     
-    // Immediately trigger the worker to process
+    // Trigger the worker to process immediately (optional)
     console.log(`[${executionId}] Triggering artist discovery worker...`);
     try {
-      const workerResponse = await supabase.functions.invoke('artistDiscovery', {
+      await supabase.functions.invoke('artistDiscovery', {
         body: { triggeredManually: true, artistName: artistName, executionId: executionId }
       });
-      
-      if (workerResponse.error) {
-        console.warn(`[${executionId}] Could not trigger worker directly: ${workerResponse.error.message}`);
-        console.log(`[${executionId}] Worker will be triggered by scheduled cron job instead`);
-      } else {
-        console.log(`[${executionId}] Artist discovery worker triggered successfully`);
-      }
+      console.log(`[${executionId}] Artist discovery worker triggered successfully`);
     } catch (triggerError) {
-      console.warn(`[${executionId}] Error triggering worker:`, triggerError);
+      // This is non-critical - the worker will be triggered by the cron job if this fails
       console.log(`[${executionId}] Worker will be triggered by scheduled cron job instead`);
     }
     
-    // Return success response with detailed information
+    // Return success response
     return new Response(
       JSON.stringify({ 
         success: true, 
         message: `Discovery process started for artist: ${artistName}`,
-        messageId: directDbResult,
-        executionId: executionId,
-        method: "direct_db_function"
+        messageId: messageId,
+        executionId: executionId
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
