@@ -1,3 +1,6 @@
+-- First drop any existing functions to avoid parameter name conflicts
+DROP FUNCTION IF EXISTS public.pg_delete_message(TEXT, TEXT);
+
 -- Fix pg_delete_message function to handle different parameter name formats
 CREATE OR REPLACE FUNCTION public.pg_delete_message(
   queue_name TEXT,
@@ -133,8 +136,8 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 COMMENT ON FUNCTION pg_delete_message IS 'Reliably deletes a message by ID from a queue with fallback strategies';
 
--- Create an alias function with p_ prefixed parameters for compatibility
-CREATE OR REPLACE FUNCTION public.pg_delete_message(
+-- Create a separate function with p_ prefixed parameters for compatibility
+CREATE OR REPLACE FUNCTION public.pg_delete_message_alt(
   p_queue_name TEXT,
   p_message_id TEXT
 ) RETURNS BOOLEAN AS $$
@@ -143,4 +146,4 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-COMMENT ON FUNCTION pg_delete_message(TEXT, TEXT) IS 'Alias for pg_delete_message with p_ prefixed parameters';
+COMMENT ON FUNCTION pg_delete_message_alt(TEXT, TEXT) IS 'Alternative for pg_delete_message with p_ prefixed parameters';

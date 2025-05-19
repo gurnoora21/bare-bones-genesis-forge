@@ -67,22 +67,22 @@ export async function deleteQueueMessage(
     if (error && error.message.includes("Could not find the function")) {
       logError(MODULE_NAME, `Function not found error: ${error.message}`);
       
-      // Try with different parameter names as fallback
+      // Try with the alternative function name
       try {
-        const { data: altData, error: altError } = await supabase.rpc('pg_delete_message', {
+        const { data: altData, error: altError } = await supabase.rpc('pg_delete_message_alt', {
           p_queue_name: queueName,
           p_message_id: messageId
         });
         
         if (altError) {
-          logError(MODULE_NAME, `Alternative parameter names also failed: ${altError.message}`);
+          logError(MODULE_NAME, `Alternative function also failed: ${altError.message}`);
           return false;
         }
         
-        logDebug(MODULE_NAME, `Successfully deleted message ${messageId} using alternative parameter names`);
+        logDebug(MODULE_NAME, `Successfully deleted message ${messageId} using alternative function`);
         return true;
       } catch (altError) {
-        logError(MODULE_NAME, `Error with alternative parameter approach: ${altError.message}`);
+        logError(MODULE_NAME, `Error with alternative function approach: ${altError.message}`);
         return false;
       }
     }
