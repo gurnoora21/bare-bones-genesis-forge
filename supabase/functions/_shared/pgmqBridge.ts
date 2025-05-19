@@ -57,10 +57,35 @@ export async function deleteQueueMessage(
     logDebug(MODULE_NAME, `Deleting message ${messageId} from queue ${queueName}`);
 
     // Use pg_delete_message function - the standard way to delete messages
+    // Make sure we're using the correct parameter names that match the function definition
     const { data, error } = await supabase.rpc('pg_delete_message', {
       queue_name: queueName,
       message_id: messageId
     });
+    
+    // If we get a "function not found" error, it might be because of parameter name mismatch
+    if (error && error.message.includes("Could not find the function")) {
+      logError(MODULE_NAME, `Function not found error: ${error.message}`);
+      
+      // Try with different parameter names as fallback
+      try {
+        const { data: altData, error: altError } = await supabase.rpc('pg_delete_message', {
+          p_queue_name: queueName,
+          p_message_id: messageId
+        });
+        
+        if (altError) {
+          logError(MODULE_NAME, `Alternative parameter names also failed: ${altError.message}`);
+          return false;
+        }
+        
+        logDebug(MODULE_NAME, `Successfully deleted message ${messageId} using alternative parameter names`);
+        return true;
+      } catch (altError) {
+        logError(MODULE_NAME, `Error with alternative parameter approach: ${altError.message}`);
+        return false;
+      }
+    }
     
     if (error) {
       logError(MODULE_NAME, `Error deleting message ${messageId} from queue ${queueName}: ${error.message}`);

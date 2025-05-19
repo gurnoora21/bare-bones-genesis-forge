@@ -109,6 +109,36 @@ class SupabaseQueueHelper implements QueueHelper {
       if (error) {
         logError("QueueHelper", `Error enqueueing message: ${error.message}`);
         
+        // If we get a "function not found" error, try with different parameter names
+        if (error.message.includes("Could not find the function")) {
+          logDebug("QueueHelper", `Trying alternative parameter names for pg_enqueue`, { executionId });
+          
+          try {
+            // Try with p_ prefix for parameters
+            const { data: altData, error: altError } = await this.supabase.rpc('pg_enqueue', {
+              p_queue_name: normalizedQueueName,
+              p_message: messageBody
+            });
+            
+            if (altError) {
+              logError("QueueHelper", `Alternative parameter names also failed: ${altError.message}`);
+            } else {
+              const messageId = String(altData);
+              logDebug("QueueHelper", `Message enqueued successfully with alternative parameters, ID: ${messageId}`, { executionId });
+              
+              // If deduplication key was provided, mark as processed to prevent duplicates
+              if (dedupKey) {
+                logDebug("QueueHelper", `Marking message as processed for deduplication`, { executionId });
+                await this.deduplication.markAsProcessed(normalizedQueueName, dedupKey, options.ttl || 86400);
+              }
+              
+              return messageId;
+            }
+          } catch (altErr) {
+            logError("QueueHelper", `Error with alternative parameters: ${altErr.message}`);
+          }
+        }
+        
         // Record the failure
         try {
           await this.metrics.recordQueueOperation(
