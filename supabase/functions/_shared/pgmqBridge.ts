@@ -135,82 +135,63 @@ export async function readQueueMessages(
 
 /**
  * Mark a message as processed/delete from queue
- * Uses direct SQL DELETE statement for reliability
+ * Uses the robust pg_delete_message function for reliability
  */
 export async function deleteQueueMessage(
   supabase: SupabaseClient, 
   queueName: string, 
-  messageId: string
+  messageId: string | number | undefined
 ): Promise<boolean> {
+  // Handle undefined or null message IDs
+  if (messageId === undefined || messageId === null) {
+    logError(MODULE_NAME, `Cannot delete message: messageId is ${messageId} from queue ${queueName}`);
+    return false;
+  }
+  
+  // Convert to string if it's a number
+  const messageIdStr = String(messageId);
+  
   try {
-    logDebug(MODULE_NAME, `Deleting message ${messageId} from queue ${queueName} using direct SQL`);
+    logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName} using pg_delete_message`);
     
-    // Use direct SQL DELETE statement instead of function call
-    // Target the pgmq.q_[queue_name] table directly
-    const sql = `
-      DELETE FROM pgmq.q_${queueName} 
-      WHERE id = $1 OR msg_id = $1 
-      RETURNING true AS deleted
-    `;
+    // Use the pg_delete_message function which now uses our robust implementation
+    const { data, error } = await supabase.rpc('pg_delete_message', {
+      queue_name: queueName,
+      message_id: messageIdStr
+    });
     
-    const result = await executeQueueSql(supabase, sql, [messageId]);
-    
-    if (!result || !result.length) {
-      logError(MODULE_NAME, `No rows deleted for message ${messageId} from queue ${queueName}`);
+    if (error) {
+      logError(MODULE_NAME, `Error deleting message ${messageIdStr} from queue ${queueName}: ${error.message}`);
       
-      // Try an alternative approach - check if the message exists first
-      const checkSql = `
-        SELECT EXISTS(
-          SELECT 1 FROM pgmq.q_${queueName} 
-          WHERE id = $1 OR msg_id = $1
-        ) AS exists
+      // Fallback to direct SQL if the function call fails
+      logDebug(MODULE_NAME, `Falling back to direct SQL deletion for message ${messageIdStr}`);
+      
+      const sql = `
+        SELECT pgmq.delete_message_robust($1, $2) as deleted
       `;
       
-      const checkResult = await executeQueueSql(supabase, checkSql, [messageId]);
+      const result = await executeQueueSql(supabase, sql, [queueName, messageIdStr]);
       
-      if (checkResult && checkResult.length > 0 && checkResult[0].exists) {
-        // Message exists but couldn't be deleted - try again with a different approach
-        const forceSql = `
-          DELETE FROM pgmq.q_${queueName} 
-          WHERE id::text = $1::text OR msg_id::text = $1::text
-          RETURNING true AS deleted
-        `;
-        
-        const forceResult = await executeQueueSql(supabase, forceSql, [messageId]);
-        
-        if (forceResult && forceResult.length > 0) {
-          logDebug(MODULE_NAME, `Successfully deleted message ${messageId} using text comparison`);
-          return true;
-        }
-      } else {
-        // Message doesn't exist - might have been already processed
-        logDebug(MODULE_NAME, `Message ${messageId} not found in queue ${queueName}, considering as deleted`);
+      if (result && result.length > 0 && result[0].deleted) {
+        logDebug(MODULE_NAME, `Successfully deleted message ${messageIdStr} using fallback method`);
         return true;
       }
       
+      logError(MODULE_NAME, `Failed to delete message ${messageIdStr} from queue ${queueName} using fallback method`);
       return false;
     }
     
-    logDebug(MODULE_NAME, `Successfully deleted message ${messageId} from queue ${queueName}`);
+    // If data is true, the message was successfully deleted
+    if (data === true) {
+      logDebug(MODULE_NAME, `Successfully deleted message ${messageIdStr} from queue ${queueName}`);
+      return true;
+    }
+    
+    // If we get here, the message wasn't deleted but no error was returned
+    logDebug(MODULE_NAME, `Message ${messageIdStr} not found in queue ${queueName}, considering as deleted`);
     return true;
   } catch (error) {
     logError(MODULE_NAME, `Fatal error in deleteQueueMessage for ${queueName}: ${error.message}`);
-    
-    // Last resort - try with a more permissive approach
-    try {
-      const safeSql = `
-        BEGIN;
-        DELETE FROM pgmq.q_${queueName} WHERE id::text = '${messageId}'::text;
-        DELETE FROM pgmq.q_${queueName} WHERE msg_id::text = '${messageId}'::text;
-        COMMIT;
-      `;
-      
-      await executeQueueSql(supabase, safeSql);
-      logDebug(MODULE_NAME, `Attempted safe deletion for message ${messageId} from queue ${queueName}`);
-    } catch (safeError) {
-      logError(MODULE_NAME, `Safe deletion also failed: ${safeError.message}`);
-    }
-    
     return false;
   }
 }

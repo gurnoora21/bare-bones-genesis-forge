@@ -272,13 +272,25 @@ serve(async (req) => {
         const result = await processMessage(validatedMessage);
         
         if (result.success) {
-          // Delete the message from the queue after successful processing using our bridge function
-          console.log(`Processing successful, deleting message ID: ${message.id}`);
-          await deleteQueueMessage(supabase, QUEUE_NAME, message.id);
+          // Debug message structure to identify the correct ID field
+          console.log(`Message structure:`, {
+            id: message.id,
+            msgId: message.msgId,
+            msg_id: message.msg_id,
+            messageId: message.messageId,
+            fullMessage: JSON.stringify(message).substring(0, 200) // Log first 200 chars to avoid huge logs
+          });
           
-          results.push({ id: message.id, status: "success", ...result });
+          // Try to find the message ID from various possible properties
+          const messageId = message.id || message.msgId || message.msg_id || message.messageId;
+          
+          // Delete the message from the queue after successful processing using our bridge function
+          console.log(`Processing successful, deleting message ID: ${messageId}`);
+          await deleteQueueMessage(supabase, QUEUE_NAME, messageId);
+          
+          results.push({ id: messageId, status: "success", ...result });
         } else {
-          errors.push({ id: message.id, error: result.error });
+          errors.push({ id: message.id || message.msgId || message.msg_id || "unknown", error: result.error });
         }
       } catch (error) {
         console.error(`Error processing message ${message.id}:`, error);

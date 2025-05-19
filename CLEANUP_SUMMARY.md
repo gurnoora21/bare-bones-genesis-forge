@@ -78,6 +78,31 @@ We updated `queueHelper.ts` to:
 2. **Simplicity**: Removed unnecessary complexity and fallback layers
 3. **Maintainability**: Code is now easier to understand and maintain
 4. **Consistency**: All queue operations use a consistent approach
+5. **Robust Message ID Handling**: Fixed issues with message ID extraction and deletion
+
+### Message ID Handling Fix
+
+We identified and fixed an issue where message IDs were not being properly extracted when deleting messages from queues. The solution included:
+
+1. **Enhanced pgmqBridge.ts**: 
+   - Updated to handle undefined message IDs and support multiple ID formats (string, number)
+   - Simplified the deletion logic to use the new robust SQL functions
+   - Added better error handling and logging for message ID issues
+
+2. **Improved Worker Functions**: 
+   - Added better debugging to identify message structure
+   - Implemented fallback ID extraction in all worker functions
+   - Added logging of message structure to help diagnose ID issues
+
+3. **Database Migration**: Created a SQL migration that adds robust message ID handling functions:
+   - `pgmq.delete_message_robust`: Tries multiple approaches to delete a message by ID
+   - `pgmq.extract_message_id`: Extracts message IDs from different formats
+   - Updated `pg_delete_message` to use our robust implementation
+
+4. **Simplified Implementation**:
+   - Removed complex view that was causing SQL errors
+   - Focused on core functionality needed for message deletion
+   - Ensured compatibility with the existing database structure
 
 ## Testing
 
