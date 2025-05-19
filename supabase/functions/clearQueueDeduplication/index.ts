@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -29,6 +30,8 @@ serve(async (req) => {
     
     let clearedKeys = 0;
     let preservedKeys = 0;
+    let matchedKeys = 0;
+    const keysByPattern = {}; // Track keys by pattern for better debugging
     
     // Get all keys with the dedup prefix
     try {
@@ -49,6 +52,7 @@ serve(async (req) => {
         
         const [nextCursor, keys] = scanResult;
         console.log(`Scan returned ${keys?.length || 0} keys. Next cursor: ${nextCursor}`);
+        matchedKeys += keys?.length || 0;
         
         cursor = parseInt(nextCursor);
         
@@ -63,6 +67,16 @@ serve(async (req) => {
           });
           
           console.log(`After filtering, processing ${validKeys.length} valid keys`);
+          
+          // Categorize keys by pattern for better debugging
+          validKeys.forEach(key => {
+            // Extract pattern from key for reporting
+            const pattern = key.split(':').slice(0, 2).join(':');
+            if (!keysByPattern[pattern]) {
+              keysByPattern[pattern] = 0;
+            }
+            keysByPattern[pattern]++;
+          });
           
           // Delete in batches to avoid huge commands
           for (let i = 0; i < validKeys.length; i += 50) {
@@ -104,11 +118,14 @@ serve(async (req) => {
       } while (cursor !== 0);
       
       console.log(`Successfully cleared ${clearedKeys} deduplication keys`);
+      console.log(`Keys by pattern: ${JSON.stringify(keysByPattern, null, 2)}`);
       
       return new Response(
         JSON.stringify({ 
           clearedKeys,
           preservedKeys,
+          matchedKeys,
+          keysByPattern,
           message: `Successfully cleared ${clearedKeys} deduplication keys`
         }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

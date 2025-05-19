@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -75,8 +74,8 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
     const results = [];
     
     for (const track of tracks.items) {
-      // Generate a consistent deduplication key
-      const dedupKey = `track_discovery:track:${track.id}`;
+      // MODIFIED: Use spotify_id instead of id for more consistent deduplication key naming
+      const dedupKey = `track:${track.id}`;
       
       // Check if we've already processed this track
       const isDuplicate = await deduplication.isDuplicate(QUEUE_NAME, dedupKey);
@@ -151,7 +150,8 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
         }
         
         // Enqueue producer identification for this track
-        const producerDedupKey = `producer_identification:track:${track.id}`;
+        // MODIFIED: Consistent deduplication key format for producer identification
+        const producerDedupKey = `producer:${track.id}`;
         const producerMessage = {
           trackId,
           trackName: track.name,
@@ -178,7 +178,8 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
     // If there are more tracks, enqueue the next batch
     if (tracks.next) {
       const nextOffset = offset + tracks.limit;
-      const nextDedupKey = `track_discovery:album:${albumSpotifyId}:offset:${nextOffset}`;
+      // MODIFIED: Consistent deduplication key format for the next batch
+      const nextDedupKey = `album:${albumSpotifyId}:offset:${nextOffset}`;
       
       // Make sure we maintain the same message format for the next batch
       const nextBatchMessage = {
