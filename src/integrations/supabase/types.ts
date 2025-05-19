@@ -519,16 +519,6 @@ export type Database = {
         }
         Relationships: []
       }
-      queue_monitoring_view: {
-        Row: {
-          last_check_time: string | null
-          messages_fixed: number | null
-          queue_name: string | null
-          stuck_messages: number | null
-          total_messages: number | null
-        }
-        Relationships: []
-      }
     }
     Functions: {
       acquire_processing_lock: {
@@ -787,6 +777,14 @@ export type Database = {
       pg_try_advisory_lock: {
         Args: { p_key: string }
         Returns: boolean
+      }
+      pgmq_read: {
+        Args: {
+          max_messages: number
+          queue_name: string
+          visibility_timeout?: number
+        }
+        Returns: Json
       }
       pgmq_read_safe: {
         Args: {
