@@ -1,59 +1,90 @@
-# Music Discovery Pipeline Cleanup
+# Music Discovery Pipeline
 
-This project is a Supabase-based music discovery pipeline that links artists → albums → tracks → producers. It uses PGMQ queues with custom SQL functions to process messages asynchronously.
+A Supabase-based music discovery pipeline that links artists → albums → tracks → producers using PGMQ queues with custom SQL functions to process messages asynchronously.
 
-## Recent Changes
+## Overview
 
-The pipeline has been cleaned up and simplified to improve reliability and maintainability:
+This system uses a queue-based architecture to discover and link music data:
 
-### 1. Direct SQL Operations
+1. **Artist Discovery**: Finds artist information and queues album discovery
+2. **Album Discovery**: Processes albums for each artist and queues track discovery
+3. **Track Discovery**: Processes tracks for each album and queues producer identification
+4. **Producer Identification**: Identifies producers for each track and enriches their profiles
 
-- Created a new `pgmqBridge.ts` module that provides reliable queue operations using direct SQL
-- Added fallback mechanisms to handle queue operation failures gracefully
-- Simplified the queue reading and writing logic to be more consistent and reliable
+## Recent Cleanup
 
-### 2. Queue Helper Improvements
+The pipeline code has been cleaned up and simplified to improve maintainability and reliability. Key changes include:
 
-- Updated `queueHelper.ts` to use direct SQL operations with fallbacks
-- Simplified the enqueue, deleteMessage, and sendToDLQ methods
-- Removed unnecessary complexity and fallback layers
+- Simplified queue reading and writing logic
+- Removed unnecessary fallback mechanisms
+- Consolidated related functionality
+- Improved error handling
 
-### 3. Worker Function Updates
+For detailed information about the changes, see [CLEANUP_SUMMARY.md](./CLEANUP_SUMMARY.md).
 
-- Updated `readQueue` and `sendToQueue` functions to use our simplified approach
-- Ensured all worker functions (artistDiscovery, albumDiscovery, trackDiscovery, producerIdentification) use the improved queue operations
+## Testing the Pipeline
 
-### 4. Database Support
+A test script is provided to verify that the pipeline works correctly. The script:
 
-- Added a migration to create the `raw_sql_query` function for direct SQL operations
-- Ensured proper error handling and logging throughout the pipeline
+1. Starts artist discovery for a test artist
+2. Monitors the progress through each queue
+3. Verifies that data flows correctly through artist → album → track → producer
 
-## Pipeline Flow
+### Prerequisites
 
-The music discovery pipeline follows this flow:
+- Node.js 16+
+- Supabase project with the pipeline deployed
 
-1. **Artist Discovery**: Finds artists on Spotify and stores them in the database
-2. **Album Discovery**: For each artist, retrieves their albums from Spotify
-3. **Track Discovery**: For each album, retrieves the tracks
-4. **Producer Identification**: For each track, identifies the producers using Genius API
+### Running the Test
 
-Each step in the pipeline uses PGMQ queues to process messages asynchronously, with proper error handling and dead-letter queues for failed messages.
+1. Set the required environment variables:
 
-## Key Components
-
-- **Queue Operations**: Simplified and reliable queue operations using direct SQL
-- **Worker Functions**: Edge functions that process messages from the queues
-- **Database Schema**: Tables for artists, albums, tracks, and producers with relationships
-- **API Integration**: Connections to Spotify and Genius APIs for data retrieval
-
-## Running the Pipeline
-
-To start the discovery process, send a message to the `artist_discovery` queue with an artist name:
-
-```json
-{
-  "artistName": "Artist Name"
-}
+```bash
+export SUPABASE_URL=https://your-project.supabase.co
+export SUPABASE_ANON_KEY=your-anon-key
 ```
 
-The pipeline will automatically process the message and continue through all the steps, creating the relationships between artists, albums, tracks, and producers.
+2. Install dependencies:
+
+```bash
+npm install @supabase/supabase-js
+```
+
+3. Run the test script:
+
+```bash
+node test_pipeline.js
+```
+
+The script will output detailed information about the pipeline's progress and verify that data is correctly flowing through the system.
+
+## Project Structure
+
+- `supabase/functions/`: Edge functions for processing queue messages
+  - `artistDiscovery/`: Processes artist discovery messages
+  - `albumDiscovery/`: Processes album discovery messages
+  - `trackDiscovery/`: Processes track discovery messages
+  - `producerIdentification/`: Processes producer identification messages
+  - `_shared/`: Shared utilities and helpers
+    - `pgmqBridge.ts`: Simplified queue operations
+    - `queueHelper.ts`: Helper functions for queue operations
+- `supabase/migrations/`: SQL migrations for database setup
+- `test_pipeline.js`: Script to test the pipeline end-to-end
+- `CLEANUP_SUMMARY.md`: Detailed summary of cleanup changes
+
+## Database Schema
+
+The database includes the following main tables:
+
+- `artists`: Artist information
+- `albums`: Album information linked to artists
+- `tracks`: Track information linked to albums
+- `producers`: Producer information
+- `track_producers`: Junction table linking tracks to producers
+
+Queue tables are managed by PGMQ and include:
+
+- `pgmq.q_artist_discovery`: Queue for artist discovery messages
+- `pgmq.q_album_discovery`: Queue for album discovery messages
+- `pgmq.q_track_discovery`: Queue for track discovery messages
+- `pgmq.q_producer_identification`: Queue for producer identification messages

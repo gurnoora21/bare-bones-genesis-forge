@@ -243,12 +243,12 @@ serve(async (req) => {
             fullMessage: JSON.stringify(message).substring(0, 200) // Log first 200 chars to avoid huge logs
           });
           
-          // Try to find the message ID from various possible properties
-          const messageId = message.id || message.msgId || message.msg_id || message.messageId;
+          // Use msg_id directly when available, otherwise fall back to other ID fields
+          const messageId = message.msg_id || message.id || message.msgId || message.messageId;
           
           // Delete the message from the queue after successful processing using our bridge function
           console.log(`Processing successful, deleting message ID: ${messageId}`);
-          await deleteQueueMessage(supabase, QUEUE_NAME, messageId);
+          await deleteQueueMessage(supabase, QUEUE_NAME, messageId, message);
           
           results.push({ id: messageId, status: "success", ...result });
         } else {

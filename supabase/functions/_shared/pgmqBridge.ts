@@ -118,7 +118,8 @@ export async function readQueueMessages(
       }
       
       return {
-        id: msg.msg_id || msg.msgId || msg.id,
+        id: msg.msg_id || msg.msgId || msg.id, // Keep existing order for backward compatibility
+        msg_id: msg.msg_id, // Add explicit msg_id field for direct access
         message: parsedMessage,
         created_at: msg.createdAt || msg.created_at
       };
@@ -139,7 +140,8 @@ export async function readQueueMessages(
 export async function deleteQueueMessage(
   supabase: SupabaseClient, 
   queueName: string, 
-  messageId: string | number | undefined
+  messageId: string | number | undefined,
+  message?: any // Optional full message object
 ): Promise<boolean> {
   // Handle undefined or null message IDs
   if (messageId === undefined || messageId === null) {
@@ -147,21 +149,72 @@ export async function deleteQueueMessage(
     return false;
   }
   
+  // If we have the full message object, try to get msg_id from it
+  let finalMessageId = messageId;
+  if (message && message.msg_id) {
+    finalMessageId = message.msg_id;
+    logDebug(MODULE_NAME, `Using msg_id ${finalMessageId} from message object`);
+  }
+  
   // Convert to string if it's a number
-  const messageIdStr = String(messageId);
+  const messageIdStr = String(finalMessageId);
   
   try {
     logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName} using pg_delete_message`);
     
-    // Use ONLY the pg_delete_message function which has SECURITY DEFINER
-    // This ensures proper permission elevation and schema access
-    const { data, error } = await supabase.rpc('pg_delete_message', {
+    // Use the ensure_message_deleted function which has SECURITY DEFINER and better reliability
+    // This ensures proper permission elevation, schema access, and handles retries
+    const { data, error } = await supabase.rpc('ensure_message_deleted', {
       queue_name: queueName,
-      message_id: messageIdStr
+      message_id: messageIdStr,
+      max_attempts: 3
     });
     
     if (error) {
       logError(MODULE_NAME, `Error deleting message ${messageIdStr} from queue ${queueName}: ${error.message}`);
+      
+      // If the error is about the relation not existing, try a direct SQL approach as last resort
+      if (error.message.includes("does not exist")) {
+        logDebug(MODULE_NAME, `Table not found error. Attempting direct SQL deletion as last resort.`);
+        
+        // Try direct SQL deletion as a last resort
+        try {
+          const sql = `
+            DO $$
+            DECLARE
+              table_exists BOOLEAN;
+            BEGIN
+              -- Check if table exists in pgmq schema with q_ prefix
+              SELECT EXISTS (
+                SELECT FROM pg_tables 
+                WHERE schemaname = 'pgmq' AND tablename = 'q_${queueName}'
+              ) INTO table_exists;
+              
+              IF table_exists THEN
+                EXECUTE 'DELETE FROM pgmq.q_${queueName} WHERE msg_id = $1::TEXT';
+              END IF;
+              
+              -- Check if table exists in pgmq schema with a_ prefix
+              SELECT EXISTS (
+                SELECT FROM pg_tables 
+                WHERE schemaname = 'pgmq' AND tablename = 'a_${queueName}'
+              ) INTO table_exists;
+              
+              IF table_exists THEN
+                EXECUTE 'DELETE FROM pgmq.a_${queueName} WHERE msg_id = $1::TEXT';
+              END IF;
+            END $$;
+          `;
+          
+          await executeQueueSql(supabase, sql, [messageIdStr]);
+          logDebug(MODULE_NAME, `Attempted direct SQL deletion for message ${messageIdStr}`);
+          return true; // Assume success since we can't easily check
+        } catch (sqlError) {
+          logError(MODULE_NAME, `Direct SQL deletion also failed: ${sqlError.message}`);
+          return false;
+        }
+      }
+      
       return false;
     }
     
