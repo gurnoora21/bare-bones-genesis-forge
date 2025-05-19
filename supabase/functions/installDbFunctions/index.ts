@@ -241,39 +241,50 @@ serve(async (req) => {
     } catch (error) {
       console.error("All approaches failed:", error);
       
-      // Approach 3: Last resort - try direct connection if both RPC methods fail
+      // Replace the direct POST approach with another RPC call
       try {
-        const directResponse = await fetch(`${supabaseUrl}/rest/v1/`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${supabaseKey}`,
-            'apikey': supabaseKey,
-            'Prefer': 'params=single-object'
-          },
-          body: JSON.stringify({
-            query: pgDeleteMessageSql
-          })
-        });
+        // Try another approach - using pgmq_utils schema if available
+        const { data: altData, error: altError } = await supabase.rpc('create_utility_function', {
+          p_function_name: 'pg_delete_message',
+          p_function_body: pgDeleteMessageSql
+        }).catch(e => ({ data: null, error: e }));
         
-        if (directResponse.ok) {
-          console.log("Successfully installed pg_delete_message function via direct SQL");
+        if (!altError && altData) {
+          console.log("Successfully installed pg_delete_message function via create_utility_function");
           return new Response(
             JSON.stringify({ 
               success: true, 
               message: "Successfully installed essential database functions",
               functions: ["pg_delete_message"],
-              method: "direct_sql"
+              method: "create_utility_function"
             }),
             { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
-        } else {
-          const responseText = await directResponse.text();
-          throw new Error(`Direct SQL failed: ${responseText}`);
         }
-      } catch (directError) {
-        console.error("Direct SQL approach failed:", directError);
-        throw directError;
+        
+        // Final fallback - try another RPC method if available
+        const { data: finalData, error: finalError } = await supabase.rpc('install_db_function', {
+          p_function_name: 'pg_delete_message',
+          p_sql_body: pgDeleteMessageSql
+        }).catch(e => ({ data: null, error: e }));
+        
+        if (!finalError) {
+          console.log("Successfully installed pg_delete_message function via install_db_function");
+          return new Response(
+            JSON.stringify({ 
+              success: true, 
+              message: "Successfully installed essential database functions",
+              functions: ["pg_delete_message"],
+              method: "install_db_function"
+            }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        
+        throw new Error(`All installation methods failed`);
+      } catch (finalError) {
+        console.error("All installation methods failed:", finalError);
+        throw finalError;
       }
     }
   } catch (error) {
