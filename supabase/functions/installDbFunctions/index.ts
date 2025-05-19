@@ -22,6 +22,44 @@ serve(async (req) => {
   try {
     console.log("Installing essential database functions...");
     
+    // First, ensure raw_sql_query function exists
+    try {
+      // Create raw_sql_query function if it doesn't exist
+      const createRawSqlQueryFn = `
+        CREATE OR REPLACE FUNCTION public.raw_sql_query(
+          sql_query TEXT,
+          params TEXT[] DEFAULT '{}'::TEXT[]
+        ) RETURNS JSONB AS $$
+        DECLARE
+          result JSONB;
+        BEGIN
+          EXECUTE sql_query INTO result USING params;
+          RETURN result;
+        EXCEPTION WHEN OTHERS THEN
+          RETURN jsonb_build_object('error', SQLERRM);
+        END;
+        $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+        COMMENT ON FUNCTION raw_sql_query IS 'Executes raw SQL queries safely';
+      `;
+
+      // Execute raw SQL directly to create this helper function first
+      const { error: rawSqlFnError } = await supabase.rpc('exec_sql', { 
+        sql: createRawSqlQueryFn 
+      }).catch(() => {
+        // If exec_sql doesn't exist, try a direct query
+        return supabase.from('_exec_sql').select('*').eq('query', createRawSqlQueryFn);
+      });
+      
+      if (rawSqlFnError) {
+        console.log("Note: raw_sql_query function might already exist, continuing");
+      } else {
+        console.log("Successfully created raw_sql_query function");
+      }
+    } catch (err) {
+      console.log("Note: raw_sql_query function might already exist, continuing");
+    }
+    
     // Install pg_delete_message function
     const pgDeleteMessageSql = `
     CREATE OR REPLACE FUNCTION public.pg_delete_message(
@@ -159,34 +197,85 @@ serve(async (req) => {
     COMMENT ON FUNCTION pg_delete_message IS 'Reliably deletes a message by ID from a queue with fallback strategies';
     `;
     
-    // Execute the SQL to create the function directly
+    // Try multiple approaches to install the function
     try {
-      // Execute the SQL directly using the Supabase client
+      // Approach 1: Try direct execute via PostgREST
+      const { data: directData, error: directError } = await supabase.rpc('exec_sql', {
+        sql: pgDeleteMessageSql
+      }).catch(e => ({ data: null, error: e }));
+      
+      if (!directError) {
+        console.log("Successfully installed pg_delete_message function via exec_sql");
+        return new Response(
+          JSON.stringify({ 
+            success: true, 
+            message: "Successfully installed essential database functions",
+            functions: ["pg_delete_message"],
+            method: "exec_sql"
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      
+      // Approach 2: Try using raw_sql_query if it exists now
       const { data, error } = await supabase.rpc('raw_sql_query', {
         sql_query: pgDeleteMessageSql
       });
       
       if (error) {
-        console.error("Error creating pg_delete_message function:", error);
+        console.error("Error creating pg_delete_message function with raw_sql_query:", error);
         throw new Error(`Failed to create pg_delete_message function: ${error.message}`);
       }
       
-      console.log("Successfully installed pg_delete_message function");
+      console.log("Successfully installed pg_delete_message function via raw_sql_query");
+      
+      return new Response(
+        JSON.stringify({ 
+          success: true, 
+          message: "Successfully installed essential database functions",
+          functions: ["pg_delete_message"],
+          method: "raw_sql_query"
+        }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
     } catch (error) {
-      console.error("Unexpected error during function creation:", error);
-      throw error;
+      console.error("All approaches failed:", error);
+      
+      // Approach 3: Last resort - try direct connection if both RPC methods fail
+      try {
+        const directResponse = await fetch(`${supabaseUrl}/rest/v1/`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${supabaseKey}`,
+            'apikey': supabaseKey,
+            'Prefer': 'params=single-object'
+          },
+          body: JSON.stringify({
+            query: pgDeleteMessageSql
+          })
+        });
+        
+        if (directResponse.ok) {
+          console.log("Successfully installed pg_delete_message function via direct SQL");
+          return new Response(
+            JSON.stringify({ 
+              success: true, 
+              message: "Successfully installed essential database functions",
+              functions: ["pg_delete_message"],
+              method: "direct_sql"
+            }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        } else {
+          const responseText = await directResponse.text();
+          throw new Error(`Direct SQL failed: ${responseText}`);
+        }
+      } catch (directError) {
+        console.error("Direct SQL approach failed:", directError);
+        throw directError;
+      }
     }
-    
-    // Return success response
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: "Successfully installed essential database functions",
-        functions: ["pg_delete_message"]
-      }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-    
   } catch (error) {
     console.error("Unexpected error:", error);
     
