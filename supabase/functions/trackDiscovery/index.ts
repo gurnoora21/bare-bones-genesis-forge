@@ -1,8 +1,14 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { corsHeaders } from "../_shared/cors.ts";
-import { validateMessage, TrackDiscoveryMessageSchema, type TrackDiscoveryMessage } from "../_shared/types/queueMessages.ts";
+import { 
+  validateMessage, 
+  TrackDiscoveryMessageSchema, 
+  type TrackDiscoveryMessage,
+  normalizeQueueMessage 
+} from "../_shared/types/queueMessages.ts";
 import { readQueueMessages, deleteQueueMessage } from "../_shared/pgmqBridge.ts";
 import { QueueHelper, getQueueHelper } from "../_shared/queueHelper.ts";
 import { logDebug, logError } from "../_shared/debugHelper.ts";
@@ -37,7 +43,7 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
   try {
     const spotifyClient = new SpotifyClient();
     
-    // Extract required fields with fallbacks
+    // Extract required fields with fallbacks - use more robust extraction
     const albumId = message.albumId;
     const albumSpotifyId = message.spotifyId || message.albumSpotifyId;
     const artistId = message.artistId;
@@ -170,9 +176,19 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
       const nextOffset = offset + tracks.limit;
       const nextDedupKey = `track_discovery:album:${albumSpotifyId}:offset:${nextOffset}`;
       
+      // Make sure we maintain the same message format for the next batch
+      const nextBatchMessage = {
+        ...message,
+        offset: nextOffset,
+        albumId,
+        albumSpotifyId,
+        artistId,
+        albumName,
+      };
+      
       await queueHelper.enqueue(
         QUEUE_NAME,
-        { ...message, offset: nextOffset },
+        nextBatchMessage,
         nextDedupKey,
         { ttl: 86400 * 7 } // 7 day TTL
       );
@@ -221,34 +237,44 @@ serve(async (req) => {
 
     for (const message of messages) {
       try {
-        // Validate the message format
-        console.log(`Validating message format for message ID: ${message.id}`);
-        const messageBody = typeof message.message === 'string' 
-          ? JSON.parse(message.message) 
-          : message.message;
+        // Log the full message structure for debugging
+        console.log(`Message structure debug:`, {
+          id: message.id,
+          msgId: message.msg_id,
+          messageType: typeof message.message,
+          hasMessage: !!message.message,
+          messagePreview: typeof message.message === 'string' ? 
+            message.message.substring(0, 50) : 
+            JSON.stringify(message.message).substring(0, 50)
+        });
         
-        if (!messageBody) {
+        // Normalize message structure using the new helper function
+        const messageBody = normalizeQueueMessage(message);
+        
+        if (!messageBody || Object.keys(messageBody).length === 0) {
           throw new Error(`Invalid message format: message body is empty or null`);
         }
         
+        console.log(`Normalized message:`, JSON.stringify(messageBody).substring(0, 200));
+        
+        // Validate the message format
+        console.log(`Validating message format for message ID: ${message.id || message.msg_id}`);
         const validatedMessage = validateMessage(TrackDiscoveryMessageSchema, messageBody);
         
         // Process the validated message
-        console.log(`Processing tracks for album: ${validatedMessage.albumName || validatedMessage.spotifyId}`);
+        console.log(`Processing tracks for album: ${validatedMessage.albumName || validatedMessage.albumSpotifyId || validatedMessage.spotifyId}`);
         const result = await processMessage(validatedMessage);
         
         if (result.success) {
           // Debug message structure to identify the correct ID field
           console.log(`Message structure:`, {
             id: message.id,
-            msgId: message.msgId,
-            msg_id: message.msg_id,
+            msgId: message.msg_id,
             messageId: message.messageId,
-            fullMessage: JSON.stringify(message).substring(0, 200) // Log first 200 chars to avoid huge logs
           });
           
           // Use msg_id directly when available, otherwise fall back to other ID fields
-          const messageId = message.msg_id || message.id || message.msgId || message.messageId;
+          const messageId = message.msg_id || message.id || message.msgId;
           
           // Delete the message from the queue after successful processing using our bridge function
           console.log(`Processing successful, deleting message ID: ${messageId}`);
@@ -256,23 +282,28 @@ serve(async (req) => {
           
           results.push({ id: messageId, status: "success", ...result });
         } else {
-          errors.push({ id: message.id || message.msgId || message.msg_id || "unknown", error: result.error });
+          errors.push({ id: message.id || message.msg_id, error: result.error });
         }
       } catch (error) {
-        console.error(`Error processing message ${message.id}:`, error);
-        errors.push({ id: message.id, error: error.message });
+        console.error(`Error processing message ${message.id || message.msg_id}:`, error);
+        errors.push({ id: message.id || message.msg_id, error: error.message });
         
         // If it's a validation error, send to DLQ
         if (error.message.includes("Invalid message format") || error.message.includes("Required")) {
-          console.log(`Validation error, sending message ${message.id} to DLQ`);
+          console.log(`Validation error, sending message ${message.id || message.msg_id} to DLQ`);
           try {
             // Use QueueHelper to send to DLQ
             await queueHelper.sendToDLQ(
               QUEUE_NAME,
-              message.id,
+              message.id || message.msg_id,
               message,
               error.message,
-              { timestamp: new Date().toISOString() }
+              { 
+                timestamp: new Date().toISOString(),
+                rawMessage: typeof message.message === 'string' ? 
+                  message.message.substring(0, 500) : 
+                  JSON.stringify(message.message).substring(0, 500)
+              }
             );
           } catch (dlqError) {
             console.error(`Failed to send to DLQ: ${dlqError.message}`);
