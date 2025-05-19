@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { logDebug, logError } from "../_shared/debugHelper.ts";
+import { enqueue } from "../_shared/queueHelper.ts";
 
 // Initialize Supabase client
 const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
@@ -74,34 +75,29 @@ serve(async (req) => {
     // Format message to ensure it's properly handled
     const messageToSend = typeof message === 'string' ? message : JSON.stringify(message);
     
-    // Send message to queue using pg_enqueue - the standard way to enqueue messages
-    logDebug("SendToQueue", `Sending message to queue...`, { executionId });
+    // Send message to queue using our simplified enqueue function
+    logDebug("SendToQueue", `Sending message to queue using simplified approach...`, { executionId });
     
     try {
-      // Parse the message to JSON if it's a string
-      const messageBody = typeof message === 'string' ? JSON.parse(message) : message;
+      // Use the enqueue function from queueHelper.ts
+      const messageId = await enqueue(supabase, normalizedQueueName, message);
       
-      const { data, error } = await supabase.rpc('pg_enqueue', {
-        queue_name: normalizedQueueName,
-        message_body: messageBody
-      });
-      
-      if (error) {
-        logError("SendToQueue", `Error enqueueing message: ${error.message}`);
+      if (!messageId) {
+        logError("SendToQueue", `Failed to enqueue message to ${normalizedQueueName}`);
         return new Response(
           JSON.stringify({ 
             error: 'Failed to send message',
-            details: error.message
+            details: 'Message could not be enqueued'
           }),
           { status: 500, headers: corsHeaders }
         );
       }
       
-      logDebug("SendToQueue", `Message sent successfully, ID: ${data}`, { executionId });
+      logDebug("SendToQueue", `Message sent successfully, ID: ${messageId}`, { executionId });
       return new Response(
         JSON.stringify({ 
           success: true, 
-          message_id: data,
+          message_id: messageId,
           queue_name: normalizedQueueName
         }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

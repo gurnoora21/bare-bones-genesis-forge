@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { logDebug, logError } from "../_shared/debugHelper.ts";
+import { readQueueMessages } from "../_shared/pgmqBridge.ts";
 
 // Initialize Supabase client
 const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
@@ -32,23 +33,14 @@ serve(async (req) => {
     
     logDebug("ReadQueue", `Reading up to ${batch_size} messages from queue ${queue_name} with visibility timeout ${visibility_timeout}s`);
     
-    // Use pg_dequeue directly - the standard way to read messages
-    const { data, error } = await supabase.rpc('pg_dequeue', {
-      queue_name: queue_name,
-      batch_size: batch_size,
-      visibility_timeout: visibility_timeout
-    });
+    // Use the pgmqBridge module for more reliable queue operations
+    const messages = await readQueueMessages(
+      supabase,
+      queue_name,
+      batch_size,
+      visibility_timeout
+    );
     
-    if (error) {
-      logError("ReadQueue", `Error reading from queue: ${error.message}`);
-      return new Response(
-        JSON.stringify({ error: error.message }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Parse the JSON result if it's a string
-    const messages = typeof data === 'string' ? JSON.parse(data) : data;
     logDebug("ReadQueue", `Successfully read ${messages?.length || 0} messages from queue ${queue_name}`);
     
     return new Response(

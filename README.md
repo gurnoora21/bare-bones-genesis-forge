@@ -1,73 +1,59 @@
-# Welcome to your Lovable project
+# Music Discovery Pipeline Cleanup
 
-## Project info
+This project is a Supabase-based music discovery pipeline that links artists → albums → tracks → producers. It uses PGMQ queues with custom SQL functions to process messages asynchronously.
 
-**URL**: https://lovable.dev/projects/b0046701-4f27-4919-b008-541b0fe045f9
+## Recent Changes
 
-## How can I edit this code?
+The pipeline has been cleaned up and simplified to improve reliability and maintainability:
 
-There are several ways of editing your application.
+### 1. Direct SQL Operations
 
-**Use Lovable**
+- Created a new `pgmqBridge.ts` module that provides reliable queue operations using direct SQL
+- Added fallback mechanisms to handle queue operation failures gracefully
+- Simplified the queue reading and writing logic to be more consistent and reliable
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/b0046701-4f27-4919-b008-541b0fe045f9) and start prompting.
+### 2. Queue Helper Improvements
 
-Changes made via Lovable will be committed automatically to this repo.
+- Updated `queueHelper.ts` to use direct SQL operations with fallbacks
+- Simplified the enqueue, deleteMessage, and sendToDLQ methods
+- Removed unnecessary complexity and fallback layers
 
-**Use your preferred IDE**
+### 3. Worker Function Updates
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+- Updated `readQueue` and `sendToQueue` functions to use our simplified approach
+- Ensured all worker functions (artistDiscovery, albumDiscovery, trackDiscovery, producerIdentification) use the improved queue operations
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+### 4. Database Support
 
-Follow these steps:
+- Added a migration to create the `raw_sql_query` function for direct SQL operations
+- Ensured proper error handling and logging throughout the pipeline
 
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
+## Pipeline Flow
 
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
+The music discovery pipeline follows this flow:
 
-# Step 3: Install the necessary dependencies.
-npm i
+1. **Artist Discovery**: Finds artists on Spotify and stores them in the database
+2. **Album Discovery**: For each artist, retrieves their albums from Spotify
+3. **Track Discovery**: For each album, retrieves the tracks
+4. **Producer Identification**: For each track, identifies the producers using Genius API
 
-# Step 4: Start the development server with auto-reloading and an instant preview.
-npm run dev
+Each step in the pipeline uses PGMQ queues to process messages asynchronously, with proper error handling and dead-letter queues for failed messages.
+
+## Key Components
+
+- **Queue Operations**: Simplified and reliable queue operations using direct SQL
+- **Worker Functions**: Edge functions that process messages from the queues
+- **Database Schema**: Tables for artists, albums, tracks, and producers with relationships
+- **API Integration**: Connections to Spotify and Genius APIs for data retrieval
+
+## Running the Pipeline
+
+To start the discovery process, send a message to the `artist_discovery` queue with an artist name:
+
+```json
+{
+  "artistName": "Artist Name"
+}
 ```
 
-**Edit a file directly in GitHub**
-
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
-
-**Use GitHub Codespaces**
-
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
-
-## What technologies are used for this project?
-
-This project is built with:
-
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
-
-## How can I deploy this project?
-
-Simply open [Lovable](https://lovable.dev/projects/b0046701-4f27-4919-b008-541b0fe045f9) and click on Share -> Publish.
-
-## Can I connect a custom domain to my Lovable project?
-
-Yes, you can!
-
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
-
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/tips-tricks/custom-domain#step-by-step-guide)
+The pipeline will automatically process the message and continue through all the steps, creating the relationships between artists, albums, tracks, and producers.

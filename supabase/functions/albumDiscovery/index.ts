@@ -100,11 +100,14 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
       const dedupKey = `album_discovery:album:${album.id}`;
       
       // Check if we've already processed this album
-      const isDuplicate = await deduplication.checkAndSet(dedupKey, { ttl: 86400 * 30 });
+      const isDuplicate = await deduplication.isDuplicate(QUEUE_NAME, dedupKey);
       if (isDuplicate) {
         console.log(`Album ${album.name} (${album.id}) already processed, skipping`);
         continue;
       }
+      
+      // Mark as processed to prevent duplicates
+      await deduplication.markAsProcessed(QUEUE_NAME, dedupKey, 86400 * 30);
       
       // Insert album into database
       try {
