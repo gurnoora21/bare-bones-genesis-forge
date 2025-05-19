@@ -85,10 +85,7 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
         continue;
       }
       
-      // Mark as processed to prevent duplicates
-      await deduplication.markAsProcessed(QUEUE_NAME, dedupKey, 86400 * 30); // 30 days TTL
-      
-      // Insert track into database
+      // Insert track into database - MOVED deduplication marking to happen AFTER successful DB operations
       try {
         // Check if track already exists
         const { data: existingTrack } = await supabase
@@ -118,6 +115,9 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
               }
             })
             .eq('id', trackId);
+            
+          // Mark as processed AFTER successful update
+          await deduplication.markAsProcessed(QUEUE_NAME, dedupKey, 86400 * 30); // 30 days TTL
         } else {
           console.log(`Creating new track: ${track.name}`);
           
@@ -141,10 +141,13 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
             
           if (insertError) {
             console.error(`Error inserting track ${track.name}:`, insertError);
-            continue;
+            continue; // Skip to next track without marking as processed
           }
           
           trackId = newTrack.id;
+          
+          // Mark as processed ONLY AFTER successful insert
+          await deduplication.markAsProcessed(QUEUE_NAME, dedupKey, 86400 * 30); // 30 days TTL
         }
         
         // Enqueue producer identification for this track
@@ -168,6 +171,7 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
         results.push({ trackId, trackName: track.name, producerEnqueued: true });
       } catch (error) {
         console.error(`Error processing track ${track.name}:`, error);
+        // Do NOT mark as processed if we got an error - this will allow retries
       }
     }
     
