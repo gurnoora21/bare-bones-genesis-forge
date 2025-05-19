@@ -1,3 +1,4 @@
+
 /**
  * PGMQ Bridge Functions
  * 
@@ -135,7 +136,7 @@ export async function readQueueMessages(
 
 /**
  * Mark a message as processed/delete from queue
- * Uses the robust pg_delete_message function for reliability
+ * Uses ensure_message_deleted to reliably delete messages
  */
 export async function deleteQueueMessage(
   supabase: SupabaseClient, 
@@ -160,10 +161,9 @@ export async function deleteQueueMessage(
   const messageIdStr = String(finalMessageId);
   
   try {
-    logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName} using pg_delete_message`);
+    logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName} using ensure_message_deleted`);
     
     // Use the ensure_message_deleted function which has SECURITY DEFINER and better reliability
-    // This ensures proper permission elevation, schema access, and handles retries
     const { data, error } = await supabase.rpc('ensure_message_deleted', {
       queue_name: queueName,
       message_id: messageIdStr,
@@ -172,49 +172,6 @@ export async function deleteQueueMessage(
     
     if (error) {
       logError(MODULE_NAME, `Error deleting message ${messageIdStr} from queue ${queueName}: ${error.message}`);
-      
-      // If the error is about the relation not existing, try a direct SQL approach as last resort
-      if (error.message.includes("does not exist")) {
-        logDebug(MODULE_NAME, `Table not found error. Attempting direct SQL deletion as last resort.`);
-        
-        // Try direct SQL deletion as a last resort
-        try {
-          const sql = `
-            DO $$
-            DECLARE
-              table_exists BOOLEAN;
-            BEGIN
-              -- Check if table exists in pgmq schema with q_ prefix
-              SELECT EXISTS (
-                SELECT FROM pg_tables 
-                WHERE schemaname = 'pgmq' AND tablename = 'q_${queueName}'
-              ) INTO table_exists;
-              
-              IF table_exists THEN
-                EXECUTE 'DELETE FROM pgmq.q_${queueName} WHERE msg_id = $1::TEXT';
-              END IF;
-              
-              -- Check if table exists in pgmq schema with a_ prefix
-              SELECT EXISTS (
-                SELECT FROM pg_tables 
-                WHERE schemaname = 'pgmq' AND tablename = 'a_${queueName}'
-              ) INTO table_exists;
-              
-              IF table_exists THEN
-                EXECUTE 'DELETE FROM pgmq.a_${queueName} WHERE msg_id = $1::TEXT';
-              END IF;
-            END $$;
-          `;
-          
-          await executeQueueSql(supabase, sql, [messageIdStr]);
-          logDebug(MODULE_NAME, `Attempted direct SQL deletion for message ${messageIdStr}`);
-          return true; // Assume success since we can't easily check
-        } catch (sqlError) {
-          logError(MODULE_NAME, `Direct SQL deletion also failed: ${sqlError.message}`);
-          return false;
-        }
-      }
-      
       return false;
     }
     

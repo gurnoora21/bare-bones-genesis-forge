@@ -25,6 +25,10 @@ export const AlbumDiscoveryMessageSchema = BaseMessageSchema.extend({
   albumName: z.string(),
   releaseDate: z.string().optional(),
   albumType: z.enum(['album', 'single', 'compilation']).optional(),
+  
+  // Add artistId for better validation
+  artistId: z.string().uuid().optional(),
+  artist_id: z.string().uuid().optional(),
 });
 
 export type AlbumDiscoveryMessage = z.infer<typeof AlbumDiscoveryMessageSchema>;

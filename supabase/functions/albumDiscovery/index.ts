@@ -78,21 +78,26 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
       offset: message.offset || 0
     };
     
+    // Validate that artistId exists
+    if (!normalizedMessage.artistId) {
+      throw new Error(`Missing required field: artistId must be provided for artist ${artistName} (${spotifyId})`);
+    }
+    
     console.log(`Processing albums for artist ${normalizedMessage.artistName} (${normalizedMessage.spotifyId})`);
     
     // Fetch albums from Spotify
-    const offset = message.offset || 0;
-    const albums = await spotifyClient.getArtistAlbums(message.spotifyId, offset);
+    const offset = normalizedMessage.offset || 0;
+    const albums = await spotifyClient.getArtistAlbums(normalizedMessage.spotifyId, offset);
     
     if (!albums || !albums.items || albums.items.length === 0) {
-      console.log(`No albums found for artist ${message.artistName}`);
+      console.log(`No albums found for artist ${normalizedMessage.artistName}`);
       return { success: true, message: "No albums found" };
     }
     
-    console.log(`Found ${albums.items.length} albums for artist ${message.artistName}`);
+    console.log(`Found ${albums.items.length} albums for artist ${normalizedMessage.artistName}`);
     
     // Process each album
-    const artistId = message.artistId;
+    const artistId = normalizedMessage.artistId; // Use the normalized artistId which is guaranteed to exist
     const results = [];
     
     for (const album of albums.items) {
@@ -113,7 +118,7 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
       try {
         // Prepare album data
         const albumData = {
-          artist_id: artistId,
+          artist_id: artistId, // Use the validated artistId
           name: album.name,
           spotify_id: album.id,
           release_date: formatReleaseDate(album.release_date),
@@ -136,7 +141,7 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
           .single();
           
         if (upsertError) {
-          logError("AlbumDiscovery", `Error upserting album ${album.name}:`, upsertError);
+          logError("AlbumDiscovery", `Error upserting album ${album.name} for artist ${normalizedMessage.artistName} (ID: ${artistId}): ${upsertError.message}`);
           continue;
         }
         
@@ -150,7 +155,7 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
           albumName: album.name,
           spotifyId: album.id,
           artistId,
-          artistName: message.artistName,
+          artistName: normalizedMessage.artistName, // Use the normalized artist name
           offset: 0,
           totalTracks: album.total_tracks || 50
         };
@@ -165,23 +170,26 @@ async function processMessage(message: AlbumDiscoveryMessage): Promise<{ success
         console.log(`Enqueued track discovery for album ${album.name}, message ID: ${trackEnqueueResult}`);
         results.push({ albumId, albumName: album.name, tracksEnqueued: true });
       } catch (error) {
-        console.error(`Error processing album ${album.name}:`, error);
+        console.error(`Error processing album ${album.name} for artist ${normalizedMessage.artistName} (ID: ${artistId}):`, error);
       }
     }
     
     // If there are more albums, enqueue the next batch
     if (albums.next) {
       const nextOffset = offset + albums.limit;
-      const nextDedupKey = `album_discovery:artist:${message.spotifyId}:offset:${nextOffset}`;
+      const nextDedupKey = `album_discovery:artist:${normalizedMessage.spotifyId}:offset:${nextOffset}`;
       
       await queueHelper.enqueue(
         QUEUE_NAME,
-        { ...message, offset: nextOffset },
+        { 
+          ...normalizedMessage, 
+          offset: nextOffset 
+        },
         nextDedupKey,
         { ttl: 86400 * 7 }
       );
       
-      console.log(`Enqueued next batch of albums for ${message.artistName}, offset: ${nextOffset}`);
+      console.log(`Enqueued next batch of albums for ${normalizedMessage.artistName}, offset: ${nextOffset}`);
     }
     
     return { 
@@ -276,7 +284,7 @@ serve(async (req) => {
         errors.push({ id: message.id, error: error.message });
         
         // If it's a validation error, send to DLQ
-        if (error.message.includes("Invalid message format") || error.message.includes("Required")) {
+        if (error.message.includes("Invalid message format") || error.message.includes("required field")) {
           console.log(`Validation error, sending message ${message.id} to DLQ`);
           try {
             await supabase.rpc("move_to_dead_letter_queue", {
@@ -312,3 +320,4 @@ serve(async (req) => {
     );
   }
 });
+
