@@ -5,7 +5,7 @@
  * Simple wrapper functions for interacting with PGMQ queues
  * Uses direct SQL operations for reliability
  */
-import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { logDebug, logError } from "./debugHelper.ts";
 
 const MODULE_NAME = "PGMQBridge";
@@ -50,27 +50,8 @@ export async function readQueueMessages(
 ): Promise<any[]> {
   try {
     logDebug(MODULE_NAME, `Reading messages from queue ${queueName} with batch size ${batchSize}`);
-
-    // First try using the pg_dequeue function
-    const { data, error } = await supabase.rpc('pg_dequeue', {
-      queue_name: queueName,
-      batch_size: batchSize,
-      visibility_timeout: visibilityTimeout
-    });
-
-    if (!error) {
-      // Parse the result if it's a string
-      const messages = Array.isArray(data) ? data : 
-                      (typeof data === 'string' ? JSON.parse(data) : []);
-      
-      logDebug(MODULE_NAME, `Successfully read ${messages.length} messages from queue ${queueName} using pg_dequeue`);
-      return messages;
-    }
     
-    // If pg_dequeue fails, use direct SQL
-    logDebug(MODULE_NAME, `pg_dequeue failed, using direct SQL: ${error.message}`);
-    
-    // Direct SQL approach to read messages
+    // Use direct SQL approach to read messages - more reliable than pg_dequeue
     const sql = `
       WITH next_messages AS (
         SELECT 
@@ -126,7 +107,7 @@ export async function readQueueMessages(
       };
     });
     
-    logDebug(MODULE_NAME, `Successfully read ${messages.length} messages from queue ${queueName} using direct SQL`);
+    logDebug(MODULE_NAME, `Successfully read ${messages.length} messages from queue ${queueName}`);
     return messages;
   } catch (error) {
     logError(MODULE_NAME, `Fatal error in readQueueMessages for ${queueName}: ${error.message}`);
@@ -136,7 +117,7 @@ export async function readQueueMessages(
 
 /**
  * Mark a message as processed/delete from queue
- * Uses ensure_message_deleted to reliably delete messages
+ * Uses pg_delete_message for simplicity and reliability
  */
 export async function deleteQueueMessage(
   supabase: SupabaseClient, 
@@ -161,13 +142,12 @@ export async function deleteQueueMessage(
   const messageIdStr = String(finalMessageId);
   
   try {
-    logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName} using ensure_message_deleted`);
+    logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName}`);
     
-    // Use the ensure_message_deleted function which has SECURITY DEFINER and better reliability
-    const { data, error } = await supabase.rpc('ensure_message_deleted', {
+    // Use the pg_delete_message function which is simpler and more reliable
+    const { data, error } = await supabase.rpc('pg_delete_message', {
       queue_name: queueName,
-      message_id: messageIdStr,
-      max_attempts: 3
+      message_id: messageIdStr
     });
     
     if (error) {
@@ -175,18 +155,10 @@ export async function deleteQueueMessage(
       return false;
     }
     
-    // If data is true, the message was successfully deleted
-    if (data === true) {
-      logDebug(MODULE_NAME, `Successfully deleted message ${messageIdStr} from queue ${queueName}`);
-      return true;
-    }
-    
-    // If we get here, the message wasn't deleted but no error was returned
-    // This could mean the message doesn't exist or was already deleted
-    logDebug(MODULE_NAME, `Message ${messageIdStr} not found in queue ${queueName}, considering as deleted`);
+    logDebug(MODULE_NAME, `Successfully deleted message ${messageIdStr} from queue ${queueName}`);
     return true;
   } catch (error) {
-    logError(MODULE_NAME, `Fatal error in deleteQueueMessage for ${queueName}: ${error.message}`);
+    logError(MODULE_NAME, `Error in deleteQueueMessage for ${queueName}: ${error.message}`);
     return false;
   }
 }

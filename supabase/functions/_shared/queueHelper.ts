@@ -1,4 +1,4 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService } from "./deduplication.ts";
 import { getDeduplicationMetrics } from "./metrics.ts";
@@ -63,11 +63,9 @@ class SupabaseQueueHelper implements QueueHelper {
     dedupKey?: string, 
     options: { ttl?: number, priority?: number } = {}
   ): Promise<string | null> {
-    const executionId = `enqueue_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-    logDebug("QueueHelper", `Starting enqueue operation for queue: ${queueName}`, { executionId });
-    
     // Normalize the queue name
     const normalizedQueueName = normalizeQueueName(queueName);
+    logDebug("QueueHelper", `Enqueueing message to queue: ${normalizedQueueName}`);
     
     // Check deduplication first if a key is provided
     if (dedupKey) {
@@ -78,31 +76,17 @@ class SupabaseQueueHelper implements QueueHelper {
       );
       
       if (isDuplicate) {
-        logDebug("QueueHelper", `Skipping duplicate message with key ${dedupKey} for queue ${normalizedQueueName}`);
+        logDebug("QueueHelper", `Skipping duplicate message with key ${dedupKey}`);
         return null;
       }
     }
 
     try {
-      // Format message for enqueuing
-      const messageBody = typeof message === 'string' ? JSON.parse(message) : message;
-      
-      // Use pg_enqueue function which has SECURITY DEFINER
-      const { data, error } = await this.supabase.rpc('pg_enqueue', {
-        queue_name: normalizedQueueName,
-        message_body: messageBody
-      });
-      
-      if (error) {
-        logError("QueueHelper", `Error enqueueing message to ${normalizedQueueName}: ${error.message}`);
-        return null;
-      }
-      
-      const messageId = String(data);
-      logDebug("QueueHelper", `Message enqueued successfully, ID: ${messageId}`);
+      // Use the standalone enqueue function for simplicity
+      const messageId = await enqueue(this.supabase, normalizedQueueName, message);
       
       // If deduplication key was provided, mark as processed to prevent duplicates
-      if (dedupKey) {
+      if (messageId && dedupKey) {
         await this.deduplication.markAsProcessed(
           normalizedQueueName, 
           dedupKey, 
@@ -112,7 +96,7 @@ class SupabaseQueueHelper implements QueueHelper {
       
       return messageId;
     } catch (err) {
-      logError("QueueHelper", `Unexpected error enqueueing message to ${normalizedQueueName}: ${err.message}`);
+      logError("QueueHelper", `Error enqueueing message to ${normalizedQueueName}: ${err.message}`);
       return null;
     }
   }
@@ -127,63 +111,22 @@ class SupabaseQueueHelper implements QueueHelper {
       
       if (success) {
         logDebug("QueueHelper", `Successfully deleted message ${messageId} from queue ${normalizedQueueName}`);
-        
-        // Record the success
-        try {
-          await this.metrics.recordQueueOperation(
-            normalizedQueueName, 
-            'delete', 
-            true, 
-            { message_id: messageId }
-          );
-        } catch (metricError) {
-          // Don't fail if metrics recording fails
-          console.warn(`Failed to record queue operation metric: ${metricError.message}`);
-        }
-        
         return { 
           success: true, 
           message: "Message deleted successfully"
         };
       } else {
         logError("QueueHelper", `Failed to delete message ${messageId} from queue ${normalizedQueueName}`);
-        
-        // Record the failure
-        try {
-          await this.metrics.recordQueueOperation(
-            normalizedQueueName, 
-            'delete', 
-            false, 
-            { message_id: messageId, error: "Failed to delete message" }
-          );
-        } catch (metricError) {
-          // Don't fail if metrics recording fails
-          console.warn(`Failed to record queue operation metric: ${metricError.message}`);
-        }
-        
         return { 
           success: false, 
           message: "Failed to delete message"
         };
       }
     } catch (err) {
-      logError("QueueHelper", `Unexpected error deleting message ${messageId} from ${normalizedQueueName}: ${err.message}`);
-      
-      // Record the failure but don't fail if metrics recording fails
-      try {
-        await this.metrics.recordQueueOperation(
-          normalizedQueueName, 
-          'delete', 
-          false, 
-          { message_id: messageId, error: err.message }
-        );
-      } catch (metricError) {
-        console.warn(`Failed to record queue operation metric: ${metricError.message}`);
-      }
-      
+      logError("QueueHelper", `Error deleting message ${messageId} from ${normalizedQueueName}: ${err.message}`);
       return { 
         success: false, 
-        message: `Unexpected error: ${err.message}`
+        message: `Error: ${err.message}`
       };
     }
   }
@@ -214,52 +157,13 @@ class SupabaseQueueHelper implements QueueHelper {
       
       if (!newMessageId) {
         logError("QueueHelper", `Failed to send message to DLQ ${dlqName}`);
-        
-        // Record the failure
-        try {
-          await this.metrics.recordQueueOperation(
-            dlqName, 
-            'send_to_dlq', 
-            false, 
-            { message_id: originalMessageId, error: "Failed to enqueue to DLQ" }
-          );
-        } catch (metricError) {
-          console.warn(`Failed to record queue operation metric: ${metricError.message}`);
-        }
-        
         return false;
       }
       
       logDebug("QueueHelper", `Successfully sent message to DLQ ${dlqName}, new ID: ${newMessageId}`);
-      
-      // Record the success
-      try {
-        await this.metrics.recordQueueOperation(
-          dlqName, 
-          'send_to_dlq', 
-          true, 
-          { message_id: originalMessageId, new_message_id: newMessageId }
-        );
-      } catch (metricError) {
-        console.warn(`Failed to record queue operation metric: ${metricError.message}`);
-      }
-      
       return true;
     } catch (err) {
-      logError("QueueHelper", `Unexpected error sending message to DLQ ${dlqName}: ${err.message}`);
-      
-      // Record the failure but don't fail if metrics recording fails
-      try {
-        await this.metrics.recordQueueOperation(
-          dlqName, 
-          'send_to_dlq', 
-          false, 
-          { message_id: originalMessageId, error: err.message }
-        );
-      } catch (metricError) {
-        console.warn(`Failed to record queue operation metric: ${metricError.message}`);
-      }
-      
+      logError("QueueHelper", `Error sending message to DLQ ${dlqName}: ${err.message}`);
       return false;
     }
   }
