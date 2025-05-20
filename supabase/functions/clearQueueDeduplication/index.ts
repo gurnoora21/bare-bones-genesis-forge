@@ -160,32 +160,35 @@ serve(async (req) => {
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
-  } catch (redisError) {
-    console.error('Redis operation failed:', {
-      error: redisError.message,
-      stack: redisError.stack,
-      name: redisError.name
-    });
-    return new Response(
-      JSON.stringify({ 
-        error: 'Failed to clear deduplication keys',
-        details: redisError.message,
-        stack: redisError.stack
-      }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
   } catch (error) {
-    console.error("Error clearing deduplication keys:", {
-      error: error.message,
-      stack: error.stack,
-      name: error.name
-    });
-    return new Response(
-      JSON.stringify({ 
+    // Handle both Redis-specific and general errors
+    if (error.name && error.name.includes('Redis')) {
+      console.error('Redis operation failed:', {
         error: error.message,
-        stack: error.stack
-      }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+        stack: error.stack,
+        name: error.name
+      });
+      return new Response(
+        JSON.stringify({ 
+          error: 'Failed to clear deduplication keys',
+          details: error.message,
+          stack: error.stack
+        }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    } else {
+      console.error("Error clearing deduplication keys:", {
+        error: error.message,
+        stack: error.stack,
+        name: error.name
+      });
+      return new Response(
+        JSON.stringify({ 
+          error: error.message,
+          stack: error.stack
+        }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
   }
 });
