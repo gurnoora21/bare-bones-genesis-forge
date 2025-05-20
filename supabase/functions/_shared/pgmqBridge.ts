@@ -41,6 +41,7 @@ export async function executeQueueSql(
 /**
  * Read messages from a PGMQ queue
  * Uses direct SQL operations for reliability
+ * Updated for PGMQ 1.4.4 schema compatibility
  */
 export async function readQueueMessages(
   supabase: SupabaseClient,
@@ -51,34 +52,33 @@ export async function readQueueMessages(
   try {
     logDebug(MODULE_NAME, `Reading messages from queue ${queueName} with batch size ${batchSize}`);
     
-    // Use direct SQL approach to read messages - more reliable than pg_dequeue
+    // Updated SQL to use correct column names for PGMQ 1.4.4: msg_id, enqueued_at, vt
     const sql = `
       WITH next_messages AS (
         SELECT 
-          id,
           msg_id,
           message,
-          created_at,
-          visible_at,
-          NOW() + INTERVAL '${visibilityTimeout} seconds' AS new_visible_at
+          enqueued_at,
+          vt,
+          NOW() + INTERVAL '${visibilityTimeout} seconds' AS new_vt
         FROM pgmq.q_${queueName}
-        WHERE visible_at <= NOW()
-        ORDER BY created_at
+        WHERE vt IS NULL OR vt <= NOW()
+        ORDER BY enqueued_at
         LIMIT ${batchSize}
         FOR UPDATE SKIP LOCKED
       ),
       updated AS (
         UPDATE pgmq.q_${queueName} q
-        SET visible_at = nm.new_visible_at
+        SET vt = nm.new_vt
         FROM next_messages nm
-        WHERE q.id = nm.id
-        RETURNING q.id, q.msg_id, q.message, q.created_at
+        WHERE q.msg_id = nm.msg_id
+        RETURNING q.msg_id, q.message, q.enqueued_at
       )
       SELECT 
-        id,
+        msg_id,
         msg_id AS "msgId",
         message,
-        created_at AS "createdAt"
+        enqueued_at AS "createdAt"
       FROM updated
     `;
     
