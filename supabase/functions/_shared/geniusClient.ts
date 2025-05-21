@@ -68,13 +68,9 @@ export class GeniusClient {
     const query = encodeURIComponent(`${trackName} ${artistName}`);
     const result = await this.apiRequest(`/search?q=${query}`);
     
-    if (result.response && result.response.hits && result.response.hits.length > 0) {
-      // Find the most relevant hit (usually the first one)
-      const hit = result.response.hits.find((h: any) => h.type === "song") || result.response.hits[0];
-      return hit.result;
-    }
-    
-    return null;
+    // Return the full response object instead of just the first hit
+    // This allows the caller to access the hits array and process results properly
+    return result.response;
   }
 
   /**

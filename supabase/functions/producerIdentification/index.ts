@@ -63,15 +63,15 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
       const genius = getGeniusClient();
       
       // Search for track on Genius
-      const searchResults = await genius.search(trackName, track.name);
+      const searchResponse = await genius.search(trackName, track.name);
       
-      if (!searchResults || !searchResults.hits || searchResults.hits.length === 0) {
+      if (!searchResponse || !searchResponse.hits || searchResponse.hits.length === 0) {
         logger.info(`No genius results found for track "${trackName}"`);
         return { status: 'completed', result: 'no_genius_results' };
       }
       
       // Get first result
-      const songId = searchResults.hits[0].result.id;
+      const songId = searchResponse.hits[0].result.id;
       
       // Get detailed song info
       const songDetails = await genius.getSong(songId);
@@ -107,10 +107,7 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
               .from('producers')
               .insert({
                 name: producer.name,
-                genius_id: producer.id,
                 metadata: {
-                  genius_url: producer.url,
-                  image_url: producer.image_url,
                   updated_at: new Date().toISOString()
                 }
               })
