@@ -28,8 +28,11 @@ const VISIBILITY_TIMEOUT = 30; // seconds
 
 // Define the producer worker implementation
 class ProducerIdentificationWorker extends EnhancedWorkerBase {
+  private redis: Redis;
+
   constructor() {
     super('producer_identification', supabase, 'ProducerIdentification');
+    this.redis = redis; // Properly initialize the redis property
   }
 
   /**
