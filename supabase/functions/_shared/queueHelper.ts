@@ -3,7 +3,7 @@ import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService } from "./deduplication.ts";
 import { getDeduplicationMetrics } from "./metrics.ts";
 import { logDebug, logError } from "./debugHelper.ts";
-import { executeQueueSql, deleteQueueMessage } from "./pgmqBridge.ts";
+import { deleteQueueMessage } from "./pgmqBridge.ts";
 
 // Interface for response from deleteFromQueue function
 export interface DeleteMessageResponse {

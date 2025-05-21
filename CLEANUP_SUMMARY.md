@@ -7,8 +7,8 @@ This document summarizes the changes made to clean up and simplify the Supabase-
 ## Key Issues Addressed
 
 1. **Simplified Queue Reading Logic**: 
+   - Reverted to using the reliable `pg_dequeue` function in `pgmqBridge.ts` instead of direct SQL
    - Removed the unnecessary `pgmq_read_safe` wrapper and fallback mechanisms in `readQueue/index.ts`
-   - Streamlined the queue reading process to use a single, reliable method
 
 2. **Streamlined Queue Writing**:
    - Simplified the `sendToQueue` function to use a single, direct method for enqueueing messages
@@ -39,7 +39,7 @@ Each step in the pipeline now uses a more direct approach for reading from and w
 
 ## Benefits of Changes
 
-1. **Improved Reliability**: By removing unnecessary fallback mechanisms and using direct, proven methods
+1. **Improved Reliability**: By using proven methods like `pg_dequeue` instead of custom SQL
 2. **Better Maintainability**: Simplified code is easier to understand and modify
 3. **Reduced Complexity**: Fewer moving parts means fewer potential points of failure
 4. **More Direct Flow**: Clearer path from queue to worker function execution
