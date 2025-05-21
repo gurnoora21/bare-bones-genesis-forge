@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -29,6 +30,19 @@ const VISIBILITY_TIMEOUT = 30; // seconds
 class ProducerIdentificationWorker extends EnhancedWorkerBase {
   constructor() {
     super('producer_identification', supabase, 'ProducerIdentification');
+  }
+
+  /**
+   * Normalize producer name to comply with DB requirements
+   * This ensures we have a valid, consistent normalized_name for each producer
+   */
+  private normalizeProducerName(name: string): string {
+    if (!name) return "";
+    return name
+      .toLowerCase()
+      .replace(/[^\w\s]/g, '') // Remove special chars
+      .replace(/\s+/g, '_')    // Replace whitespace with underscores
+      .trim();
   }
 
   async processMessage(message: ProducerIdentificationMessage): Promise<any> {
@@ -90,11 +104,20 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
         
         // Process each producer
         for (const producer of producers) {
+          // Only process producers with valid names
+          if (!producer.name) {
+            logger.info(`Skipping producer with empty name`);
+            continue;
+          }
+          
+          // Normalize the producer name
+          const normalizedName = this.normalizeProducerName(producer.name);
+          
           // Check if producer already exists
           const { data: existingProducer } = await this.supabase
             .from('producers')
             .select('id')
-            .eq('name', producer.name)
+            .eq('normalized_name', normalizedName)
             .maybeSingle();
           
           let producerId;
@@ -102,11 +125,12 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
           if (existingProducer) {
             producerId = existingProducer.id;
           } else {
-            // Insert new producer
+            // Insert new producer with normalized name
             const { data: newProducer, error: insertError } = await this.supabase
               .from('producers')
               .insert({
                 name: producer.name,
+                normalized_name: normalizedName,
                 metadata: {
                   updated_at: new Date().toISOString()
                 }
