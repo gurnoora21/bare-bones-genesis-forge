@@ -1,3 +1,4 @@
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
 import { DeduplicationService } from "./deduplication.ts";
@@ -82,11 +83,19 @@ class SupabaseQueueHelper implements QueueHelper {
     }
 
     try {
-      // Use the standalone enqueue function for simplicity
-      const messageId = await enqueue(this.supabase, normalizedQueueName, message);
+      // Use pg_enqueue RPC function
+      const { data, error } = await this.supabase.rpc('pg_enqueue', {
+        queue_name: normalizedQueueName,
+        message_body: message
+      });
+      
+      if (error) {
+        logError("QueueHelper", `Error enqueueing message to ${normalizedQueueName}: ${error.message}`);
+        return null;
+      }
       
       // If deduplication key was provided, mark as processed to prevent duplicates
-      if (messageId && dedupKey) {
+      if (data && dedupKey) {
         await this.deduplication.markAsProcessed(
           normalizedQueueName, 
           dedupKey, 
@@ -94,7 +103,7 @@ class SupabaseQueueHelper implements QueueHelper {
         );
       }
       
-      return messageId;
+      return data;
     } catch (err) {
       logError("QueueHelper", `Error enqueueing message to ${normalizedQueueName}: ${err.message}`);
       return null;
@@ -152,15 +161,18 @@ class SupabaseQueueHelper implements QueueHelper {
         ...metadata
       };
       
-      // Use our simplified enqueue function
-      const newMessageId = await enqueue(this.supabase, dlqName, dlqMessage);
+      // Use pg_enqueue RPC function
+      const { data, error } = await this.supabase.rpc('pg_enqueue', {
+        queue_name: dlqName,
+        message_body: dlqMessage
+      });
       
-      if (!newMessageId) {
-        logError("QueueHelper", `Failed to send message to DLQ ${dlqName}`);
+      if (error) {
+        logError("QueueHelper", `Failed to send message to DLQ ${dlqName}: ${error.message}`);
         return false;
       }
       
-      logDebug("QueueHelper", `Successfully sent message to DLQ ${dlqName}, new ID: ${newMessageId}`);
+      logDebug("QueueHelper", `Successfully sent message to DLQ ${dlqName}, new ID: ${data}`);
       return true;
     } catch (err) {
       logError("QueueHelper", `Error sending message to DLQ ${dlqName}: ${err.message}`);
@@ -173,32 +185,4 @@ class SupabaseQueueHelper implements QueueHelper {
 export function getQueueHelper(supabase: any, redis: Redis): QueueHelper {
   const deduplicationService = new DeduplicationService(redis);
   return new SupabaseQueueHelper(supabase, redis, deduplicationService);
-}
-
-/**
- * Enqueue a message to a specified queue
- * Simplified standalone version that uses pg_enqueue
- */
-export async function enqueue(supabase: any, queueName: string, message: any): Promise<string | null> {
-  try {
-    // Format message for enqueuing
-    const messageBody = typeof message === 'string' ? JSON.parse(message) : message;
-    const normalizedQueueName = normalizeQueueName(queueName);
-    
-    // Use pg_enqueue function which has SECURITY DEFINER
-    const { data, error } = await supabase.rpc('pg_enqueue', {
-      queue_name: normalizedQueueName,
-      message_body: messageBody
-    });
-    
-    if (error) {
-      logError("QueueHelper", `Error enqueueing message to ${normalizedQueueName}: ${error.message}`);
-      return null;
-    }
-    
-    return data || null;
-  } catch (error) {
-    logError("QueueHelper", `Exception enqueueing message to ${queueName}: ${error.message}`);
-    return null;
-  }
 }

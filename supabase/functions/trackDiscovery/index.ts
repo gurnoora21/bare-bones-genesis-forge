@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -128,8 +129,9 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
               name: track.name,
               spotify_id: track.id,
               duration_ms: track.duration_ms,
-              track_number: track.track_number,
+              // Store track_number in metadata instead of as a separate column
               metadata: {
+                track_number: track.track_number,
                 preview_url: track.preview_url,
                 explicit: track.explicit,
                 created_at: new Date().toISOString()

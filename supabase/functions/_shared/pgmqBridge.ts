@@ -11,7 +11,6 @@ const MODULE_NAME = "PGMQBridge";
 
 /**
  * Read messages from a PGMQ queue
- * Uses pg_dequeue for compatibility
  */
 export async function readQueueMessages(
   supabase: SupabaseClient,
@@ -22,7 +21,7 @@ export async function readQueueMessages(
   try {
     logDebug(MODULE_NAME, `Reading messages from queue ${queueName} with batch size ${batchSize}`);
     
-    // Use the pg_dequeue function which is more reliable
+    // Use pg_dequeue RPC function which is more reliable
     const { data, error } = await supabase.rpc('pg_dequeue', {
       queue_name: queueName,
       batch_size: batchSize,
@@ -39,7 +38,7 @@ export async function readQueueMessages(
       return [];
     }
     
-    // Process the messages to match the expected format
+    // Process the messages to ensure consistent format
     const messages = data.map(msg => {
       // Parse the message if it's a string
       let parsedMessage;
@@ -50,10 +49,10 @@ export async function readQueueMessages(
       }
       
       return {
-        id: msg.msg_id || msg.msgId || msg.id, // Keep existing order for backward compatibility
-        msg_id: msg.msg_id, // Add explicit msg_id field for direct access
+        id: msg.msg_id, // Use msg_id consistently
+        msg_id: msg.msg_id, // Explicit msg_id field for direct access
         message: parsedMessage,
-        created_at: msg.created_at || msg.createdAt
+        created_at: msg.enqueued_at || msg.created_at // Handle both field names
       };
     });
     
@@ -66,8 +65,7 @@ export async function readQueueMessages(
 }
 
 /**
- * Mark a message as processed/delete from queue
- * Uses pg_delete_message for simplicity and reliability
+ * Delete a message from a queue
  */
 export async function deleteQueueMessage(
   supabase: SupabaseClient, 
@@ -81,20 +79,13 @@ export async function deleteQueueMessage(
     return false;
   }
   
-  // If we have the full message object, try to get msg_id from it
-  let finalMessageId = messageId;
-  if (message && message.msg_id) {
-    finalMessageId = message.msg_id;
-    logDebug(MODULE_NAME, `Using msg_id ${finalMessageId} from message object`);
-  }
-  
   // Convert to string if it's a number
-  const messageIdStr = String(finalMessageId);
+  const messageIdStr = String(messageId);
   
   try {
     logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName}`);
     
-    // Use the pg_delete_message function which is simpler and more reliable
+    // Use pg_delete_message RPC function
     const { data, error } = await supabase.rpc('pg_delete_message', {
       queue_name: queueName,
       message_id: messageIdStr
