@@ -37,12 +37,17 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
    * This ensures we have a valid, consistent normalized_name for each producer
    */
   private normalizeProducerName(name: string): string {
-    if (!name) return "";
-    return name
+    // If name is null, undefined, or empty string, return a placeholder
+    if (!name || name.trim() === "") return "unknown_producer";
+    
+    const normalized = name
       .toLowerCase()
       .replace(/[^\w\s]/g, '') // Remove special chars
       .replace(/\s+/g, '_')    // Replace whitespace with underscores
       .trim();
+    
+    // If after normalization we get an empty string, return a placeholder
+    return normalized || "unknown_producer";
   }
 
   async processMessage(message: ProducerIdentificationMessage): Promise<any> {
