@@ -85,9 +85,10 @@ export async function deleteQueueMessage(
   try {
     logDebug(MODULE_NAME, `Deleting message ${messageIdStr} from queue ${queueName}`);
     
-    // Use pg_delete_message RPC function
+    // Use pg_delete_message RPC function with the exact queue name as provided
+    // No normalization - the RPC function expects the exact queue name
     const { data, error } = await supabase.rpc('pg_delete_message', {
-      queue_name: queueName,
+      queue_name: queueName, // Use the queue name as-is without normalization
       message_id: messageIdStr
     });
     

@@ -38,6 +38,7 @@ export interface QueueHelper {
   ): Promise<boolean>;
 }
 
+// This function is only used for enqueueing messages, not for deletion
 function normalizeQueueName(queueName: string): string {
   // Remove any existing prefixes
   const baseName = queueName.replace(/^(pgmq\.|q_)/, '');
@@ -64,7 +65,7 @@ class SupabaseQueueHelper implements QueueHelper {
     dedupKey?: string, 
     options: { ttl?: number, priority?: number } = {}
   ): Promise<string | null> {
-    // Normalize the queue name
+    // Normalize the queue name for enqueue operations
     const normalizedQueueName = normalizeQueueName(queueName);
     logDebug("QueueHelper", `Enqueueing message to queue: ${normalizedQueueName}`);
     
@@ -111,28 +112,29 @@ class SupabaseQueueHelper implements QueueHelper {
   }
 
   async deleteMessage(queueName: string, messageId: string): Promise<DeleteMessageResponse> {
-    const normalizedQueueName = normalizeQueueName(queueName);
-    logDebug("QueueHelper", `Deleting message ${messageId} from queue ${normalizedQueueName}`);
+    // Pass the queue name as-is, without normalization
+    // This ensures consistency with how deleteQueueMessage expects it
+    logDebug("QueueHelper", `Deleting message ${messageId} from queue ${queueName}`);
     
     try {
-      // Use the deleteQueueMessage function from pgmqBridge.ts
-      const success = await deleteQueueMessage(this.supabase, normalizedQueueName, messageId);
+      // Use the deleteQueueMessage function from pgmqBridge.ts with exact queue name
+      const success = await deleteQueueMessage(this.supabase, queueName, messageId);
       
       if (success) {
-        logDebug("QueueHelper", `Successfully deleted message ${messageId} from queue ${normalizedQueueName}`);
+        logDebug("QueueHelper", `Successfully deleted message ${messageId} from queue ${queueName}`);
         return { 
           success: true, 
           message: "Message deleted successfully"
         };
       } else {
-        logError("QueueHelper", `Failed to delete message ${messageId} from queue ${normalizedQueueName}`);
+        logError("QueueHelper", `Failed to delete message ${messageId} from queue ${queueName}`);
         return { 
           success: false, 
           message: "Failed to delete message"
         };
       }
     } catch (err) {
-      logError("QueueHelper", `Error deleting message ${messageId} from ${normalizedQueueName}: ${err.message}`);
+      logError("QueueHelper", `Error deleting message ${messageId} from ${queueName}: ${err.message}`);
       return { 
         success: false, 
         message: `Error: ${err.message}`

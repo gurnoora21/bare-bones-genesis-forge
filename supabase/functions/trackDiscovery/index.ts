@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.7.1";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -107,8 +106,8 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
               name: track.name,
               album_id: albumId,
               duration_ms: track.duration_ms,
-              track_number: track.track_number,
               metadata: {
+                track_number: track.track_number,
                 preview_url: track.preview_url,
                 explicit: track.explicit,
                 updated_at: new Date().toISOString()
@@ -121,7 +120,7 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
         } else {
           console.log(`Creating new track: ${track.name}`);
           
-          // Insert new track
+          // Insert new track - Store track_number in metadata
           const { data: newTrack, error: insertError } = await supabase
             .from('tracks')
             .insert({
@@ -129,7 +128,6 @@ async function processMessage(message: TrackDiscoveryMessage): Promise<{ success
               name: track.name,
               spotify_id: track.id,
               duration_ms: track.duration_ms,
-              // Store track_number in metadata instead of as a separate column
               metadata: {
                 track_number: track.track_number,
                 preview_url: track.preview_url,
