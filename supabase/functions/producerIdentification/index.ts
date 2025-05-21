@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.7";
 import { Redis } from "https://esm.sh/@upstash/redis@1.20.6";
@@ -150,20 +151,28 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
             producerId = newProducer.id;
           }
           
-          // Create track-producer relationship
-          const { error: relationError } = await this.supabase
+          // Check if track-producer relationship already exists
+          const { data: existingRelation } = await this.supabase
             .from('track_producers')
-            .insert({
-              track_id: trackId,
-              producer_id: producerId,
-              source: 'genius',
-              confidence: producer.confidence || 0.8
-            })
-            .onConflict(['track_id', 'producer_id'])
-            .ignore();
+            .select('id')
+            .eq('track_id', trackId)
+            .eq('producer_id', producerId)
+            .maybeSingle();
             
-          if (relationError) {
-            logger.error(`Error creating track-producer relationship:`, relationError);
+          // Only insert if relationship doesn't exist
+          if (!existingRelation) {
+            const { error: relationError } = await this.supabase
+              .from('track_producers')
+              .insert({
+                track_id: trackId,
+                producer_id: producerId,
+                source: 'genius',
+                confidence: producer.confidence || 0.8
+              });
+              
+            if (relationError) {
+              logger.error(`Error creating track-producer relationship:`, relationError);
+            }
           }
           
       // Enqueue social enrichment for this producer
