@@ -130,7 +130,8 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
           if (existingProducer) {
             producerId = existingProducer.id;
           } else {
-            // Insert new producer with normalized name
+            // Insert new producer with normalized name - without using onConflict
+            // First we'll check again if the producer exists to avoid race conditions
             const { data: newProducer, error: insertError } = await this.supabase
               .from('producers')
               .insert({
@@ -144,27 +145,52 @@ class ProducerIdentificationWorker extends EnhancedWorkerBase {
               .single();
               
             if (insertError) {
-              logger.error(`Error inserting producer ${producer.name}:`, insertError);
-              continue;
+              // If insertion failed due to conflict, try to fetch the existing producer
+              if (insertError.message.includes('duplicate key') || 
+                  insertError.message.includes('unique constraint')) {
+                const { data: conflictedProducer } = await this.supabase
+                  .from('producers')
+                  .select('id')
+                  .eq('normalized_name', normalizedName)
+                  .single();
+                  
+                if (conflictedProducer) {
+                  producerId = conflictedProducer.id;
+                } else {
+                  logger.error(`Error inserting producer ${producer.name}:`, insertError);
+                  continue;
+                }
+              } else {
+                logger.error(`Error inserting producer ${producer.name}:`, insertError);
+                continue;
+              }
+            } else {
+              producerId = newProducer.id;
             }
-            
-            producerId = newProducer.id;
           }
           
-          // Create track-producer relationship
-          const { error: relationError } = await this.supabase
+          // Create track-producer relationship 
+          // Use upsert pattern without onConflict
+          const { error: relationCheckError, data: existingRelation } = await this.supabase
             .from('track_producers')
-            .insert({
-              track_id: trackId,
-              producer_id: producerId,
-              source: 'genius',
-              confidence: producer.confidence || 0.8
-            })
-            .onConflict(['track_id', 'producer_id'])
-            .ignore();
+            .select('id')
+            .eq('track_id', trackId)
+            .eq('producer_id', producerId)
+            .maybeSingle();
             
-          if (relationError) {
-            logger.error(`Error creating track-producer relationship:`, relationError);
+          if (!existingRelation) {
+            const { error: relationError } = await this.supabase
+              .from('track_producers')
+              .insert({
+                track_id: trackId,
+                producer_id: producerId,
+                source: 'genius',
+                confidence: producer.confidence || 0.8
+              });
+              
+            if (relationError) {
+              logger.error(`Error creating track-producer relationship:`, relationError);
+            }
           }
           
       // Enqueue social enrichment for this producer
