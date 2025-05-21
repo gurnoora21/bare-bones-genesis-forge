@@ -1,3 +1,4 @@
+
 -- First drop any existing functions to avoid parameter name conflicts
 DROP FUNCTION IF EXISTS public.pg_delete_message(TEXT, TEXT);
 
